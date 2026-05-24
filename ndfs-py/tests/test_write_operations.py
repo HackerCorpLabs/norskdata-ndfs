@@ -1,0 +1,175 @@
+"""
+Tests for write operations -- small, 1-page, multi-page, overwrite, auto quota, disk full, delete, rename.
+
+SPDX-License-Identifier: MIT
+Copyright (c) 1985-2026 Ronny Hansen
+HackerCorp Labs - https://github.com/HackerCorpLabs
+"""
+import pytest
+
+from ndfs.filesystem import NdfsFileSystem
+from ndfs.constants import NDFS_PAGE_SIZE
+from ndfs.types import ImageTemplate, ImageCreationOptions
+
+
+def _make_fs(pages=200):
+    opts = ImageCreationOptions(
+        template=ImageTemplate.Custom,
+        directory_name="WRITETEST",
+        custom_pages=pages,
+    )
+    return NdfsFileSystem.create_image(opts)
+
+
+class TestSmallFileWrite:
+    def test_write_and_read_small_file(self):
+        ndfs = _make_fs()
+        ndfs.write_file("SYSTEM/HELLO:DATA", b"Hello NDFS!")
+        content = ndfs.read_file("SYSTEM/HELLO:DATA")
+        assert content == b"Hello NDFS!"
+
+    def test_write_single_byte(self):
+        ndfs = _make_fs()
+        ndfs.write_file("SYSTEM/BYTE:DATA", b"X")
+        content = ndfs.read_file("SYSTEM/BYTE:DATA")
+        assert content == b"X"
+
+    def test_write_empty_data(self):
+        ndfs = _make_fs()
+        ndfs.write_file("SYSTEM/EMPTY:DATA", b"")
+        # File exists but with minimal data
+        assert ndfs.file_exists("SYSTEM/EMPTY:DATA") is True
+
+
+class TestOnePageFile:
+    def test_exact_page_size(self):
+        ndfs = _make_fs()
+        data = bytearray(NDFS_PAGE_SIZE)
+        for i in range(len(data)):
+            data[i] = 0xAA
+        ndfs.write_file("SYSTEM/ONEPAGE:DATA", data)
+        content = ndfs.read_file("SYSTEM/ONEPAGE:DATA")
+        assert len(content) == NDFS_PAGE_SIZE
+        assert content[0] == 0xAA
+        assert content[NDFS_PAGE_SIZE - 1] == 0xAA
+
+
+class TestMultiPageFile:
+    def test_multi_page_data_integrity(self):
+        ndfs = _make_fs()
+        data = bytearray(5000)
+        for i in range(len(data)):
+            data[i] = i & 0xFF
+        ndfs.write_file("SYSTEM/BIGFILE:DATA", data)
+        content = ndfs.read_file("SYSTEM/BIGFILE:DATA")
+        assert len(content) == 5000
+        for i in range(len(data)):
+            assert content[i] == data[i], f"Mismatch at byte {i}"
+
+    def test_exact_two_pages(self):
+        ndfs = _make_fs()
+        data = bytearray(NDFS_PAGE_SIZE * 2)
+        for i in range(len(data)):
+            data[i] = (i % 251) & 0xFF
+        ndfs.write_file("SYSTEM/TWOPG:DATA", data)
+        content = ndfs.read_file("SYSTEM/TWOPG:DATA")
+        assert len(content) == NDFS_PAGE_SIZE * 2
+        for i in range(len(data)):
+            assert content[i] == data[i]
+
+
+class TestOverwrite:
+    def test_overwrite_with_larger_data(self):
+        ndfs = _make_fs()
+        ndfs.write_file("SYSTEM/FILE:DATA", b"version 1")
+        ndfs.write_file("SYSTEM/FILE:DATA", b"version 2 is longer")
+        content = ndfs.read_file("SYSTEM/FILE:DATA")
+        assert content == b"version 2 is longer"
+
+    def test_overwrite_with_smaller_data(self):
+        ndfs = _make_fs()
+        ndfs.write_file("SYSTEM/FILE:DATA", b"long version one data here")
+        ndfs.write_file("SYSTEM/FILE:DATA", b"short")
+        content = ndfs.read_file("SYSTEM/FILE:DATA")
+        assert content == b"short"
+
+    def test_overwrite_preserves_other_files(self):
+        ndfs = _make_fs()
+        ndfs.write_file("SYSTEM/A:DATA", b"aaa")
+        ndfs.write_file("SYSTEM/B:DATA", b"bbb")
+        ndfs.write_file("SYSTEM/A:DATA", b"AAA")
+        assert ndfs.read_file("SYSTEM/A:DATA") == b"AAA"
+        assert ndfs.read_file("SYSTEM/B:DATA") == b"bbb"
+
+
+class TestAutoQuota:
+    def test_quota_expands_automatically(self):
+        ndfs = _make_fs(200)
+        # Write a large file that exceeds initial quota
+        data = bytearray(NDFS_PAGE_SIZE * 10)
+        for i in range(len(data)):
+            data[i] = i & 0xFF
+        ndfs.write_file("SYSTEM/BIG:DATA", data)
+        content = ndfs.read_file("SYSTEM/BIG:DATA")
+        assert len(content) == len(data)
+
+
+class TestDiskFull:
+    def test_raises_on_disk_full(self):
+        # Create a tiny filesystem and fill it up
+        ndfs = _make_fs(25)
+        free = ndfs.get_free_pages()
+        # Write NON-ZERO data requiring more pages than available
+        # (zero pages would be sparse and not allocate blocks)
+        need_pages = free + 10
+        data = bytearray(NDFS_PAGE_SIZE * need_pages)
+        for i in range(len(data)):
+            data[i] = 0xFF
+        with pytest.raises(IOError):
+            ndfs.write_file("SYSTEM/TOOBIG:DATA", data)
+
+
+class TestDeleteFreesBlocks:
+    def test_delete_frees_blocks(self):
+        ndfs = _make_fs()
+        free_before = ndfs.get_free_pages()
+        ndfs.write_file("SYSTEM/TODEL:DATA", b"delete me please")
+        free_after_write = ndfs.get_free_pages()
+        assert free_after_write < free_before
+
+        ndfs.delete_file("SYSTEM/TODEL:DATA")
+        free_after_delete = ndfs.get_free_pages()
+        assert free_after_delete == free_before
+
+    def test_delete_nonexistent_raises(self):
+        ndfs = _make_fs()
+        with pytest.raises(FileNotFoundError):
+            ndfs.delete_file("SYSTEM/NOPE:DATA")
+
+    def test_delete_updates_user_usage(self):
+        ndfs = _make_fs()
+        user = ndfs.get_user(0)
+        used_before = user.pages_used
+
+        ndfs.write_file("SYSTEM/TEMP:DATA", b"temporary data")
+        used_after_write = ndfs.get_user(0).pages_used
+        assert used_after_write > used_before
+
+        ndfs.delete_file("SYSTEM/TEMP:DATA")
+        used_after_delete = ndfs.get_user(0).pages_used
+        assert used_after_delete == used_before
+
+
+class TestRename:
+    def test_rename_file(self):
+        ndfs = _make_fs()
+        ndfs.write_file("SYSTEM/OLD:DATA", b"content")
+        ndfs.rename("SYSTEM/OLD:DATA", "NEW:TEXT")
+        assert ndfs.file_exists("SYSTEM/OLD:DATA") is False
+        assert ndfs.file_exists("SYSTEM/NEW:TEXT") is True
+        assert ndfs.read_file("SYSTEM/NEW:TEXT") == b"content"
+
+    def test_rename_nonexistent_raises(self):
+        ndfs = _make_fs()
+        with pytest.raises(FileNotFoundError):
+            ndfs.rename("SYSTEM/NOPE:DATA", "NEW:DATA")

@@ -1,0 +1,424 @@
+/**
+ * ndtool: CLI tool for working with NDFS disk images.
+ * Main entry point and helper functions.
+ *
+ * SPDX-License-Identifier: MIT
+ */
+
+#include "ndtool.h"
+#include "parity.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include <getopt.h>
+
+/* ── Forward declarations ─────────────────────────────────────────── */
+
+static void print_usage(const char *prog);
+static void print_version(void);
+
+/* ── Long options ─────────────────────────────────────────────────── */
+
+static struct option long_options[] = {
+    {"put",       required_argument, 0, 'P'},
+    {"rm",        required_argument, 0, 'R'},
+    {"useradd",   required_argument, 0, 'A'},
+    {"userdel",   required_argument, 0, 'D'},
+    {"addquota",  required_argument, 0, 1003},
+    {"remquota",  required_argument, 0, 1004},
+    {"passwd",    required_argument, 0, 'W'},
+    {"create",    required_argument, 0, 'C'},
+    {"shell",     no_argument,       0, 'S'},
+    {"fsck",      no_argument,       0, 1005},
+    {"editor",    required_argument, 0, 1006},
+    {"xat",       no_argument,       0, 1007},
+    {"pages",     required_argument, 0, 1001},
+    {"name",      required_argument, 0, 1002},
+    {0, 0, 0, 0}
+};
+
+/* ── Main ─────────────────────────────────────────────────────────── */
+
+int main(int argc, char **argv)
+{
+    ndtool_ctx_t ctx;
+    int opt;
+    int ret = 0;
+
+    /* Mode flags */
+    int mode_list = 0;
+    int mode_extract = 0;
+    int mode_info = 0;
+    int mode_users = 0;
+    int mode_shell = 0;
+    int mode_fsck = 0;
+
+    /* Write operation args */
+    const char *put_local = NULL;
+    const char *rm_path = NULL;
+    const char *useradd_name = NULL;
+    const char *userdel_name = NULL;
+    const char *addquota_name = NULL;
+    const char *remquota_name = NULL;
+    uint32_t quota_pages = 0;
+    const char *passwd_name = NULL;
+    const char *create_template = NULL;
+    uint32_t custom_pages = 0;
+    const char *dir_name = NULL;
+
+    int needs_write = 0;
+
+    memset(&ctx, 0, sizeof(ctx));
+
+    if (argc < 2) {
+        print_usage(argv[0]);
+        return 1;
+    }
+
+    while ((opt = getopt_long(argc, argv, "tuxidplvf:ho:VnF:", long_options, NULL)) != -1) {
+        switch (opt) {
+        case 't': mode_list = 1; break;
+        case 'u': mode_users = 1; break;
+        case 'x': mode_extract = 1; break;
+        case 'i': mode_info = 1; break;
+        case 'd': ctx.with_dirs = true; break;
+        case 'p': ctx.do_parity = true; break;
+        case 'l': ctx.lowercase = true; break;
+        case 'v': ctx.verbose = true; break;
+        case 'f': /* intentional fall-through: -f is also used as filter_file via -F */
+            break;
+        case 'F': ctx.filter_file = optarg; break;
+        case 'n': ctx.dry_run = true; break;
+        case 'o': ctx.output_dir = optarg; break;
+        case 'h': print_usage(argv[0]); return 0;
+        case 'V': print_version(); return 0;
+
+        case 'P': put_local = optarg; needs_write = 1; break;
+        case 'R': rm_path = optarg; needs_write = 1; break;
+        case 'A': useradd_name = optarg; needs_write = 1; break;
+        case 'D': userdel_name = optarg; needs_write = 1; break;
+        case 1003: addquota_name = optarg; needs_write = 1; break;
+        case 1004: remquota_name = optarg; needs_write = 1; break;
+        case 'W': passwd_name = optarg; needs_write = 1; break;
+        case 'C': create_template = optarg; needs_write = 1; break;
+        case 'S': mode_shell = 1; needs_write = 1; break;
+        case 1005: mode_fsck = 1; break;
+        case 1006: ctx.editor = optarg; break;
+        case 1007: ctx.use_xat = true; break;
+
+        case 1001: custom_pages = (uint32_t)atol(optarg); break;
+        case 1002: dir_name = optarg; break;
+
+        default:
+            print_usage(argv[0]);
+            return 1;
+        }
+    }
+
+    /* -f short option: re-parse to get filter_user */
+    /* We use -u with an argument: if -u is set AND next positional before image looks like a user */
+    /* Actually: -u alone = list users. -u USER -t = list files for USER. */
+    /* Let's handle the -u USER filter via optind scanning */
+
+    /* The image file is ALWAYS the last argument */
+    if (create_template) {
+        /* For --create, the image path is the last arg */
+        if (optind >= argc) {
+            fprintf(stderr, "Error: no output image path specified\n");
+            return 1;
+        }
+        ctx.image_path = argv[argc - 1];
+
+        /* If --addquota/--remquota, grab the pages arg */
+        if ((addquota_name || remquota_name) && optind < argc - 1) {
+            quota_pages = (uint32_t)atol(argv[optind]);
+        }
+    } else {
+        if (optind >= argc) {
+            fprintf(stderr, "Error: no image file specified\n");
+            return 1;
+        }
+        ctx.image_path = argv[argc - 1];
+
+        /* Parse positional args between optind and last arg */
+        /* For --put LOCAL [NDFS_PATH] IMAGE */
+        /* For --quota INDEX PAGES IMAGE */
+        /* For -u USER (filter) */
+        if (mode_users && mode_list && optind < argc - 1) {
+            ctx.filter_user = argv[optind];
+        } else if (mode_users && !mode_list && optind < argc - 1) {
+            ctx.filter_user = argv[optind];
+        } else if (mode_list && optind < argc - 1) {
+            ctx.filter_user = argv[optind];
+        }
+
+        if ((addquota_name || remquota_name) && optind < argc - 1) {
+            quota_pages = (uint32_t)atol(argv[optind]);
+        }
+    }
+
+    /* Handle --create separately (no existing image to open) */
+    if (create_template) {
+        ret = cmd_create(&ctx, create_template, custom_pages, dir_name);
+        return ret;
+    }
+
+    /* Read the image file */
+    {
+        size_t img_size = 0;
+        uint8_t *img_data = ndtool_read_local_file(ctx.image_path, &img_size);
+        if (!img_data) {
+            fprintf(stderr, "Error: cannot read '%s'\n", ctx.image_path);
+            return 1;
+        }
+
+        bool read_only = !needs_write;
+        ndfs_error_t err = ndfs_open_buffer_copy(img_data, img_size, read_only, &ctx.fs);
+        free(img_data);
+
+        if (err != NDFS_OK) {
+            fprintf(stderr, "Error: cannot open NDFS image: %s\n", ndfs_strerror(err));
+            return 1;
+        }
+    }
+
+    /* Dispatch command */
+    if (mode_shell) {
+        ret = cmd_shell(&ctx);
+    } else if (mode_fsck) {
+        char *report = NULL;
+        int errs = 0;
+        ndfs_error_t ferr = ndfs_fsck(ctx.fs, &report, &errs);
+        if (ferr == NDFS_OK && report) {
+            printf("%s", report);
+            ndfs_free_string(report);
+        } else {
+            fprintf(stderr, "Error running fsck: %s\n", ndfs_strerror(ferr));
+        }
+        ret = (errs > 0) ? 1 : 0;
+    } else if (mode_info) {
+        ret = cmd_info(&ctx);
+    } else if (mode_list) {
+        ret = cmd_list(&ctx);
+    } else if (mode_users && !mode_list) {
+        ret = cmd_users(&ctx);
+    } else if (mode_extract) {
+        ret = cmd_extract(&ctx);
+    } else if (put_local) {
+        const char *ndfs_path = NULL;
+        /* If there's an arg between put_local and the image path */
+        if (optind < argc - 1) {
+            ndfs_path = argv[optind];
+        }
+        ret = cmd_put(&ctx, put_local, ndfs_path);
+    } else if (rm_path) {
+        ret = cmd_delete(&ctx, rm_path);
+    } else if (useradd_name) {
+        uint32_t quota = 100;
+        if (optind < argc - 1) {
+            quota = (uint32_t)atol(argv[optind]);
+        }
+        ret = cmd_useradd(&ctx, useradd_name, quota);
+    } else if (userdel_name) {
+        ret = cmd_userdel(&ctx, userdel_name);
+    } else if (addquota_name && quota_pages > 0) {
+        ret = cmd_addquota(&ctx, addquota_name, quota_pages);
+    } else if (remquota_name && quota_pages > 0) {
+        ret = cmd_remquota(&ctx, remquota_name, quota_pages);
+    } else if (passwd_name) {
+        ret = cmd_passwd(&ctx, passwd_name);
+    } else {
+        /* Default: show info */
+        ret = cmd_info(&ctx);
+    }
+
+    ndfs_close(ctx.fs);
+    return ret;
+}
+
+/* ── Usage / Version ──────────────────────────────────────────────── */
+
+static void print_usage(const char *prog)
+{
+    printf("ndtool %s - NDFS disk image tool\n\n", NDTOOL_VERSION);
+    printf("Usage: %s [options] [args] <image>\n\n", prog);
+    printf("Modes:\n");
+    printf("  -t              List files\n");
+    printf("  -u              List users (combine with -t to filter by user)\n");
+    printf("  -i              Show filesystem info\n");
+    printf("  -x              Extract files\n");
+    printf("  --put LOCAL [NDFS_PATH]  Copy file into image\n");
+    printf("  --rm NDFS_PATH  Delete file from image\n");
+    printf("  --useradd NAME [QUOTA]   Add user (default quota: 100 pages)\n");
+    printf("  --userdel NAME           Remove user (must have no files)\n");
+    printf("  --addquota NAME PAGES    Add pages to user quota (checks disk space)\n");
+    printf("  --remquota NAME PAGES    Remove pages from user quota (checks usage)\n");
+    printf("  --passwd NAME            Clear user password\n");
+    printf("  --fsck          Full filesystem check\n");
+    printf("  --create TEMPLATE  Create new image\n");
+    printf("  --shell         Interactive shell\n");
+    printf("\nOptions:\n");
+    printf("  -v              Verbose output\n");
+    printf("  -l              Lowercase filenames on extract\n");
+    printf("  -p              Even parity: strip on extract, set on copy-in\n");
+    printf("                  (for text files: :MODE, :SYMB, :TEXT, :C, etc.)\n");
+    printf("  -d              Create user subdirectories on extract\n");
+    printf("  -o DIR          Output directory for extract\n");
+    printf("  -F FILE         Filter by filename\n");
+    printf("  -n              Dry run (don't write)\n");
+    printf("  -f              Force (skip confirmations)\n");
+    printf("  --xat           Write/read .xat sidecar files for metadata preservation\n");
+    printf("  --editor CMD    Editor for 'edit' command (default: $EDITOR or code --wait)\n");
+    printf("  -h              Show this help\n");
+    printf("  -V              Show version\n");
+    printf("\nCreate templates:\n");
+    printf("  floppy360       360 KB floppy (154 pages)\n");
+    printf("  floppy12        1.2 MB floppy (512 pages)\n");
+    printf("  smd75           75 MB SMD disk\n");
+    printf("  winchester74    74 MB Winchester disk\n");
+    printf("  custom          Custom size (use --pages N)\n");
+    printf("\n  --pages N       Page count for custom template\n");
+    printf("  --name NAME     Directory/volume name for new image\n");
+    printf("\nExamples:\n");
+    printf("  %s -t disk.ndfs\n", prog);
+    printf("  %s -t -u SYSTEM disk.ndfs\n", prog);
+    printf("  %s -i -v disk.ndfs\n", prog);
+    printf("  %s -x -o output/ -d -l disk.ndfs\n", prog);
+    printf("  %s --put myfile.txt SYSTEM/MYFILE:TEXT disk.ndfs\n", prog);
+    printf("  %s --create floppy360 --name MYDISK newdisk.ndfs\n", prog);
+    printf("  %s --shell disk.ndfs\n", prog);
+}
+
+static void print_version(void)
+{
+    printf("ndtool %s\n", NDTOOL_VERSION);
+}
+
+/* ── Helper: convert NDFS name to host filename ───────────────────── */
+
+void ndtool_to_host_name(const char *ndfs_name, char *out, size_t out_len, bool lowercase)
+{
+    size_t i;
+    size_t len = strlen(ndfs_name);
+    if (len >= out_len) len = out_len - 1;
+
+    for (i = 0; i < len; i++) {
+        if (ndfs_name[i] == ':') {
+            out[i] = '.';
+        } else if (lowercase) {
+            out[i] = (char)tolower((unsigned char)ndfs_name[i]);
+        } else {
+            out[i] = ndfs_name[i];
+        }
+    }
+    out[i] = '\0';
+}
+
+/* ── Helper: convert host filename to NDFS name ───────────────────── */
+
+void ndtool_to_ndfs_name(const char *host_name, char *out, size_t out_len)
+{
+    size_t i;
+    size_t len = strlen(host_name);
+    size_t last_dot = (size_t)-1;
+
+    if (len >= out_len) len = out_len - 1;
+
+    /* Find last dot */
+    for (i = 0; i < len; i++) {
+        if (host_name[i] == '.') last_dot = i;
+    }
+
+    for (i = 0; i < len; i++) {
+        if (i == last_dot) {
+            out[i] = ':';
+        } else {
+            out[i] = (char)toupper((unsigned char)host_name[i]);
+        }
+    }
+    out[i] = '\0';
+}
+
+/* ── Helper: read local file ──────────────────────────────────────── */
+
+uint8_t *ndtool_read_local_file(const char *path, size_t *out_size)
+{
+    FILE *f;
+    uint8_t *data;
+    long fsize;
+
+    f = fopen(path, "rb");
+    if (!f) return NULL;
+
+    fseek(f, 0, SEEK_END);
+    fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    if (fsize < 0) {
+        fclose(f);
+        return NULL;
+    }
+
+    data = (uint8_t *)malloc((size_t)fsize);
+    if (!data) {
+        fclose(f);
+        return NULL;
+    }
+
+    if (fread(data, 1, (size_t)fsize, f) != (size_t)fsize) {
+        free(data);
+        fclose(f);
+        return NULL;
+    }
+
+    fclose(f);
+    *out_size = (size_t)fsize;
+    return data;
+}
+
+/* ── Helper: write local file ─────────────────────────────────────── */
+
+int ndtool_write_local_file(const char *path, const uint8_t *data, size_t size)
+{
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        fprintf(stderr, "Error: cannot create '%s'\n", path);
+        return -1;
+    }
+
+    if (fwrite(data, 1, size, f) != size) {
+        fprintf(stderr, "Error: write failed for '%s'\n", path);
+        fclose(f);
+        return -1;
+    }
+
+    fclose(f);
+    return 0;
+}
+
+/* ── Helper: save image ───────────────────────────────────────────── */
+
+int ndtool_save_image(ndtool_ctx_t *ctx)
+{
+    uint8_t *buf = NULL;
+    size_t buf_size = 0;
+    ndfs_error_t err;
+    int ret;
+
+    if (ctx->dry_run) {
+        printf("(dry run: not saving)\n");
+        return 0;
+    }
+
+    err = ndfs_to_buffer(ctx->fs, &buf, &buf_size);
+    if (err != NDFS_OK) {
+        fprintf(stderr, "Error: cannot export image: %s\n", ndfs_strerror(err));
+        return -1;
+    }
+
+    ret = ndtool_write_local_file(ctx->image_path, buf, buf_size);
+    ndfs_free_data(buf);
+    return ret;
+}

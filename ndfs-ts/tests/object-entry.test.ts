@@ -1,0 +1,114 @@
+import { describe, it, expect } from 'vitest';
+import { ObjectEntry } from '../src/object-entry.js';
+import { BlockPointer } from '../src/block-pointer.js';
+import { PointerType } from '../src/types.js';
+import { ENTRY_SIZE, OBJECT_ENTRY_IN_USE, NDFS_NAME_TERMINATOR } from '../src/constants.js';
+import { writeUint32BE } from '../src/endian.js';
+
+function buildObjectBytes(
+  name: string,
+  type: string,
+  userIndex: number,
+  pages: number,
+  bytes: number,
+  pointerNative: number,
+): Uint8Array {
+  const buf = new Uint8Array(ENTRY_SIZE);
+  buf[0] = OBJECT_ENTRY_IN_USE; // 0x80
+
+  // Name at offset 2
+  for (let i = 0; i < name.length && i < 16; i++) {
+    buf[2 + i] = name.charCodeAt(i);
+  }
+  if (name.length < 16) buf[2 + name.length] = NDFS_NAME_TERMINATOR;
+
+  // Type at offset 18
+  for (let i = 0; i < type.length && i < 4; i++) {
+    buf[18 + i] = type.charCodeAt(i);
+  }
+  if (type.length < 4) buf[18 + type.length] = NDFS_NAME_TERMINATOR;
+
+  buf[34] = userIndex;
+  writeUint32BE(buf, 52, pages);
+  writeUint32BE(buf, 56, bytes > 0 ? bytes - 1 : 0); // stored as bytes-1
+  writeUint32BE(buf, 60, pointerNative);
+
+  return buf;
+}
+
+describe('ObjectEntry', () => {
+  describe('fromBytes', () => {
+    it('parses valid object entry', () => {
+      const data = buildObjectBytes('TESTFILE', 'DATA', 0, 5, 10240, 0x40000064);
+      const entry = ObjectEntry.fromBytes(data, 0);
+      expect(entry).not.toBeNull();
+      expect(entry!.objectName).toBe('TESTFILE');
+      expect(entry!.type).toBe('DATA');
+      expect(entry!.userIndex).toBe(0);
+      expect(entry!.pagesInFile).toBe(5);
+      expect(entry!.bytesInFile).toBe(10240);
+      expect(entry!.filePointer).not.toBeNull();
+      expect(entry!.filePointer!.blockId).toBe(100);
+      expect(entry!.filePointer!.type).toBe(PointerType.Indexed);
+    });
+
+    it('returns null for unused entry', () => {
+      const data = new Uint8Array(ENTRY_SIZE);
+      data[0] = 0x00; // not in use
+      expect(ObjectEntry.fromBytes(data, 0)).toBeNull();
+    });
+
+    it('handles 1-byte file correctly (bytes stored as 0)', () => {
+      const data = buildObjectBytes('TINY', 'DATA', 0, 1, 1, 0x00000010);
+      const entry = ObjectEntry.fromBytes(data, 0);
+      expect(entry!.bytesInFile).toBe(1);
+    });
+  });
+
+  describe('fullName', () => {
+    it('returns NAME:TYPE format', () => {
+      const entry = new ObjectEntry();
+      entry.objectName = 'README';
+      entry.type = 'TEXT';
+      expect(entry.fullName).toBe('README:TEXT');
+    });
+  });
+
+  describe('fileTypeAsText', () => {
+    it('returns DATA for type 0', () => {
+      const entry = new ObjectEntry();
+      entry.fileType = 0;
+      expect(entry.fileTypeAsText).toBe('DATA');
+    });
+    it('returns PROG for type 1', () => {
+      const entry = new ObjectEntry();
+      entry.fileType = 1;
+      expect(entry.fileTypeAsText).toBe('PROG');
+    });
+  });
+
+  describe('toBytes round-trip', () => {
+    it('round-trips all fields', () => {
+      const entry = new ObjectEntry();
+      entry.objectName = 'MYFILE';
+      entry.type = 'PROG';
+      entry.userIndex = 3;
+      entry.pagesInFile = 10;
+      entry.bytesInFile = 20000;
+      entry.filePointer = new BlockPointer(50, PointerType.Indexed);
+
+      const buf = new Uint8Array(ENTRY_SIZE);
+      entry.toBytes(buf, 0);
+
+      const parsed = ObjectEntry.fromBytes(buf, 0);
+      expect(parsed).not.toBeNull();
+      expect(parsed!.objectName).toBe('MYFILE');
+      expect(parsed!.type).toBe('PROG');
+      expect(parsed!.userIndex).toBe(3);
+      expect(parsed!.pagesInFile).toBe(10);
+      expect(parsed!.bytesInFile).toBe(20000);
+      expect(parsed!.filePointer!.blockId).toBe(50);
+      expect(parsed!.filePointer!.type).toBe(PointerType.Indexed);
+    });
+  });
+});
