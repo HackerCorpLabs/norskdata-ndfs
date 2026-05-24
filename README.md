@@ -147,7 +147,7 @@ make help       # list all targets
 ## Downloads
 
 Pre-built `ndtool` binaries for **Windows (x64)**, **Linux (x64 / arm64)**, and
-**macOS (Apple Silicon / Intel)** are attached to every
+**macOS (Apple Silicon)** are attached to every
 [GitHub Release](https://github.com/HackerCorpLabs/norskdata-ndfs/releases/latest).
 Each archive contains a single self-contained binary with no external runtime
 dependencies. Releases are built automatically by the
