@@ -1,5 +1,9 @@
 # norskdata-ndfs
 
+[![Release builds](https://github.com/HackerCorpLabs/norskdata-ndfs/actions/workflows/release.yml/badge.svg)](https://github.com/HackerCorpLabs/norskdata-ndfs/actions/workflows/release.yml)
+[![Latest release](https://img.shields.io/github/v/release/HackerCorpLabs/norskdata-ndfs?sort=semver)](https://github.com/HackerCorpLabs/norskdata-ndfs/releases/latest)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 Read and write NDFS (Norsk Data File System) disk images from Sintran-III minicomputers.
 
 Three standalone libraries with identical APIs, plus a CLI tool:
@@ -9,7 +13,7 @@ Three standalone libraries with identical APIs, plus a CLI tool:
 | [ndfs-ts](ndfs-ts/) | TypeScript | 270 | `npm install norskdata-ndfs` |
 | [ndfs-py](ndfs-py/) | Python | 310 | `pip install norskdata-ndfs` |
 | [ndfs-c](ndfs-c/) | C99 | 147 | `cmake .. && make` |
-| [ndtool](ndfs-c/tools/ndtool/) | CLI (C) | -- | Built with libndfs |
+| [ndtool](ndfs-c/tools/ndtool/README.md) | CLI (C) | -- | Built with libndfs |
 
 **Total: 727 tests. No external dependencies in any library.**
 
@@ -88,6 +92,8 @@ ndtool --create floppy360 --name MYDISK new.ndfs     # Create new image
 ndtool --shell disk.ndfs                     # Interactive mode
 ```
 
+See the [ndtool README](ndfs-c/tools/ndtool/README.md) for the full command reference.
+
 ## ND-100 Even Parity
 
 The ND-100 stores text files with even parity. Bit 7 of each byte is set so the total number of 1-bits is even:
@@ -128,6 +134,24 @@ cd ndfs-py && PYTHONPATH=src python -m pytest tests/ -v
 # C library + ndtool
 cd ndfs-c && mkdir build && cd build && cmake .. && make && ./ndfs_tests
 ```
+
+Or, from the repository root, use the convenience Makefile:
+
+```bash
+make            # build the ndtool CLI (Release)
+make release    # build ndtool, statically linked where supported
+make test       # build + run the C unit tests
+make help       # list all targets
+```
+
+## Downloads
+
+Pre-built `ndtool` binaries for **Windows (x64)**, **Linux (x64 / arm64)**, and
+**macOS (Apple Silicon / Intel)** are attached to every
+[GitHub Release](https://github.com/HackerCorpLabs/norskdata-ndfs/releases/latest).
+Each archive contains a single self-contained binary with no external runtime
+dependencies. Releases are built automatically by the
+[release workflow](.github/workflows/release.yml) when a `v*` tag is pushed.
 
 ## License
 

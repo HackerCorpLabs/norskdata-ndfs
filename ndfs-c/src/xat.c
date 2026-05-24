@@ -56,7 +56,7 @@ static const char *find_json_string(const char *json, const char *key,
  * Find a JSON integer value for a given key.
  * Returns 1 if found, 0 if not found.
  */
-static int find_json_int(const char *json, const char *key, long *out_val)
+static int find_json_int(const char *json, const char *key, uint32_t *out_val)
 {
     char search[128];
     const char *pos;
@@ -72,7 +72,10 @@ static int find_json_int(const char *json, const char *key, long *out_val)
     /* Skip optional quotes around numbers */
     if (*pos == '"') pos++;
 
-    *out_val = strtol(pos, &endptr, 10);
+    /* Fields are uint32_t and can reach 0xFFFFFFFF. strtoul holds the full
+     * 32-bit range even where long is only 32-bit (e.g. Windows/MinGW),
+     * whereas strtol would saturate at 0x7FFFFFFF. */
+    *out_val = (uint32_t)strtoul(pos, &endptr, 10);
     return (endptr != pos) ? 1 : 0;
 }
 
@@ -187,7 +190,7 @@ ndfs_error_t ndfs_xat_serialize(const ndfs_xat_properties_t *xat,
 ndfs_error_t ndfs_xat_deserialize(const char *json,
                                   ndfs_xat_properties_t *out)
 {
-    long val;
+    uint32_t val;
 
     if (!json || !out) return NDFS_ERR_NULL_PTR;
 

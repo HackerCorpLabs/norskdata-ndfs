@@ -14,11 +14,18 @@
 #include <sys/types.h>
 #include <errno.h>
 
+#ifdef _WIN32
+#include <direct.h>
+#define ndtool_mkdir(path) _mkdir(path)
+#else
+#define ndtool_mkdir(path) mkdir((path), 0755)
+#endif
+
 static void ensure_dir(const char *path)
 {
     struct stat st;
     if (stat(path, &st) != 0) {
-        mkdir(path, 0755);
+        ndtool_mkdir(path);
     }
 }
 
