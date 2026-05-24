@@ -245,7 +245,7 @@ $ ndtool --xat --put README.TEXT SYSTEM/README:TEXT disk.ndfs
 
 This is essential for archival round-trips (extract, analyze, reconstitute) and development workflows (edit source on a modern system, transfer back to an ND-100 emulator) where preserving the file's original identity matters.
 
-See the [NDFS Format Specification](../../docs/NDFS-FORMAT.md#xat-sidecar-files) for the full XAT file format documentation.
+See the [NDFS Format Specification](../../../docs/NDFS-FORMAT.md#xat-sidecar-files) for the full XAT file format documentation.
 
 ## Copying Files In
 
@@ -586,11 +586,11 @@ $ ndtool --put myfile.txt SYSTEM/CUSTOM-NAME:TEXT disk.ndfs
 
 ## On-Disk Format
 
-See [NDFS-FORMAT.md](../../docs/NDFS-FORMAT.md) for the complete binary format specification covering master blocks, block pointers, user/object entries, allocation bitmaps, and boot sector formats.
+See [NDFS-FORMAT.md](../../../docs/NDFS-FORMAT.md) for the complete binary format specification covering master blocks, block pointers, user/object entries, allocation bitmaps, and boot sector formats.
 
 ## Comparison with Tor Arntsen's ndfs
 
-ndtool is inspired by [Tor Arntsen's ndfs tool](http://www.pvv.ntnu.no/~arlents/ndfs/) and supports the same listing and extraction features, plus:
+ndtool is inspired by [Tor Arntsen's ndfs tool](https://www.ndwiki.org/wiki/User:TArntsen) and supports the same listing and extraction features, plus:
 
 | Feature | Tor's ndfs | ndtool |
 |---------|-----------|--------|
