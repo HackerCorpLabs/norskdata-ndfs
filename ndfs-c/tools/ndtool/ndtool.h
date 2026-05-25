@@ -12,6 +12,14 @@
 
 #define NDTOOL_VERSION "1.0.0"
 
+/* Policy when a target file already exists (import into image, or extract to
+ * host). Default is DENY: skip the file and keep going. */
+typedef enum {
+    NDTOOL_ON_EXIST_DENY = 0,   /* skip existing targets (safe default) */
+    NDTOOL_ON_EXIST_OVERWRITE,  /* replace existing targets (--overwrite/-f) */
+    NDTOOL_ON_EXIST_PROMPT      /* ask per file (-i), falls back to deny w/o TTY */
+} ndtool_on_exist_t;
+
 typedef struct {
     const char *image_path;
     ndfs_filesystem_t *fs;
@@ -23,7 +31,9 @@ typedef struct {
     bool with_dirs;     /* -d flag */
     const char *output_dir;
     const char *filter_user;  /* -u USER filter */
-    const char *filter_file;  /* -f FILE filter */
+    const char *filter_file;  /* -F FILE/glob filter (wildcards on extract) */
+    const char *dest_user;    /* --dest USER: destination for multi-file --put */
+    ndtool_on_exist_t on_exist; /* collision policy for existing targets */
     bool modified;
     bool use_xat;       /* --xat: write/read .xat sidecar files */
     const char *editor;     /* custom editor command, NULL = auto-detect */
@@ -43,6 +53,14 @@ int ndtool_write_local_file(const char *path, const uint8_t *data, size_t size);
 
 /* Helper: save modified image back to disk */
 int ndtool_save_image(ndtool_ctx_t *ctx);
+
+/* Helper: true if the string contains a '*' or '?' wildcard. */
+bool ndtool_has_wildcard(const char *s);
+
+/* Decide whether to write a target that already exists, per ctx->on_exist.
+ * Prints a skip/overwrite notice. 'what' describes the target for messages
+ * (e.g. the destination path). Returns true to proceed, false to skip. */
+bool ndtool_confirm_overwrite(ndtool_ctx_t *ctx, const char *what, bool exists);
 
 /* Commands */
 int cmd_list(ndtool_ctx_t *ctx);

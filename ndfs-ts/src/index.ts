@@ -24,5 +24,6 @@ export * from './access-control.js';
 export * from './image-creator.js';
 export * from './boot-loader.js';
 export * from './parity.js';
+export * from './wildmatch.js';
 export * from './xat.js';
 export * from './ndfs-filesystem.js';

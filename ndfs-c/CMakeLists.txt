@@ -21,6 +21,7 @@ set(NDFS_SOURCES
     src/boot_loader.c
     src/xat.c
     src/parity.c
+    src/wildmatch.c
 )
 
 add_library(ndfs STATIC ${NDFS_SOURCES})
@@ -56,6 +57,7 @@ set(TEST_SOURCES
     tests/test_xat.c
     tests/test_xat_copy.c
     tests/test_parity.c
+    tests/test_wildmatch.c
 )
 
 add_executable(ndfs_tests ${TEST_SOURCES})

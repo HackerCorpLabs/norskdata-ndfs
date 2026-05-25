@@ -25,6 +25,7 @@ extern void run_write_comprehensive_tests(void);
 extern void run_xat_tests(void);
 extern void run_xat_copy_tests(void);
 extern void run_parity_tests(void);
+extern void run_wildmatch_tests(void);
 
 int main(void)
 {
@@ -44,6 +45,7 @@ int main(void)
     run_xat_tests();
     run_xat_copy_tests();
     run_parity_tests();
+    run_wildmatch_tests();
 
     TEST_SUITE_REPORT();
 

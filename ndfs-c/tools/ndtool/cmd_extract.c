@@ -86,10 +86,24 @@ static int extract_one_file(ndtool_ctx_t *ctx, const char *user_name,
 
     strncat(out_path, host_name, sizeof(out_path) - strlen(out_path) - 1);
 
-    if (ctx->dry_run) {
-        printf("  %s -> %s (%zu bytes) [dry run]\n", ndfs_path, out_path, data_size);
-        ndfs_free_data(data);
-        return 0;
+    /* Collision handling against the host filesystem. */
+    {
+        struct stat st;
+        bool exists = (stat(out_path, &st) == 0);
+
+        if (ctx->dry_run) {
+            const char *act = !exists ? "create"
+                : (ctx->on_exist == NDTOOL_ON_EXIST_OVERWRITE ? "overwrite" : "skip");
+            printf("  %s -> %s (%zu bytes) [%s]\n",
+                   ndfs_path, out_path, data_size, act);
+            ndfs_free_data(data);
+            return 0;
+        }
+
+        if (!ndtool_confirm_overwrite(ctx, out_path, exists)) {
+            ndfs_free_data(data);
+            return 0;
+        }
     }
 
     /* Write to local file */
@@ -122,7 +136,10 @@ static int extract_one_file(ndtool_ctx_t *ctx, const char *user_name,
     return ret;
 }
 
-static int extract_user_files(ndtool_ctx_t *ctx, const char *user_name)
+/* Extract one user's files, keeping only those whose full name matches
+ * file_pat (a wildcard pattern; NULL means "all files"). */
+static int extract_user_files(ndtool_ctx_t *ctx, const char *user_name,
+                              const char *file_pat)
 {
     ndfs_file_entry_t *entries = NULL;
     size_t count = 0;
@@ -139,7 +156,8 @@ static int extract_user_files(ndtool_ctx_t *ctx, const char *user_name)
     for (i = 0; i < count; i++) {
         if (entries[i].is_directory) continue;
 
-        if (ctx->filter_file && strcmp(entries[i].full_name, ctx->filter_file) != 0) {
+        /* Case-insensitive wildcard match (NDFS names are uppercase). */
+        if (file_pat && !ndfs_wildmatch(file_pat, entries[i].full_name, true)) {
             continue;
         }
 
@@ -154,32 +172,53 @@ static int extract_user_files(ndtool_ctx_t *ctx, const char *user_name)
 
 int cmd_extract(ndtool_ctx_t *ctx)
 {
-    if (ctx->filter_user) {
-        return extract_user_files(ctx, ctx->filter_user);
+    char user_pat_buf[NDFS_NAME_MAX + 1];
+    const char *user_pat = NULL;
+    const char *file_pat = ctx->filter_file;
+    ndfs_file_entry_t *users = NULL;
+    size_t user_count = 0;
+    size_t i;
+    ndfs_error_t err;
+    int ret = 0;
+    int matched_users = 0;
+
+    /* A -F pattern of the form USER/FILE splits into a user glob and a file
+     * glob, e.g. SYSTEM followed by '*:MODE', or a '*' user with a file glob. */
+    if (file_pat) {
+        const char *slash = strchr(file_pat, '/');
+        if (slash) {
+            size_t ulen = (size_t)(slash - file_pat);
+            if (ulen >= sizeof(user_pat_buf)) ulen = sizeof(user_pat_buf) - 1;
+            memcpy(user_pat_buf, file_pat, ulen);
+            user_pat_buf[ulen] = '\0';
+            user_pat = user_pat_buf;
+            file_pat = slash + 1;
+        }
     }
 
-    /* Extract from all users */
-    {
-        ndfs_file_entry_t *users = NULL;
-        size_t user_count = 0;
-        size_t i;
-        ndfs_error_t err;
-        int ret = 0;
+    /* An explicit -u USER selects the user when no user glob was embedded. */
+    if (!user_pat && ctx->filter_user) user_pat = ctx->filter_user;
 
-        err = ndfs_list_directory(ctx->fs, "/", &users, &user_count);
-        if (err != NDFS_OK) {
-            fprintf(stderr, "Error listing root: %s\n", ndfs_strerror(err));
-            return -1;
-        }
-
-        for (i = 0; i < user_count; i++) {
-            if (!users[i].is_directory) continue;
-            if (extract_user_files(ctx, users[i].name) != 0) {
-                ret = -1;
-            }
-        }
-
-        ndfs_free_entries(users);
-        return ret;
+    err = ndfs_list_directory(ctx->fs, "/", &users, &user_count);
+    if (err != NDFS_OK) {
+        fprintf(stderr, "Error listing root: %s\n", ndfs_strerror(err));
+        return -1;
     }
+
+    for (i = 0; i < user_count; i++) {
+        if (!users[i].is_directory) continue;
+        if (user_pat && !ndfs_wildmatch(user_pat, users[i].name, true)) continue;
+        matched_users++;
+        if (extract_user_files(ctx, users[i].name, file_pat) != 0) {
+            ret = -1;
+        }
+    }
+
+    if (user_pat && matched_users == 0) {
+        fprintf(stderr, "No users match '%s'\n", user_pat);
+        ret = -1;
+    }
+
+    ndfs_free_entries(users);
+    return ret;
 }

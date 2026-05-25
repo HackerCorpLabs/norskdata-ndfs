@@ -32,10 +32,23 @@ EXTRACT:
   ndtool -x -d <image>                       Extract into USER/ subdirectories
   ndtool -x -p -l <image>                    Extract with parity stripped, lowercase
   ndtool -x -o /tmp/out -d -l <image>        Extract to directory
+  ndtool -x -p -F 'SYSTEM/*:MODE' -o out/ <image>   Extract matching files (glob)
+  ndtool -x -F '*/*:SYMB' -o out/ <image>    All users' :SYMB files
 
 COPY IN:
   ndtool --put readme.txt SYSTEM/README:TEXT <image>
   ndtool -p --put source.c SYSTEM/SOURCE:C <image>    (with parity)
+  ndtool --put '*.NPL' --dest TEST -p <image>         Import matching files (glob)
+
+WILDCARDS (-F pattern / --put glob):
+  * matches any run of chars, ? matches one. Quote patterns so the shell
+  leaves them for ndtool. -F splits on '/' into USER-glob/FILE-glob.
+
+OVERWRITE POLICY (import and extract):
+  (default)        Skip targets that already exist (safe)
+  --overwrite, -f  Replace existing targets
+  --interactive    Prompt before each overwrite (skips when no TTY)
+  -n               Dry run: preview create / overwrite / skip per file
 
 DELETE:
   ndtool --rm SYSTEM/OLD-FILE:DATA <image>

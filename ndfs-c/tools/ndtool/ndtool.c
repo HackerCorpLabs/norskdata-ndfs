@@ -14,6 +14,14 @@
 #include <ctype.h>
 #include <getopt.h>
 
+#ifdef _WIN32
+#include <io.h>
+#define isatty _isatty
+#define fileno _fileno
+#else
+#include <unistd.h>
+#endif
+
 /* ── Forward declarations ─────────────────────────────────────────── */
 
 static void print_usage(const char *prog);
@@ -34,6 +42,9 @@ static struct option long_options[] = {
     {"fsck",      no_argument,       0, 1005},
     {"editor",    required_argument, 0, 1006},
     {"xat",       no_argument,       0, 1007},
+    {"dest",      required_argument, 0, 1008},
+    {"overwrite", no_argument,       0, 1009},
+    {"interactive", no_argument,     0, 1010},
     {"pages",     required_argument, 0, 1001},
     {"name",      required_argument, 0, 1002},
     {0, 0, 0, 0}
@@ -87,7 +98,9 @@ int main(int argc, char **argv)
         case 'p': ctx.do_parity = true; break;
         case 'l': ctx.lowercase = true; break;
         case 'v': ctx.verbose = true; break;
-        case 'f': /* intentional fall-through: -f is also used as filter_file via -F */
+        case 'f': /* force == overwrite existing targets */
+            ctx.force = true;
+            ctx.on_exist = NDTOOL_ON_EXIST_OVERWRITE;
             break;
         case 'F': ctx.filter_file = optarg; break;
         case 'n': ctx.dry_run = true; break;
@@ -107,6 +120,9 @@ int main(int argc, char **argv)
         case 1005: mode_fsck = 1; break;
         case 1006: ctx.editor = optarg; break;
         case 1007: ctx.use_xat = true; break;
+        case 1008: ctx.dest_user = optarg; break;
+        case 1009: ctx.on_exist = NDTOOL_ON_EXIST_OVERWRITE; break;
+        case 1010: ctx.on_exist = NDTOOL_ON_EXIST_PROMPT; break;
 
         case 1001: custom_pages = (uint32_t)atol(optarg); break;
         case 1002: dir_name = optarg; break;
@@ -250,6 +266,7 @@ static void print_usage(const char *prog)
     printf("  -i              Show filesystem info\n");
     printf("  -x              Extract files\n");
     printf("  --put LOCAL [NDFS_PATH]  Copy file into image\n");
+    printf("                  LOCAL may be a wildcard (quote it); use --dest USER\n");
     printf("  --rm NDFS_PATH  Delete file from image\n");
     printf("  --useradd NAME [QUOTA]   Add user (default quota: 100 pages)\n");
     printf("  --userdel NAME           Remove user (must have no files)\n");
@@ -266,9 +283,12 @@ static void print_usage(const char *prog)
     printf("                  (for text files: :MODE, :SYMB, :TEXT, :C, etc.)\n");
     printf("  -d              Create user subdirectories on extract\n");
     printf("  -o DIR          Output directory for extract\n");
-    printf("  -F FILE         Filter by filename\n");
-    printf("  -n              Dry run (don't write)\n");
-    printf("  -f              Force (skip confirmations)\n");
+    printf("  -F PATTERN      Filter/extract by filename glob (* and ?),\n");
+    printf("                  e.g. 'SYSTEM/*:MODE' or '*/STARTUP:MODE'\n");
+    printf("  --dest USER     Destination user for --put (required for wildcards)\n");
+    printf("  -n              Dry run (preview create/overwrite/skip)\n");
+    printf("  --overwrite, -f Overwrite existing targets (default: skip them)\n");
+    printf("  --interactive   Prompt before overwriting each existing target\n");
     printf("  --xat           Write/read .xat sidecar files for metadata preservation\n");
     printf("  --editor CMD    Editor for 'edit' command (default: $EDITOR or code --wait)\n");
     printf("  -h              Show this help\n");
@@ -287,6 +307,8 @@ static void print_usage(const char *prog)
     printf("  %s -i -v disk.ndfs\n", prog);
     printf("  %s -x -o output/ -d -l disk.ndfs\n", prog);
     printf("  %s --put myfile.txt SYSTEM/MYFILE:TEXT disk.ndfs\n", prog);
+    printf("  %s -x -p -F 'SYSTEM/*:MODE' -o out/ disk.ndfs\n", prog);
+    printf("  %s --put '*.NPL' --dest TEST -p disk.ndfs\n", prog);
     printf("  %s --create floppy360 --name MYDISK newdisk.ndfs\n", prog);
     printf("  %s --shell disk.ndfs\n", prog);
 }
@@ -396,6 +418,52 @@ int ndtool_write_local_file(const char *path, const uint8_t *data, size_t size)
 
     fclose(f);
     return 0;
+}
+
+/* ── Helper: wildcard detection ───────────────────────────────────── */
+
+bool ndtool_has_wildcard(const char *s)
+{
+    if (!s) return false;
+    for (; *s; s++) {
+        if (*s == '*' || *s == '?') return true;
+    }
+    return false;
+}
+
+/* ── Helper: overwrite decision ───────────────────────────────────── */
+
+bool ndtool_confirm_overwrite(ndtool_ctx_t *ctx, const char *what, bool exists)
+{
+    if (!exists) return true;
+
+    switch (ctx->on_exist) {
+    case NDTOOL_ON_EXIST_OVERWRITE:
+        if (ctx->verbose) printf("  overwriting: %s\n", what);
+        return true;
+
+    case NDTOOL_ON_EXIST_PROMPT: {
+        char resp[16];
+        /* Non-interactive stdin: fall back to the safe default (skip). */
+        if (!isatty(fileno(stdin))) {
+            printf("  skipped (exists, no tty): %s\n", what);
+            return false;
+        }
+        printf("Overwrite %s? [y/N] ", what);
+        fflush(stdout);
+        if (fgets(resp, sizeof(resp), stdin) &&
+            (resp[0] == 'y' || resp[0] == 'Y')) {
+            return true;
+        }
+        printf("  skipped: %s\n", what);
+        return false;
+    }
+
+    case NDTOOL_ON_EXIST_DENY:
+    default:
+        printf("  skipped (exists): %s\n", what);
+        return false;
+    }
 }
 
 /* ── Helper: save image ───────────────────────────────────────────── */

@@ -17,6 +17,7 @@
 #include "user_entry.h"
 #include "object_entry.h"
 #include "parity.h"
+#include "wildmatch.h"
 #include "xat.h"
 #include "filesystem.h"
 #include "image_creator.h"

@@ -83,6 +83,7 @@ from ndfs.xat import (
     XAT_EXTENSION,
 )
 from ndfs.parity import strip_parity, set_parity, is_text_type
+from ndfs.wildmatch import wildmatch
 from ndfs.filesystem import NdfsFileSystem
 
 __all__ = [
@@ -122,6 +123,8 @@ __all__ = [
     "XAT_LAST_READ_DATE", "XAT_LAST_WRITE_DATE", "ALL_XAT_KEYS", "XAT_EXTENSION",
     # Parity
     "strip_parity", "set_parity", "is_text_type",
+    # Wildcard matching
+    "wildmatch",
     # Filesystem
     "NdfsFileSystem",
 ]
