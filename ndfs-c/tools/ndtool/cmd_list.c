@@ -45,10 +45,25 @@ static int list_user_files(ndtool_ctx_t *ctx, const char *user_name)
     return 0;
 }
 
+/* ── Volume header ────────────────────────────────────────────────── */
+
+/* Print the volume (directory) name from the master block, if present. */
+static void print_volume_header(ndtool_ctx_t *ctx)
+{
+    const ndfs_master_block_t *mb = NULL;
+
+    if (ndfs_get_master_block(ctx->fs, &mb) != NDFS_OK || !mb) return;
+    if (mb->directory_name[0] == '\0') return;
+
+    printf("Volume: %s\n\n", mb->directory_name);
+}
+
 /* ── cmd_list ─────────────────────────────────────────────────────── */
 
 int cmd_list(ndtool_ctx_t *ctx)
 {
+    print_volume_header(ctx);
+
     if (ctx->filter_user) {
         printf("USER: %s\n", ctx->filter_user);
         return list_user_files(ctx, ctx->filter_user);

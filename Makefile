@@ -15,6 +15,15 @@
 # ── Configuration ───────────────────────────────────────────────────
 C_DIR      := ndfs-c
 BUILD_DIR  := $(C_DIR)/build
+
+# Resolve cmake to an ABSOLUTE path up front. Under WSL the full Windows PATH
+# is appended (e.g. /mnt/c/Program Files/CMake/bin), and GNU make's direct
+# exec of an unquoted recipe command can trip over a foreign cmake on those
+# entries and fail with "cmake: Permission denied" -- even though the shell
+# finds /usr/bin/cmake fine. Calling cmake by absolute path skips make's PATH
+# search entirely. Override with `make CMAKE=/path/to/cmake` if needed.
+CMAKE      ?= $(shell command -v cmake 2>/dev/null || echo cmake)
+CTEST      ?= $(shell command -v ctest 2>/dev/null || echo ctest)
 GENERATOR  ?= $(shell command -v ninja >/dev/null 2>&1 && echo Ninja || echo "Unix Makefiles")
 
 # Static linking is supported on Windows (MinGW) and Linux, but not macOS
@@ -44,20 +53,20 @@ all: ndtool
 
 ## build: configure + build the whole C project (lib, tests, ndtool)
 build:
-	cmake -S $(C_DIR) -B $(BUILD_DIR) -G "$(GENERATOR)" -DCMAKE_BUILD_TYPE=Release
-	cmake --build $(BUILD_DIR)
+	"$(CMAKE)" -S $(C_DIR) -B $(BUILD_DIR) -G "$(GENERATOR)" -DCMAKE_BUILD_TYPE=Release
+	"$(CMAKE)" --build $(BUILD_DIR)
 
 ## ndtool: build just the ndtool CLI (Release)
 ndtool:
-	cmake -S $(C_DIR) -B $(BUILD_DIR) -G "$(GENERATOR)" -DCMAKE_BUILD_TYPE=Release
-	cmake --build $(BUILD_DIR) --target ndtool
+	"$(CMAKE)" -S $(C_DIR) -B $(BUILD_DIR) -G "$(GENERATOR)" -DCMAKE_BUILD_TYPE=Release
+	"$(CMAKE)" --build $(BUILD_DIR) --target ndtool
 	@echo "Built: $(NDTOOL)"
 
 ## release: build ndtool, statically linked where the platform supports it
 release:
-	cmake -S $(C_DIR) -B $(BUILD_DIR) -G "$(GENERATOR)" \
+	"$(CMAKE)" -S $(C_DIR) -B $(BUILD_DIR) -G "$(GENERATOR)" \
 		-DCMAKE_BUILD_TYPE=Release $(STATIC_FLAGS)
-	cmake --build $(BUILD_DIR) --target ndtool
+	"$(CMAKE)" --build $(BUILD_DIR) --target ndtool
 	@echo "Built (release): $(NDTOOL)"
 
 # ── Tests ───────────────────────────────────────────────────────────
@@ -67,9 +76,9 @@ test: test-c
 
 ## test-c: build and run the libndfs C unit tests
 test-c:
-	cmake -S $(C_DIR) -B $(BUILD_DIR) -G "$(GENERATOR)" -DCMAKE_BUILD_TYPE=Release
-	cmake --build $(BUILD_DIR) --target ndfs_tests
-	ctest --test-dir $(BUILD_DIR) --output-on-failure
+	"$(CMAKE)" -S $(C_DIR) -B $(BUILD_DIR) -G "$(GENERATOR)" -DCMAKE_BUILD_TYPE=Release
+	"$(CMAKE)" --build $(BUILD_DIR) --target ndfs_tests
+	"$(CTEST)" --test-dir $(BUILD_DIR) --output-on-failure
 
 ## test-ts: run the TypeScript test suite
 test-ts ts:
