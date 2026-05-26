@@ -5,6 +5,12 @@
  * SPDX-License-Identifier: MIT
  */
 
+/* Expose POSIX fileno()/isatty() under strict -std=c99 (must precede any
+ * system header include). */
+#ifndef _WIN32
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "ndtool.h"
 #include "parity.h"
 
@@ -92,7 +98,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    while ((opt = getopt_long(argc, argv, "tuxidplvf:ho:VnF:", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "tuxidplvfho:VnF:", long_options, NULL)) != -1) {
         switch (opt) {
         case 't': mode_list = 1; break;
         case 'u': mode_users = 1; break;

@@ -207,6 +207,11 @@ int cmd_put(ndtool_ctx_t *ctx, const char *local_path, const char *ndfs_path)
                 ndfs_free_users(users);
             }
             target = auto_path;
+        } else if (ctx->dest_user && !strchr(target, '/')) {
+            /* An explicit name without a USER/ prefix, plus --dest USER:
+             * place it under that user (e.g. --put f.txt --dest BUILD T:TXT). */
+            snprintf(auto_path, sizeof(auto_path), "%s/%s", ctx->dest_user, target);
+            target = auto_path;
         }
 
         ret = put_one_file(ctx, local_path, target);

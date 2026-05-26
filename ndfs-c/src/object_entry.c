@@ -127,8 +127,11 @@ ndfs_error_t ndfs_oe_to_bytes(const ndfs_object_entry_t *entry,
     /* File type code */
     buffer[offset + 32] = entry->file_type;
 
-    /* User index (byte 34, high byte of the object-index word) */
+    /* Object index word at 34: high byte = user index, low byte = file slot.
+     * Writing both bytes keeps the version pointers (which equal this word)
+     * consistent for newly-created files. */
     buffer[offset + 34] = entry->user_index;
+    buffer[offset + 35] = (uint8_t)(entry->disk_object_index & 0xFF);
 
     /* Open counts and timestamps (offsets 36-51). */
     ndfs_write_u16be(buffer, offset + 36, entry->current_open_count);

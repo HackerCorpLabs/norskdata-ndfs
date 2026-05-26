@@ -685,6 +685,13 @@ static ndfs_error_t create_new_file(struct ndfs_filesystem *fs,
      * used here. */
     entry.access_bits = NDFS_ACCESS_DEFAULT;
     entry.file_type_flags = NDFS_FT_INDEXED;
+    /* SINTRAN object index = [user index | physical slot] and a single-version
+     * file points its next/prev version at itself. Without this SINTRAN sees a
+     * broken version chain (";2") and refuses to open the file. */
+    entry.disk_object_index = (uint16_t)(((uint16_t)entry.user_index << 8) |
+                                         (entry.object_index & 0xFF));
+    entry.next_version = entry.disk_object_index;
+    entry.prev_version = entry.disk_object_index;
 
     add_object(fs, &entry);
 
@@ -879,6 +886,43 @@ static ndfs_error_t persist_all(struct ndfs_filesystem *fs)
     }
 
     return NDFS_OK;
+}
+
+/* Zero the on-disk object entry at a physical slot so a deleted file does not
+ * reappear when the image is reloaded (persist_all only rewrites surviving
+ * objects and would otherwise leave the freed slot's in-use bit set). */
+static void clear_object_slot(struct ndfs_filesystem *fs, uint32_t object_index)
+{
+    const ndfs_master_block_t *mb = &fs->master_block;
+    uint32_t page_idx = object_index / NDFS_ENTRIES_PER_PAGE;
+    uint32_t slot = object_index % NDFS_ENTRIES_PER_PAGE;
+    uint8_t *page = NULL;
+
+    if (!ndfs_bp_is_valid(&mb->object_file_ptr)) return;
+
+    if (mb->object_file_ptr.type == NDFS_PTR_INDEXED) {
+        const uint8_t *idx_page = read_page(fs, mb->object_file_ptr.block_id);
+        ndfs_block_pointer_t ptr;
+        if (!idx_page || page_idx >= NDFS_MAX_OBJECT_FILE_PTRS) return;
+        ptr = ndfs_bp_from_bytes(idx_page, page_idx * 4);
+        if (!ndfs_bp_is_valid(&ptr)) return;
+        page = write_page_ptr(fs, ptr.block_id);
+    } else if (mb->object_file_ptr.type == NDFS_PTR_SUBINDEXED) {
+        const uint8_t *sub_page = read_page(fs, mb->object_file_ptr.block_id);
+        uint32_t sub_idx = page_idx / NDFS_MAX_OBJECT_FILE_PTRS;
+        uint32_t inner_idx = page_idx % NDFS_MAX_OBJECT_FILE_PTRS;
+        ndfs_block_pointer_t sub_ptr, data_ptr;
+        const uint8_t *inner;
+        if (!sub_page) return;
+        sub_ptr = ndfs_bp_from_bytes(sub_page, sub_idx * 4);
+        if (!ndfs_bp_is_valid(&sub_ptr)) return;
+        inner = read_page(fs, sub_ptr.block_id);
+        if (!inner) return;
+        data_ptr = ndfs_bp_from_bytes(inner, inner_idx * 4);
+        if (!ndfs_bp_is_valid(&data_ptr)) return;
+        page = write_page_ptr(fs, data_ptr.block_id);
+    }
+    if (page) memset(page + (size_t)slot * NDFS_ENTRY_SIZE, 0, NDFS_ENTRY_SIZE);
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -1258,6 +1302,9 @@ ndfs_error_t ndfs_delete_file(ndfs_filesystem_t *fs, const char *path)
         else
             fs->users[user_slot].pages_used = 0;
     }
+
+    /* Clear the freed entry's slot on disk so it does not reappear on reload. */
+    clear_object_slot(fs, obj->object_index);
 
     /* Remove from object array */
     if ((size_t)idx < fs->object_count - 1) {

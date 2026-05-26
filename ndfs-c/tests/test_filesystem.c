@@ -792,9 +792,61 @@ static int test_get_object_entry(void)
     return 0;
 }
 
+/* Regression: a deleted file must stay deleted after the image is exported
+ * and reopened (the freed object slot must be cleared on disk). */
+static int test_delete_persists_after_reload(void)
+{
+    uint8_t *img = create_test_image();
+    ndfs_filesystem_t *fs = NULL;
+    uint8_t *buf = NULL;
+    size_t bufsize = 0;
+    bool exists = true;
+
+    ndfs_open_buffer_copy(img, TEST_IMAGE_SIZE, false, &fs);
+    TEST_ASSERT_OK(ndfs_write_file(fs, "SYSTEM/DELME:DATA", (const uint8_t *)"x", 1));
+    TEST_ASSERT_OK(ndfs_delete_file(fs, "SYSTEM/DELME:DATA"));
+    TEST_ASSERT_OK(ndfs_to_buffer(fs, &buf, &bufsize));
+    ndfs_close(fs);
+
+    /* Reopen the exported image: the file must not reappear. */
+    ndfs_open_buffer_copy(buf, bufsize, true, &fs);
+    TEST_ASSERT_OK(ndfs_file_exists(fs, "SYSTEM/DELME:DATA", &exists));
+    TEST_ASSERT(exists == false);
+
+    ndfs_free_data(buf);
+    ndfs_close(fs);
+    free(img);
+    return 0;
+}
+
+/* Regression: a newly-created file gets a self-referential version chain and
+ * an object index of [user index | physical slot]; otherwise SINTRAN sees a
+ * broken version chain (";2") and cannot open it. */
+static int test_new_file_version_self_ref(void)
+{
+    uint8_t *img = create_test_image();
+    ndfs_filesystem_t *fs = NULL;
+    ndfs_object_entry_t obj;
+
+    ndfs_open_buffer_copy(img, TEST_IMAGE_SIZE, false, &fs);
+    TEST_ASSERT_OK(ndfs_write_file(fs, "SYSTEM/VER:DATA", (const uint8_t *)"x", 1));
+    TEST_ASSERT_OK(ndfs_get_object_entry(fs, "VER:DATA", "SYSTEM", &obj));
+
+    TEST_ASSERT_EQUAL(obj.disk_object_index, obj.next_version);
+    TEST_ASSERT_EQUAL(obj.disk_object_index, obj.prev_version);
+    /* High byte of the object index must equal the owning user index. */
+    TEST_ASSERT_EQUAL(obj.user_index, (obj.disk_object_index >> 8) & 0xFF);
+
+    ndfs_close(fs);
+    free(img);
+    return 0;
+}
+
 void run_filesystem_tests(void)
 {
     TEST_SUITE_BEGIN("Filesystem Tests");
+    RUN_TEST(test_delete_persists_after_reload);
+    RUN_TEST(test_new_file_version_self_ref);
     RUN_TEST(test_open_close);
     RUN_TEST(test_directory_name);
     RUN_TEST(test_list_root);
