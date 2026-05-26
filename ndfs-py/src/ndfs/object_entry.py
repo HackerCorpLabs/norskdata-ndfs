@@ -213,8 +213,10 @@ class ObjectEntry:
             for i in range(ENTRY_SIZE):
                 buffer[offset + i] = 0
 
-        # Header (0x80 = in use)
-        buffer[offset] = OBJECT_ENTRY_IN_USE
+        # Header: a loaded entry keeps its original header word (used/write/
+        # modified/terminal bits) via the raw copy; a fresh entry gets in-use.
+        if self.raw is None or len(self.raw) != ENTRY_SIZE:
+            buffer[offset] = OBJECT_ENTRY_IN_USE
 
         # Object name
         write_ndfs_name(buffer, offset + 2, self.object_name, NDFS_NAME_MAX)

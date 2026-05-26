@@ -35,12 +35,15 @@ def read_ndfs_name(data: _BufType, offset: int, max_len: int) -> str:
 def write_ndfs_name(data: bytearray, offset: int, name: str, max_len: int) -> None:
     """Write an NDFS name into a byte buffer.
 
-    Pads with the terminator byte (0x27) after the name.
+    Writes a single 0x27 terminator after the name (when it fits) followed by
+    NULs -- matching SINTRAN. A field full of terminators is rejected by
+    SINTRAN's directory scan. Zero-fill also clears a longer previous name.
     """
     upper = name.upper()
     length = min(len(upper), max_len)
     for i in range(length):
         data[offset + i] = ord(upper[i]) & 0x7F
-    # Fill remainder with terminator
-    for i in range(length, max_len):
-        data[offset + i] = NDFS_NAME_TERMINATOR
+    if length < max_len:
+        data[offset + length] = NDFS_NAME_TERMINATOR
+        for i in range(length + 1, max_len):
+            data[offset + i] = 0x00

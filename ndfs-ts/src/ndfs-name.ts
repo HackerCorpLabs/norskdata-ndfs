@@ -45,8 +45,13 @@ export function writeNdfsName(
   for (let i = 0; i < len; i++) {
     data[offset + i] = upper.charCodeAt(i) & 0x7f;
   }
-  // Fill remainder with terminator
-  for (let i = len; i < maxLen; i++) {
-    data[offset + i] = NDFS_NAME_TERMINATOR;
+  // SINTRAN writes a single 0x27 terminator after the name (when it fits)
+  // followed by NULs -- not a field full of terminators (which SINTRAN's
+  // directory scan rejects). Zero-fill also clears a longer previous name.
+  if (len < maxLen) {
+    data[offset + len] = NDFS_NAME_TERMINATOR;
+    for (let i = len + 1; i < maxLen; i++) {
+      data[offset + i] = 0x00;
+    }
   }
 }

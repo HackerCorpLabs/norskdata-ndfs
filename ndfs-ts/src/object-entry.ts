@@ -181,8 +181,11 @@ export class ObjectEntry {
       buffer.fill(0, offset, offset + ENTRY_SIZE);
     }
 
-    // Header (0x80 = in use)
-    buffer[offset] = OBJECT_ENTRY_IN_USE;
+    // Header: a loaded entry keeps its original header word (used/write/
+    // modified/terminal bits) via the raw copy; a fresh entry gets in-use.
+    if (!this.raw || this.raw.length !== ENTRY_SIZE) {
+      buffer[offset] = OBJECT_ENTRY_IN_USE;
+    }
 
     // Object name
     writeNdfsName(buffer, offset + 2, this.objectName, NDFS_NAME_MAX);

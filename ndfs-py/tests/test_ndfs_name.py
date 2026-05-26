@@ -35,7 +35,9 @@ class TestReadNdfsName:
 
 
 class TestWriteNdfsName:
-    def test_writes_name_and_pads_with_0x27(self):
+    def test_writes_name_terminator_then_nuls(self):
+        # SINTRAN writes one 0x27 terminator after the name, then NULs (verified
+        # against real on-disk entries), NOT a field full of terminators.
         buf = bytearray(8)
         write_ndfs_name(buf, 0, "TEST", 8)
         assert buf[0] == 0x54  # T
@@ -43,7 +45,9 @@ class TestWriteNdfsName:
         assert buf[2] == 0x53  # S
         assert buf[3] == 0x54  # T
         assert buf[4] == NDFS_NAME_TERMINATOR
-        assert buf[5] == NDFS_NAME_TERMINATOR
+        assert buf[5] == 0x00
+        assert buf[6] == 0x00
+        assert buf[7] == 0x00
 
     def test_uppercases_the_name(self):
         buf = bytearray(8)

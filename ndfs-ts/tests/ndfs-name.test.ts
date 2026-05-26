@@ -32,7 +32,9 @@ describe('NDFS name encoding', () => {
   });
 
   describe('writeNdfsName', () => {
-    it('writes name and pads with 0x27', () => {
+    it('writes name, one terminator, then NULs (SINTRAN format)', () => {
+      // Verified against real on-disk entries: one 0x27 terminator then NULs,
+      // not a field full of terminators.
       const buf = new Uint8Array(8);
       writeNdfsName(buf, 0, 'TEST', 8);
       expect(buf[0]).toBe(0x54); // T
@@ -40,7 +42,9 @@ describe('NDFS name encoding', () => {
       expect(buf[2]).toBe(0x53); // S
       expect(buf[3]).toBe(0x54); // T
       expect(buf[4]).toBe(NDFS_NAME_TERMINATOR);
-      expect(buf[5]).toBe(NDFS_NAME_TERMINATOR);
+      expect(buf[5]).toBe(0x00);
+      expect(buf[6]).toBe(0x00);
+      expect(buf[7]).toBe(0x00);
     });
 
     it('uppercases the name', () => {
