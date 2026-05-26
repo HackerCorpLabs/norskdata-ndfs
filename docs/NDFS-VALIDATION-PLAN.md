@@ -244,6 +244,17 @@ For each divergence the matrix surfaces:
 - ✅ **>512-page files** rejected in C/PY (were corrupting the adjacent block);
   TS uses sub-indexed.
 - ✅ Object header word preserved on rewrite (used/modified bits).
+- ✅ **Friend management** — list/add/remove a user's friends (the 8 x 2-byte
+  RWACD entries at user-entry offset 48). Added `ndfs_list_friends` /
+  `ndfs_add_friend` / `ndfs_remove_friend` (C) and the equivalents in py/ts,
+  plus C `UserEntry` friend helpers + a permission-letters parser. ndtool
+  gains `--friends` / `--friendadd OWNER:FRIEND[:RWACD]` / `--frienddel`
+  and shell `friends`/`friendadd`/`frienddel`; `stat USER` now shows a user's
+  details + friend list. Persisted surgically (owner's user page only).
+  Owner/friend accept a name or index. Tests added in all three.
+- ✅ **ndtool command rename** — quota commands are now `--quotaadd` /
+  `--quotadel` (were `--addquota` / `--remquota`); friend commands use the
+  same `<noun><add|del>` style. Hard rename (old quota names removed).
 - ✅ **Empty file type defaulted to "DATA" on read** — `from_bytes`/`fromBytes`
   rewrote an intentionally-empty type field (e.g. `TERMINAL`: `27 00 00 00`)
   to `44 41 54 41` on the next write-back. Now the empty type is preserved

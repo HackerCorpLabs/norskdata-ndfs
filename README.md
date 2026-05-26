@@ -21,7 +21,7 @@ Three standalone libraries with identical APIs, plus a CLI tool:
 
 - **Read and write files** to/from NDFS disk images (contiguous, indexed, sub-indexed allocation with sparse hole support)
 - **Create new images** from templates (360KB floppy, 1.2MB floppy, 75MB SMD, 74MB Winchester, custom)
-- **User management** (add, remove, quota with addquota/remquota, password clearing, max 256 users)
+- **User management** (add, remove, quota with quotaadd/quotadel, password clearing, friends list/add/remove, max 256 users)
 - **ND-100 even parity** (strip on read, set on write -- proper calculated parity per byte, not mark parity)
 - **XAT sidecar files** for preserving NDFS metadata (permissions, file types, dates) when copying to/from host filesystems
 - **Boot loader detection** (BPUN, FLOMON, Binary formats)
