@@ -67,7 +67,6 @@ static ndfs_error_t update_existing_file(struct ndfs_filesystem *fs,
                                          int obj_idx, int user_idx,
                                          const uint8_t *file_data, size_t file_size);
 static void add_object(struct ndfs_filesystem *fs, const ndfs_object_entry_t *obj);
-static int next_object_index(const struct ndfs_filesystem *fs);
 static size_t objects_for_user_by_index(const struct ndfs_filesystem *fs, uint8_t idx);
 
 /* ── Helpers ─────────────────────────────────────────────────────── */
@@ -240,32 +239,6 @@ static int find_object(const struct ndfs_filesystem *fs, const char *path)
         }
     }
     return -1;
-}
-
-static int next_object_index(const struct ndfs_filesystem *fs)
-{
-    uint32_t max_idx = 0;
-    size_t i;
-    uint32_t candidate;
-    bool found;
-
-    for (i = 0; i < fs->object_count; i++) {
-        if (fs->objects[i].object_index >= max_idx)
-            max_idx = fs->objects[i].object_index + 1;
-    }
-
-    /* Find first gap */
-    for (candidate = 0; candidate < max_idx + 1; candidate++) {
-        found = false;
-        for (i = 0; i < fs->object_count; i++) {
-            if (fs->objects[i].object_index == candidate) {
-                found = true;
-                break;
-            }
-        }
-        if (!found) return (int)candidate;
-    }
-    return (int)max_idx;
 }
 
 static size_t objects_for_user_by_index(const struct ndfs_filesystem *fs, uint8_t idx)
@@ -593,6 +566,96 @@ static void free_file_blocks(struct ndfs_filesystem *fs,
 
 /* ── File creation/update ────────────────────────────────────────── */
 
+/* Find the next free object slot WITHIN a user's region. SINTRAN partitions
+ * the object file so each user owns 256 slots [user<<8 .. user<<8|0xFF]; the
+ * object index's high byte is the owning user. Returns -1 if the user's 256
+ * file slots are all in use. */
+static int find_free_user_slot(const struct ndfs_filesystem *fs, uint8_t user_index)
+{
+    uint32_t base = (uint32_t)user_index << 8;
+    uint32_t slot;
+    for (slot = base; slot < base + 256; slot++) {
+        size_t i;
+        bool used = false;
+        for (i = 0; i < fs->object_count; i++) {
+            if (fs->objects[i].object_index == slot) { used = true; break; }
+        }
+        if (!used) return (int)slot;
+    }
+    return -1;
+}
+
+/* Ensure the object-file directory data page that holds object entry
+ * `object_index` exists, allocating and linking it (like SINTRAN/RetroCore do
+ * on demand) if the index pointer is null. Returns the data block id, or 0 on
+ * failure. The page index in the object-file index block is object_index/32;
+ * for a user that maps to index-pointer slots user*8 .. user*8+7. */
+static uint32_t ensure_object_dir_page(struct ndfs_filesystem *fs,
+                                       uint32_t object_index)
+{
+    ndfs_master_block_t *mb = &fs->master_block;
+    uint32_t page_idx = object_index / NDFS_ENTRIES_PER_PAGE;
+    uint8_t *index_page;
+    ndfs_block_pointer_t ptr;
+    uint32_t blk;
+    uint8_t *dp;
+    ndfs_block_pointer_t newp;
+
+    if (!ndfs_bp_is_valid(&mb->object_file_ptr)) return 0;
+
+    if (mb->object_file_ptr.type == NDFS_PTR_INDEXED) {
+        if (page_idx >= NDFS_MAX_OBJECT_FILE_PTRS) return 0;
+        index_page = write_page_ptr(fs, mb->object_file_ptr.block_id);
+        if (!index_page) return 0;
+        ptr = ndfs_bp_from_bytes(index_page, page_idx * 4);
+        if (ndfs_bp_is_valid(&ptr)) return ptr.block_id;
+    } else if (mb->object_file_ptr.type == NDFS_PTR_SUBINDEXED) {
+        uint32_t sub_idx = page_idx / NDFS_MAX_OBJECT_FILE_PTRS;
+        uint32_t inner = page_idx % NDFS_MAX_OBJECT_FILE_PTRS;
+        uint8_t *sub_page = write_page_ptr(fs, mb->object_file_ptr.block_id);
+        ndfs_block_pointer_t sub_ptr;
+        if (!sub_page) return 0;
+        sub_ptr = ndfs_bp_from_bytes(sub_page, sub_idx * 4);
+        if (!ndfs_bp_is_valid(&sub_ptr)) {
+            /* Allocate a new inner index block and link it in the sub-index. */
+            if (ndfs_bf_find_free(&fs->bit_file, &blk) != NDFS_OK) return 0;
+            ndfs_bf_mark_used(&fs->bit_file, blk);
+            dp = write_page_ptr(fs, blk);
+            if (!dp) return 0;
+            memset(dp, 0, NDFS_PAGE_SIZE);
+            newp.block_id = blk;
+            newp.type = NDFS_PTR_CONTIGUOUS;
+            sub_page = write_page_ptr(fs, mb->object_file_ptr.block_id);
+            ndfs_bp_to_bytes(&newp, sub_page, sub_idx * 4);
+            sub_ptr = newp;
+        }
+        index_page = write_page_ptr(fs, sub_ptr.block_id);
+        if (!index_page) return 0;
+        ptr = ndfs_bp_from_bytes(index_page, inner * 4);
+        if (ndfs_bp_is_valid(&ptr)) return ptr.block_id;
+        page_idx = inner; /* offset within the inner index block */
+    } else {
+        return 0;
+    }
+
+    /* Allocate + link a new directory data page. */
+    if (ndfs_bf_find_free(&fs->bit_file, &blk) != NDFS_OK) return 0;
+    ndfs_bf_mark_used(&fs->bit_file, blk);
+    dp = write_page_ptr(fs, blk);
+    if (!dp) return 0;
+    memset(dp, 0, NDFS_PAGE_SIZE);
+    newp.block_id = blk;
+    newp.type = NDFS_PTR_CONTIGUOUS;
+    /* Re-fetch the index page pointer and write the link. */
+    if (mb->object_file_ptr.type == NDFS_PTR_INDEXED) {
+        index_page = write_page_ptr(fs, mb->object_file_ptr.block_id);
+        ndfs_bp_to_bytes(&newp, index_page, (object_index / NDFS_ENTRIES_PER_PAGE) * 4);
+    } else {
+        ndfs_bp_to_bytes(&newp, index_page, page_idx * 4);
+    }
+    return blk;
+}
+
 static ndfs_error_t create_new_file(struct ndfs_filesystem *fs,
                                     const char *obj_name, const char *file_type,
                                     int user_slot,
@@ -602,10 +665,21 @@ static ndfs_error_t create_new_file(struct ndfs_filesystem *fs,
     uint32_t index_block_id;
     uint8_t *index_page_buf;
     uint32_t i;
+    uint32_t obj_index;
+    int slot;
     ndfs_object_entry_t entry;
     ndfs_error_t err;
 
     if (data_pages == 0) data_pages = 1;
+
+    /* Choose the object slot inside the OWNING USER's region (SINTRAN
+     * partitions the object file: user U owns slots U*256..U*256+255 and the
+     * object-index high byte is the owner). A flat global slot would land the
+     * file in the wrong user. Make sure that user's directory page exists. */
+    slot = find_free_user_slot(fs, fs->users[user_slot].user_index);
+    if (slot < 0) return NDFS_ERR_NO_SPACE;
+    obj_index = (uint32_t)slot;
+    if (ensure_object_dir_page(fs, obj_index) == 0) return NDFS_ERR_NO_SPACE;
 
     /* Allocate index block */
     err = ndfs_bf_find_free(&fs->bit_file, &index_block_id);
@@ -659,7 +733,7 @@ static ndfs_error_t create_new_file(struct ndfs_filesystem *fs,
 
     /* Create object entry */
     ndfs_oe_init(&entry);
-    entry.object_index = (uint32_t)next_object_index(fs);
+    entry.object_index = obj_index;
     {
         size_t nlen = strlen(obj_name);
         if (nlen > NDFS_NAME_MAX) nlen = NDFS_NAME_MAX;
@@ -685,13 +759,12 @@ static ndfs_error_t create_new_file(struct ndfs_filesystem *fs,
      * used here. */
     entry.access_bits = NDFS_ACCESS_DEFAULT;
     entry.file_type_flags = NDFS_FT_INDEXED;
-    /* SINTRAN object index = [user index | physical slot] and a single-version
-     * file points its next/prev version at itself. Without this SINTRAN sees a
-     * broken version chain (";2") and refuses to open the file. */
-    entry.disk_object_index = (uint16_t)(((uint16_t)entry.user_index << 8) |
-                                         (entry.object_index & 0xFF));
-    entry.next_version = entry.disk_object_index;
-    entry.prev_version = entry.disk_object_index;
+    /* object_index already encodes [user|fileEntry] (it was chosen inside the
+     * user's region). The object-index word and a single-version file's
+     * self-referential next/prev version all equal it. */
+    entry.disk_object_index = (uint16_t)obj_index;
+    entry.next_version = (uint16_t)obj_index;
+    entry.prev_version = (uint16_t)obj_index;
 
     add_object(fs, &entry);
 

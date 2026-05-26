@@ -842,11 +842,50 @@ static int test_new_file_version_self_ref(void)
     return 0;
 }
 
+/* Regression: a file created for a non-SYSTEM user must get an object index
+ * inside that user's region (high byte == user index), so SINTRAN places it
+ * under the right user -- not the first free global slot (which would land it
+ * under SYSTEM). */
+static int test_new_file_lands_in_owning_user_region(void)
+{
+    uint8_t *img = create_test_image();
+    ndfs_filesystem_t *fs = NULL;
+    ndfs_object_entry_t obj;
+    ndfs_user_entry_t *users = NULL;
+    size_t count = 0;
+    uint8_t guest_idx;
+
+    ndfs_open_buffer_copy(img, TEST_IMAGE_SIZE, false, &fs);
+    TEST_ASSERT_OK(ndfs_add_user(fs, "GUEST", 200));
+    ndfs_get_users(fs, &users, &count);
+    /* GUEST is the second user; capture its (non-zero) index. */
+    guest_idx = users[1].user_index;
+    ndfs_free_users(users);
+    TEST_ASSERT(guest_idx != 0);
+
+    TEST_ASSERT_OK(ndfs_write_file(fs, "GUEST/HELLO:TEXT",
+                                   (const uint8_t *)"hi", 2));
+    TEST_ASSERT_OK(ndfs_get_object_entry(fs, "HELLO:TEXT", "GUEST", &obj));
+
+    /* Object index high byte == owning user; whole index in user's region. */
+    TEST_ASSERT_EQUAL(guest_idx, (obj.disk_object_index >> 8) & 0xFF);
+    TEST_ASSERT_EQUAL(guest_idx, obj.user_index);
+    TEST_ASSERT(obj.object_index >= (uint32_t)guest_idx * 256);
+    TEST_ASSERT(obj.object_index < ((uint32_t)guest_idx + 1) * 256);
+    /* Self-referential version chain. */
+    TEST_ASSERT_EQUAL(obj.disk_object_index, obj.next_version);
+
+    ndfs_close(fs);
+    free(img);
+    return 0;
+}
+
 void run_filesystem_tests(void)
 {
     TEST_SUITE_BEGIN("Filesystem Tests");
     RUN_TEST(test_delete_persists_after_reload);
     RUN_TEST(test_new_file_version_self_ref);
+    RUN_TEST(test_new_file_lands_in_owning_user_region);
     RUN_TEST(test_open_close);
     RUN_TEST(test_directory_name);
     RUN_TEST(test_list_root);
