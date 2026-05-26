@@ -24,6 +24,9 @@ from ndfs.xat import (
     XAT_ACCESS_BITS,
     XAT_FILE_TYPE_FLAGS,
     XAT_FILE_TYPE,
+    XAT_DEVICE_NUMBER,
+    XAT_NEXT_VERSION,
+    XAT_PREV_VERSION,
     XAT_PAGES_IN_FILE,
     XAT_BYTES_IN_FILE,
     XAT_DATE_CREATED,
@@ -98,6 +101,9 @@ class TestObjectEntryToXat:
         entry.date_created = 12345
         entry.last_date_read = 67890
         entry.last_date_written = 11111
+        entry.device_number = 5
+        entry.next_version = 42
+        entry.prev_version = 43
 
         xat = object_entry_to_xat(entry)
 
@@ -108,6 +114,9 @@ class TestObjectEntryToXat:
         assert xat[XAT_ACCESS_BITS] == 1279
         assert xat[XAT_FILE_TYPE_FLAGS] == 0
         assert xat[XAT_FILE_TYPE] == 3
+        assert xat[XAT_DEVICE_NUMBER] == 5
+        assert xat[XAT_NEXT_VERSION] == 42
+        assert xat[XAT_PREV_VERSION] == 43
         assert xat[XAT_PAGES_IN_FILE] == 1
         assert xat[XAT_BYTES_IN_FILE] == 1024
         assert xat[XAT_DATE_CREATED] == 12345
@@ -306,3 +315,52 @@ class TestFilesystemXatIntegration:
         assert len(data2) == 4
         assert data2[0] == 65
         assert props2[XAT_ACCESS_BITS] == 777
+
+
+class TestXatDeviceAndVersion:
+    """Tests for the 3 new XAT fields: device_number, next_version, prev_version."""
+
+    def test_from_object_captures_all_three(self):
+        entry = ObjectEntry()
+        entry.object_name = "TEST"
+        entry.type = "DATA"
+        entry.device_number = 42
+        entry.next_version = 100
+        entry.prev_version = 200
+
+        xat = object_entry_to_xat(entry)
+        assert xat[XAT_DEVICE_NUMBER] == 42
+        assert xat[XAT_NEXT_VERSION] == 100
+        assert xat[XAT_PREV_VERSION] == 200
+
+    def test_json_round_trip_preserves_all_three(self):
+        entry = ObjectEntry()
+        entry.device_number = 7
+        entry.next_version = 55
+        entry.prev_version = 33
+
+        xat = object_entry_to_xat(entry)
+        json_str = serialize_xat(xat)
+        restored = deserialize_xat(json_str)
+
+        assert restored[XAT_DEVICE_NUMBER] == 7
+        assert restored[XAT_NEXT_VERSION] == 55
+        assert restored[XAT_PREV_VERSION] == 33
+
+    def test_apply_restores_device_but_not_versions(self):
+        """device_number is restored; next/prev_version are NOT (they're dangling refs)."""
+        xat = {
+            XAT_DEVICE_NUMBER: 42,
+            XAT_NEXT_VERSION: 100,
+            XAT_PREV_VERSION: 200,
+        }
+        entry = ObjectEntry()
+        entry.device_number = 0
+        entry.next_version = 999  # sentinel
+        entry.prev_version = 888  # sentinel
+
+        xat_to_object_entry(xat, entry)
+
+        assert entry.device_number == 42  # restored
+        assert entry.next_version == 999  # NOT changed
+        assert entry.prev_version == 888  # NOT changed

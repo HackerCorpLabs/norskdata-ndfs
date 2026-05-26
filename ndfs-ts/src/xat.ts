@@ -25,6 +25,9 @@ export const XAT_KEYS = {
   ACCESS_BITS: 'ndfs.access_bits',
   FILE_TYPE_FLAGS: 'ndfs.file_type_flags',
   FILE_TYPE: 'ndfs.file_type',
+  DEVICE_NUMBER: 'ndfs.device_number',
+  NEXT_VERSION: 'ndfs.next_version',
+  PREV_VERSION: 'ndfs.prev_version',
   PAGES_IN_FILE: 'ndfs.pages_in_file',
   BYTES_IN_FILE: 'ndfs.bytes_in_file',
   DATE_CREATED: 'ndfs.date_created',
@@ -51,6 +54,9 @@ export function objectEntryToXat(entry: ObjectEntry): XatProperties {
   props[XAT_KEYS.ACCESS_BITS] = entry.accessBits;
   props[XAT_KEYS.FILE_TYPE_FLAGS] = entry.fileTypeFlags;
   props[XAT_KEYS.FILE_TYPE] = entry.fileType;
+  props[XAT_KEYS.DEVICE_NUMBER] = entry.deviceNumber;
+  props[XAT_KEYS.NEXT_VERSION] = entry.nextVersion;
+  props[XAT_KEYS.PREV_VERSION] = entry.prevVersion;
   props[XAT_KEYS.PAGES_IN_FILE] = entry.pagesInFile;
   props[XAT_KEYS.BYTES_IN_FILE] = entry.bytesInFile;
   props[XAT_KEYS.DATE_CREATED] = entry.dateCreated;
@@ -88,6 +94,11 @@ export function xatToObjectEntry(xat: XatProperties, entry: ObjectEntry): void {
   ) {
     entry.fileTypeFlags = xat[XAT_KEYS.FILE_TYPE_FLAGS] as number;
   }
+  if (XAT_KEYS.DEVICE_NUMBER in xat && typeof xat[XAT_KEYS.DEVICE_NUMBER] === 'number') {
+    entry.deviceNumber = xat[XAT_KEYS.DEVICE_NUMBER] as number;
+  }
+  // nextVersion / prevVersion: recorded in XAT for fidelity but NOT restored.
+  // They reference object-table slots that are reassigned on import.
   if (XAT_KEYS.PAGES_IN_FILE in xat && typeof xat[XAT_KEYS.PAGES_IN_FILE] === 'number') {
     entry.pagesInFile = xat[XAT_KEYS.PAGES_IN_FILE] as number;
   }

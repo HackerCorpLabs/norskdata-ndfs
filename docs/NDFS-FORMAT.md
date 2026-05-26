@@ -400,6 +400,9 @@ XAT files use simple JSON with `ndfs.*` prefixed keys:
   "ndfs.access_bits": 1279,
   "ndfs.file_type_flags": 8,
   "ndfs.file_type": 3,
+  "ndfs.device_number": 0,
+  "ndfs.next_version": 0,
+  "ndfs.prev_version": 0,
   "ndfs.pages_in_file": 1,
   "ndfs.bytes_in_file": 1024,
   "ndfs.date_created": 0,
@@ -419,6 +422,9 @@ XAT files use simple JSON with `ndfs.*` prefixed keys:
 | `ndfs.access_bits` | integer | 15-bit permission encoding (see Access Permissions above) |
 | `ndfs.file_type_flags` | integer | Bit field: Terminal(0x01), Peripheral(0x02), Spooling(0x04), Indexed(0x08), Contiguous(0x10), Allocated(0x20), MagneticTape(0x40), Library(0x80) |
 | `ndfs.file_type` | integer | Type code: 0=DATA, 1=PROG, 2=SYMB, 3=TEXT |
+| `ndfs.device_number` | integer | Logical device number (restored on import) |
+| `ndfs.next_version` | integer | Next version pointer (recorded only, NOT restored -- references object-table slots that change on import) |
+| `ndfs.prev_version` | integer | Previous version pointer (recorded only, NOT restored) |
 | `ndfs.pages_in_file` | integer | File size in 2048-byte pages |
 | `ndfs.bytes_in_file` | integer | File size in bytes |
 | `ndfs.date_created` | integer | Creation date (ND timestamp, see ND Timestamp Format) |

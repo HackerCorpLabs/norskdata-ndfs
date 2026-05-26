@@ -318,4 +318,53 @@ describe('XAT', () => {
       expect(restored.properties[XAT_KEYS.ACCESS_BITS]).toBe(777);
     });
   });
+
+  describe('device_number and version pointers', () => {
+    it('captures all three from ObjectEntry', () => {
+      const entry = new ObjectEntry();
+      entry.objectName = 'TEST';
+      entry.type = 'DATA';
+      entry.deviceNumber = 42;
+      entry.nextVersion = 100;
+      entry.prevVersion = 200;
+
+      const xat = objectEntryToXat(entry);
+      expect(xat[XAT_KEYS.DEVICE_NUMBER]).toBe(42);
+      expect(xat[XAT_KEYS.NEXT_VERSION]).toBe(100);
+      expect(xat[XAT_KEYS.PREV_VERSION]).toBe(200);
+    });
+
+    it('JSON round-trip preserves all three', () => {
+      const entry = new ObjectEntry();
+      entry.deviceNumber = 7;
+      entry.nextVersion = 55;
+      entry.prevVersion = 33;
+
+      const xat = objectEntryToXat(entry);
+      const json = serializeXat(xat);
+      const restored = deserializeXat(json);
+
+      expect(restored[XAT_KEYS.DEVICE_NUMBER]).toBe(7);
+      expect(restored[XAT_KEYS.NEXT_VERSION]).toBe(55);
+      expect(restored[XAT_KEYS.PREV_VERSION]).toBe(33);
+    });
+
+    it('restores device_number but NOT version pointers', () => {
+      const xat: XatProperties = {
+        [XAT_KEYS.DEVICE_NUMBER]: 42,
+        [XAT_KEYS.NEXT_VERSION]: 100,
+        [XAT_KEYS.PREV_VERSION]: 200,
+      };
+      const entry = new ObjectEntry();
+      entry.deviceNumber = 0;
+      entry.nextVersion = 999;  // sentinel
+      entry.prevVersion = 888;  // sentinel
+
+      xatToObjectEntry(xat, entry);
+
+      expect(entry.deviceNumber).toBe(42);   // restored
+      expect(entry.nextVersion).toBe(999);   // NOT changed
+      expect(entry.prevVersion).toBe(888);   // NOT changed
+    });
+  });
 });

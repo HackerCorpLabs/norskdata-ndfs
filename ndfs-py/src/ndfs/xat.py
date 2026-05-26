@@ -28,6 +28,9 @@ XAT_USER_INDEX = "ndfs.user_index"
 XAT_ACCESS_BITS = "ndfs.access_bits"
 XAT_FILE_TYPE_FLAGS = "ndfs.file_type_flags"
 XAT_FILE_TYPE = "ndfs.file_type"
+XAT_DEVICE_NUMBER = "ndfs.device_number"
+XAT_NEXT_VERSION = "ndfs.next_version"
+XAT_PREV_VERSION = "ndfs.prev_version"
 XAT_PAGES_IN_FILE = "ndfs.pages_in_file"
 XAT_BYTES_IN_FILE = "ndfs.bytes_in_file"
 XAT_DATE_CREATED = "ndfs.date_created"
@@ -42,6 +45,9 @@ ALL_XAT_KEYS = [
     XAT_ACCESS_BITS,
     XAT_FILE_TYPE_FLAGS,
     XAT_FILE_TYPE,
+    XAT_DEVICE_NUMBER,
+    XAT_NEXT_VERSION,
+    XAT_PREV_VERSION,
     XAT_PAGES_IN_FILE,
     XAT_BYTES_IN_FILE,
     XAT_DATE_CREATED,
@@ -65,6 +71,9 @@ def object_entry_to_xat(entry: ObjectEntry) -> dict:
     props[XAT_ACCESS_BITS] = entry.access_bits
     props[XAT_FILE_TYPE_FLAGS] = entry.file_type_flags
     props[XAT_FILE_TYPE] = entry.file_type
+    props[XAT_DEVICE_NUMBER] = entry.device_number
+    props[XAT_NEXT_VERSION] = entry.next_version
+    props[XAT_PREV_VERSION] = entry.prev_version
     props[XAT_PAGES_IN_FILE] = entry.pages_in_file
     props[XAT_BYTES_IN_FILE] = entry.bytes_in_file
     props[XAT_DATE_CREATED] = entry.date_created
@@ -92,6 +101,10 @@ def xat_to_object_entry(xat: dict, entry: ObjectEntry) -> None:
         entry.file_type = xat[XAT_FILE_TYPE]
     if XAT_FILE_TYPE_FLAGS in xat and isinstance(xat[XAT_FILE_TYPE_FLAGS], int):
         entry.file_type_flags = xat[XAT_FILE_TYPE_FLAGS]
+    if XAT_DEVICE_NUMBER in xat and isinstance(xat[XAT_DEVICE_NUMBER], int):
+        entry.device_number = xat[XAT_DEVICE_NUMBER]
+    # next_version / prev_version: recorded in XAT for fidelity but NOT restored.
+    # They reference object-table slots that are reassigned on import.
     if XAT_PAGES_IN_FILE in xat and isinstance(xat[XAT_PAGES_IN_FILE], int):
         entry.pages_in_file = xat[XAT_PAGES_IN_FILE]
     if XAT_BYTES_IN_FILE in xat and isinstance(xat[XAT_BYTES_IN_FILE], int):
