@@ -110,5 +110,55 @@ describe('ObjectEntry', () => {
       expect(parsed!.filePointer!.blockId).toBe(50);
       expect(parsed!.filePointer!.type).toBe(PointerType.Indexed);
     });
+
+    it('round-trips extended fields (versioning, access, dates, open counts)', () => {
+      const entry = new ObjectEntry();
+      entry.objectName = 'LOAD';
+      entry.type = 'MODE';
+      entry.nextVersion = 20;
+      entry.prevVersion = 20;
+      entry.accessBits = 0x00ff;
+      entry.fileTypeFlags = 0x08; // Indexed
+      entry.deviceNumber = 0;
+      entry.totalOpenCount = 145;
+      entry.dateCreated = 0x01020304;
+      entry.lastDateRead = 0x05060708;
+      entry.lastDateWritten = 0x090a0b0c;
+      entry.pagesInFile = 5;
+      entry.bytesInFile = 4621;
+      entry.filePointer = new BlockPointer(18419, PointerType.Indexed);
+
+      const buf = new Uint8Array(ENTRY_SIZE);
+      entry.toBytes(buf, 0);
+      const p = ObjectEntry.fromBytes(buf, 0)!;
+      expect(p.nextVersion).toBe(20);
+      expect(p.prevVersion).toBe(20);
+      expect(p.accessBits).toBe(0x00ff);
+      expect(p.fileTypeFlags).toBe(0x08);
+      expect(p.totalOpenCount).toBe(145);
+      expect(p.dateCreated).toBe(0x01020304);
+      expect(p.lastDateRead).toBe(0x05060708);
+      expect(p.lastDateWritten).toBe(0x090a0b0c);
+
+      // Encoding stable.
+      const buf2 = new Uint8Array(ENTRY_SIZE);
+      p.toBytes(buf2, 0);
+      expect(Array.from(buf2)).toEqual(Array.from(buf));
+    });
+
+    it('preserves unmodelled bytes via raw on re-serialize', () => {
+      const buf = new Uint8Array(ENTRY_SIZE);
+      for (let i = 0; i < ENTRY_SIZE; i++) buf[i] = i + 1;
+      buf[0] = OBJECT_ENTRY_IN_USE;
+      const p = ObjectEntry.fromBytes(buf, 0)!;
+      p.accessBits = 0x03ff;
+      const out = new Uint8Array(ENTRY_SIZE);
+      p.toBytes(out, 0);
+      // bytes 33 and 35 are unmodelled and must survive
+      expect(out[33]).toBe(buf[33]);
+      expect(out[35]).toBe(buf[35]);
+      expect(out[26]).toBe(0x03);
+      expect(out[27]).toBe(0xff);
+    });
   });
 });

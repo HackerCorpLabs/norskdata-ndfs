@@ -680,6 +680,11 @@ static ndfs_error_t create_new_file(struct ndfs_filesystem *fs,
     entry.bytes_in_file = file_size > 0 ? (uint32_t)file_size : 1;
     entry.file_pointer.block_id = index_block_id;
     entry.file_pointer.type = NDFS_PTR_INDEXED;
+    /* Sensible defaults for a freshly-created file: owner (and friends) get
+     * full rights, and the allocation type flag reflects the indexed layout
+     * used here. */
+    entry.access_bits = NDFS_ACCESS_DEFAULT;
+    entry.file_type_flags = NDFS_FT_INDEXED;
 
     add_object(fs, &entry);
 
@@ -761,6 +766,9 @@ static ndfs_error_t update_existing_file(struct ndfs_filesystem *fs,
     existing->bytes_in_file = file_size > 0 ? (uint32_t)file_size : 1;
     existing->file_pointer.block_id = index_block_id;
     existing->file_pointer.type = NDFS_PTR_INDEXED;
+    /* Rewritten as an indexed file; keep the allocation flag consistent.
+     * Access bits, dates and versioning are intentionally preserved. */
+    existing->file_type_flags = NDFS_FT_INDEXED;
 
     fs->users[user_slot].pages_used += data_pages + 1;
 
@@ -1448,6 +1456,64 @@ ndfs_error_t ndfs_clear_user_password_by_index(ndfs_filesystem_t *fs,
 }
 
 /* ── Read operations (extended) ──────────────────────────────────── */
+
+ndfs_error_t ndfs_get_file_blocks(const ndfs_filesystem_t *fs, const char *path,
+                                  uint32_t **out_blocks, size_t *out_count)
+{
+    int idx;
+    const ndfs_object_entry_t *obj;
+    uint32_t *blocks;
+    size_t cap, n = 0;
+
+    if (!fs || !path || !out_blocks || !out_count) return NDFS_ERR_NULL_PTR;
+    *out_blocks = NULL;
+    *out_count = 0;
+
+    idx = find_object(fs, path);
+    if (idx < 0) return NDFS_ERR_NOT_FOUND;
+    obj = &fs->objects[idx];
+
+    cap = obj->pages_in_file ? obj->pages_in_file : 1;
+    blocks = (uint32_t *)malloc(cap * sizeof(uint32_t));
+    if (!blocks) return NDFS_ERR_ALLOC;
+
+    if (obj->file_pointer.type == NDFS_PTR_CONTIGUOUS) {
+        uint32_t i;
+        for (i = 0; i < obj->pages_in_file; i++) {
+            blocks[n++] = obj->file_pointer.block_id + i;
+        }
+    } else if (obj->file_pointer.type == NDFS_PTR_INDEXED) {
+        const uint8_t *ib = read_page(fs, obj->file_pointer.block_id);
+        uint32_t i;
+        if (!ib) { free(blocks); return NDFS_ERR_CORRUPT; }
+        for (i = 0; i < obj->pages_in_file && i < 512; i++) {
+            ndfs_block_pointer_t p = ndfs_bp_from_bytes(ib, i * 4);
+            blocks[n++] = p.block_id;
+        }
+    } else if (obj->file_pointer.type == NDFS_PTR_SUBINDEXED) {
+        const uint8_t *sib = read_page(fs, obj->file_pointer.block_id);
+        uint32_t remaining = obj->pages_in_file;
+        uint32_t si;
+        if (!sib) { free(blocks); return NDFS_ERR_CORRUPT; }
+        for (si = 0; si < 512 && remaining > 0; si++) {
+            ndfs_block_pointer_t ip = ndfs_bp_from_bytes(sib, si * 4);
+            const uint8_t *ib;
+            uint32_t j;
+            if (ip.block_id == 0) break;
+            ib = read_page(fs, ip.block_id);
+            if (!ib) { free(blocks); return NDFS_ERR_CORRUPT; }
+            for (j = 0; j < 512 && remaining > 0; j++) {
+                ndfs_block_pointer_t dp = ndfs_bp_from_bytes(ib, j * 4);
+                blocks[n++] = dp.block_id;
+                remaining--;
+            }
+        }
+    }
+
+    *out_blocks = blocks;
+    *out_count = n;
+    return NDFS_OK;
+}
 
 ndfs_error_t ndfs_file_exists(const ndfs_filesystem_t *fs, const char *path,
                               bool *out_exists)

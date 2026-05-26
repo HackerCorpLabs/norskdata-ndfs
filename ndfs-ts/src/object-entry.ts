@@ -6,11 +6,18 @@
  *   1:     Reserved
  *   2-17:  Object name (16 bytes, terminated by 0x27)
  *   18-21: File type (4 bytes, terminated by 0x27)
- *   22-31: Reserved / versioning / access
+ *   22-23: Next version (u16)
+ *   24-25: Previous version (u16)
+ *   26-27: Access bits (u16, 3x5-bit OWN/FRIEND/PUBLIC)
+ *   28-29: File type flags (u16: L M A C I B P T)
+ *   30-31: Device number (u16)
  *   32:    File type code (0=DATA, 1=PROG, 2=SYMB, 3=TEXT)
- *   33:    Reserved
- *   34:    User index (owner)
- *   35-51: Reserved / tracking
+ *   34:    User index (owner) / object-index word
+ *   36-37: Current open count (u16)
+ *   38-39: Total open count (u16)
+ *   40-43: Date created (u32, ND timestamp)
+ *   44-47: Last date opened for read (u32, ND timestamp)
+ *   48-51: Last date opened for write (u32, ND timestamp)
  *   52-55: Pages in file (32-bit, big-endian)
  *   56-59: Bytes in file - 1 (32-bit, big-endian; actual = stored + 1)
  *   60-63: File pointer (BlockPointer, big-endian)
@@ -27,13 +34,32 @@ import {
   NDFS_TYPE_MAX,
   NDFS_NAME_TERMINATOR,
 } from './constants.js';
-import { readUint32BE, writeUint32BE } from './endian.js';
+import {
+  readUint16BE,
+  writeUint16BE,
+  readUint32BE,
+  writeUint32BE,
+} from './endian.js';
 import { readNdfsName, writeNdfsName } from './ndfs-name.js';
 import { BlockPointer } from './block-pointer.js';
 import { PointerType } from './types.js';
 
+/** Object file_type_flags bits (offset 28): "L M A C I B P T". */
+export const FT_TERMINAL = 1 << 0;
+export const FT_PERIPHERAL = 1 << 1;
+export const FT_SPOOLING = 1 << 2;
+export const FT_INDEXED = 1 << 3;
+export const FT_CONTIGUOUS = 1 << 4;
+export const FT_ALLOCATED = 1 << 5;
+export const FT_MAGTAPE = 1 << 6;
+export const FT_LIBRARY = 1 << 7;
+
+/** Default access for a new file: OWN + FRIEND all rights, PUBLIC none. */
+export const ACCESS_DEFAULT = 0x03ff;
+
 export class ObjectEntry {
   header: number = OBJECT_ENTRY_IN_USE;
+  headerWord: number = OBJECT_ENTRY_IN_USE << 8;
   objectIndex: number = 0;
   objectName: string = '';
   type: string = 'DATA';
@@ -44,9 +70,19 @@ export class ObjectEntry {
   bytesInFile: number = 0;
   filePointer: BlockPointer | null = null;
   accessBits: number = 0;
+  nextVersion: number = 0;
+  prevVersion: number = 0;
+  fileTypeFlags: number = 0;
+  deviceNumber: number = 0;
+  diskObjectIndex: number = 0;
+  currentOpenCount: number = 0;
+  totalOpenCount: number = 0;
   dateCreated: number = 0;
   lastDateRead: number = 0;
   lastDateWritten: number = 0;
+  /** Verbatim on-disk 64 bytes, used as the base when re-serializing so
+   * unmodelled bytes survive. Null for freshly-built entries. */
+  raw: Uint8Array | null = null;
 
   /** Full name in "NAME:TYPE" format. */
   get fullName(): string {
@@ -82,7 +118,13 @@ export class ObjectEntry {
     if ((data[offset] & OBJECT_ENTRY_IN_USE) === 0) return null;
 
     const entry = new ObjectEntry();
+
+    // Preserve the verbatim 64 bytes so re-serialization never loses fields
+    // we do not explicitly model.
+    entry.raw = data.slice(offset, offset + ENTRY_SIZE);
+
     entry.header = data[offset];
+    entry.headerWord = readUint16BE(data, offset + 0);
 
     // Object name (16 bytes at offset+2)
     entry.objectName = readNdfsName(data, offset + 2, NDFS_NAME_MAX);
@@ -91,11 +133,26 @@ export class ObjectEntry {
     const typeStr = readNdfsName(data, offset + 18, NDFS_TYPE_MAX);
     entry.type = typeStr.length > 0 ? typeStr : 'DATA';
 
+    // Versioning, access, flags, device (offsets 22-31)
+    entry.nextVersion = readUint16BE(data, offset + 22);
+    entry.prevVersion = readUint16BE(data, offset + 24);
+    entry.accessBits = readUint16BE(data, offset + 26);
+    entry.fileTypeFlags = readUint16BE(data, offset + 28);
+    entry.deviceNumber = readUint16BE(data, offset + 30);
+
     // File type code (byte 32)
     entry.fileType = data[offset + 32];
 
-    // User index (byte 34)
+    // User index (byte 34) / object-index word
     entry.userIndex = data[offset + 34];
+    entry.diskObjectIndex = readUint16BE(data, offset + 34);
+
+    // Open counts and timestamps (offsets 36-51, big-endian)
+    entry.currentOpenCount = readUint16BE(data, offset + 36);
+    entry.totalOpenCount = readUint16BE(data, offset + 38);
+    entry.dateCreated = readUint32BE(data, offset + 40);
+    entry.lastDateRead = readUint32BE(data, offset + 44);
+    entry.lastDateWritten = readUint32BE(data, offset + 48);
 
     // Pages in file (bytes 52-55, big-endian)
     entry.pagesInFile = readUint32BE(data, offset + 52);
@@ -115,8 +172,14 @@ export class ObjectEntry {
       throw new Error('Insufficient buffer for object entry');
     }
 
-    // Clear the entry area
-    buffer.fill(0, offset, offset + ENTRY_SIZE);
+    // Base on the original on-disk bytes when available so unmodelled bytes
+    // (e.g. byte 33, the low byte of the object-index word) survive; otherwise
+    // start from zero.
+    if (this.raw && this.raw.length === ENTRY_SIZE) {
+      buffer.set(this.raw, offset);
+    } else {
+      buffer.fill(0, offset, offset + ENTRY_SIZE);
+    }
 
     // Header (0x80 = in use)
     buffer[offset] = OBJECT_ENTRY_IN_USE;
@@ -127,11 +190,25 @@ export class ObjectEntry {
     // File type string
     writeNdfsName(buffer, offset + 18, this.type, NDFS_TYPE_MAX);
 
+    // Versioning, access, flags, device (offsets 22-31)
+    writeUint16BE(buffer, offset + 22, this.nextVersion);
+    writeUint16BE(buffer, offset + 24, this.prevVersion);
+    writeUint16BE(buffer, offset + 26, this.accessBits);
+    writeUint16BE(buffer, offset + 28, this.fileTypeFlags);
+    writeUint16BE(buffer, offset + 30, this.deviceNumber);
+
     // File type code
     buffer[offset + 32] = this.fileType & 0xff;
 
     // User index
     buffer[offset + 34] = this.userIndex & 0xff;
+
+    // Open counts and timestamps (offsets 36-51)
+    writeUint16BE(buffer, offset + 36, this.currentOpenCount);
+    writeUint16BE(buffer, offset + 38, this.totalOpenCount);
+    writeUint32BE(buffer, offset + 40, this.dateCreated);
+    writeUint32BE(buffer, offset + 44, this.lastDateRead);
+    writeUint32BE(buffer, offset + 48, this.lastDateWritten);
 
     // Pages in file
     writeUint32BE(buffer, offset + 52, this.pagesInFile);

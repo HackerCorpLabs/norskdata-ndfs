@@ -12,9 +12,10 @@
  *   32-35: Pages used (32-bit, big-endian)
  *   36:    Directory index
  *   37:    User index
- *   38-39: Default file access (16-bit, big-endian)
- *   40-55: Friends (8 x 2-byte entries, big-endian)
- *   56-63: Reserved
+ *   38-39: Reserved
+ *   40-41: Default file access (16-bit, big-endian)
+ *   42-47: Reserved / tracking
+ *   48-63: Friends (8 x 2-byte entries, big-endian)
  *
  * SPDX-License-Identifier: MIT
  * Copyright (c) 1985-2026 Ronny Hansen
@@ -24,7 +25,9 @@
 #ifndef NDFS_USER_ENTRY_H
 #define NDFS_USER_ENTRY_H
 
+#include "types.h"
 #include "user_friend.h"
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -43,6 +46,11 @@ typedef struct {
     uint8_t            directory_index;
     uint16_t           default_file_access;
     ndfs_user_friend_t friends[NDFS_MAX_FRIENDS];
+    /* Verbatim on-disk 64 bytes, used as the base when re-serializing so
+     * unmodelled bytes (38-39, 42-47 incl. the mxobl/acobl byte 47) survive.
+     * has_raw is false for freshly-built entries. */
+    uint8_t            raw[NDFS_ENTRY_SIZE];
+    bool               has_raw;
 } ndfs_user_entry_t;
 
 /**

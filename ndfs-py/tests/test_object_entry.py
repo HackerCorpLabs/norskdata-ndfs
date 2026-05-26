@@ -112,3 +112,52 @@ class TestObjectEntryToBytesRoundTrip:
         assert parsed.bytes_in_file == 20000
         assert parsed.file_pointer.block_id == 50
         assert parsed.file_pointer.type == PointerType.Indexed
+
+
+def test_extended_fields_roundtrip():
+    """Versioning, access, flags, open counts and dates survive a round trip."""
+    from ndfs.object_entry import FT_INDEXED
+    entry = ObjectEntry()
+    entry.object_name = "LOAD"
+    entry.type = "MODE"
+    entry.next_version = 20
+    entry.prev_version = 20
+    entry.access_bits = 0x00FF
+    entry.file_type_flags = FT_INDEXED
+    entry.total_open_count = 145
+    entry.date_created = 0x01020304
+    entry.last_date_read = 0x05060708
+    entry.last_date_written = 0x090A0B0C
+    entry.pages_in_file = 5
+    entry.bytes_in_file = 4621
+    entry.file_pointer = BlockPointer(18419, PointerType.Indexed)
+
+    buf = bytearray(64)
+    entry.to_bytes(buf, 0)
+    p = ObjectEntry.from_bytes(buf, 0)
+    assert p.next_version == 20
+    assert p.prev_version == 20
+    assert p.access_bits == 0x00FF
+    assert p.file_type_flags == FT_INDEXED
+    assert p.total_open_count == 145
+    assert p.date_created == 0x01020304
+    assert p.last_date_read == 0x05060708
+    assert p.last_date_written == 0x090A0B0C
+
+    buf2 = bytearray(64)
+    p.to_bytes(buf2, 0)
+    assert bytes(buf2) == bytes(buf)
+
+
+def test_preserves_unmodelled_bytes():
+    """Bytes 33 and 35 (unmodelled) survive re-serialization via raw."""
+    buf = bytearray(range(1, 65))
+    buf[0] = 0x80
+    p = ObjectEntry.from_bytes(buf, 0)
+    p.access_bits = 0x03FF
+    out = bytearray(64)
+    p.to_bytes(out, 0)
+    assert out[33] == buf[33]
+    assert out[35] == buf[35]
+    assert out[26] == 0x03
+    assert out[27] == 0xFF

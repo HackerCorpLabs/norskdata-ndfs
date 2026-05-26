@@ -12,9 +12,10 @@ Byte offsets:
   32-35: Pages used (32-bit, big-endian)
   36:    Directory index
   37:    User index
-  38-39: Default file access (16-bit, big-endian)
-  40-55: Friends (8 x 2-byte entries, big-endian)
-  56-63: Reserved
+  38-39: Reserved
+  40-41: Default file access (16-bit, big-endian)
+  42-47: Reserved / tracking (byte 47 = mxobl/acobl nibbles)
+  48-63: Friends (8 x 2-byte entries, big-endian)
 
 SPDX-License-Identifier: MIT
 Copyright (c) 1985-2026 Ronny Hansen
@@ -52,6 +53,7 @@ class UserEntry:
         "directory_index",
         "default_file_access",
         "friends",
+        "raw",
     )
 
     def __init__(self) -> None:
@@ -68,6 +70,9 @@ class UserEntry:
         self.friends: List[UserFriend] = []
         for _ in range(MAX_FRIENDS):
             self.friends.append(UserFriend())
+        # Verbatim on-disk 64 bytes; base for re-serialization so unmodelled
+        # bytes (38-39, 42-47) survive. None for freshly-built entries.
+        self.raw: Optional[bytes] = None
 
     @classmethod
     def from_bytes(cls, data: _BufType, offset: int) -> Optional[UserEntry]:
@@ -83,6 +88,7 @@ class UserEntry:
             return None
 
         entry = cls()
+        entry.raw = bytes(data[offset:offset + ENTRY_SIZE])
         entry.enter_count = data[offset + 1]
         entry.user_name = read_ndfs_name(data, offset + 2, NDFS_NAME_MAX)
         entry.password = read_uint16_be(data, offset + 18)
@@ -92,17 +98,20 @@ class UserEntry:
         entry.pages_used = read_uint32_be(data, offset + 32)
         entry.directory_index = data[offset + 36]
         entry.user_index = data[offset + 37]
-        entry.default_file_access = read_uint16_be(data, offset + 38)
+        # Default file access is at offset 40 (verified on-disk); 38-39 unused.
+        entry.default_file_access = read_uint16_be(data, offset + 40)
 
-        # Parse friends (8 x 2 bytes starting at offset 40)
+        # Parse friends (8 x 2 bytes starting at offset 48)
         for i in range(MAX_FRIENDS):
-            entry.friends[i] = UserFriend.from_bytes(data, offset + 40 + i * 2)
+            entry.friends[i] = UserFriend.from_bytes(data, offset + 48 + i * 2)
 
         return entry
 
     def to_bytes(self) -> bytearray:
         """Serialize to a 64-byte bytearray."""
         buf = bytearray(ENTRY_SIZE)
+        if self.raw is not None and len(self.raw) == ENTRY_SIZE:
+            buf[0:ENTRY_SIZE] = self.raw
 
         buf[0] = USER_ENTRY_FLAG
         buf[1] = self.enter_count & 0xFF
@@ -115,10 +124,10 @@ class UserEntry:
         write_uint32_be(buf, 32, self.pages_used)
         buf[36] = self.directory_index
         buf[37] = self.user_index & 0xFF
-        write_uint16_be(buf, 38, self.default_file_access)
+        write_uint16_be(buf, 40, self.default_file_access)
 
         for i in range(MAX_FRIENDS):
-            self.friends[i].to_bytes(buf, 40 + i * 2)
+            self.friends[i].to_bytes(buf, 48 + i * 2)
 
         return buf
 

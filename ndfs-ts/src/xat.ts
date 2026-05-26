@@ -49,7 +49,7 @@ export function objectEntryToXat(entry: ObjectEntry): XatProperties {
   props[XAT_KEYS.USER_NAME] = entry.userName;
   props[XAT_KEYS.USER_INDEX] = entry.userIndex;
   props[XAT_KEYS.ACCESS_BITS] = entry.accessBits;
-  props[XAT_KEYS.FILE_TYPE_FLAGS] = 0;
+  props[XAT_KEYS.FILE_TYPE_FLAGS] = entry.fileTypeFlags;
   props[XAT_KEYS.FILE_TYPE] = entry.fileType;
   props[XAT_KEYS.PAGES_IN_FILE] = entry.pagesInFile;
   props[XAT_KEYS.BYTES_IN_FILE] = entry.bytesInFile;
@@ -81,6 +81,12 @@ export function xatToObjectEntry(xat: XatProperties, entry: ObjectEntry): void {
   }
   if (XAT_KEYS.FILE_TYPE in xat && typeof xat[XAT_KEYS.FILE_TYPE] === 'number') {
     entry.fileType = xat[XAT_KEYS.FILE_TYPE] as number;
+  }
+  if (
+    XAT_KEYS.FILE_TYPE_FLAGS in xat &&
+    typeof xat[XAT_KEYS.FILE_TYPE_FLAGS] === 'number'
+  ) {
+    entry.fileTypeFlags = xat[XAT_KEYS.FILE_TYPE_FLAGS] as number;
   }
   if (XAT_KEYS.PAGES_IN_FILE in xat && typeof xat[XAT_KEYS.PAGES_IN_FILE] === 'number') {
     entry.pagesInFile = xat[XAT_KEYS.PAGES_IN_FILE] as number;

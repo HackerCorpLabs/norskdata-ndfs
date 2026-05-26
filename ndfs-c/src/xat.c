@@ -99,13 +99,13 @@ ndfs_error_t ndfs_xat_from_object(const ndfs_object_entry_t *entry,
 
     out->user_index = entry->user_index;
     out->access_bits = entry->access_bits;
-    out->file_type_flags = 0;
+    out->file_type_flags = entry->file_type_flags;
     out->file_type = entry->file_type;
     out->pages_in_file = entry->pages_in_file;
     out->bytes_in_file = entry->bytes_in_file;
-    out->date_created = 0;
-    out->last_read_date = 0;
-    out->last_write_date = 0;
+    out->date_created = entry->date_created;
+    out->last_read_date = entry->last_read_date;
+    out->last_write_date = entry->last_write_date;
 
     return NDFS_OK;
 }

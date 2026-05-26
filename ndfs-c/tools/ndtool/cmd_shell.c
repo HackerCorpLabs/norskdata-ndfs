@@ -479,34 +479,19 @@ int cmd_shell(ndtool_ctx_t *ctx)
                 }
             }
             else if (strcmp(cmd, "stat") == 0) {
-                if (!arg1) {
-                    fprintf(stderr, "Usage: stat USER/FILE:TYPE\n");
+                /* Accept "stat PATH", "stat -v PATH" or "stat PATH -v". */
+                bool verbose = false;
+                const char *path = arg1;
+                if (arg1 && strcmp(arg1, "-v") == 0) {
+                    verbose = true;
+                    path = arg2;
+                } else if (arg2 && strcmp(arg2, "-v") == 0) {
+                    verbose = true;
+                }
+                if (!path) {
+                    fprintf(stderr, "Usage: stat [-v] USER/FILE:TYPE\n");
                 } else {
-                    ndfs_file_entry_t meta;
-                    ndfs_error_t serr = ndfs_get_metadata(ctx->fs, arg1, &meta);
-                    if (serr != NDFS_OK) {
-                        fprintf(stderr, "File not found: %s\n", arg1);
-                    } else {
-                        ndfs_object_entry_t obj;
-                        printf("  Name:   %s\n", meta.full_name);
-                        printf("  User:   %s\n", meta.user_name);
-                        printf("  Size:   %u bytes\n", meta.size);
-                        printf("  Pages:  %u\n", meta.pages);
-                        /* Try to get object entry for more detail */
-                        if (ndfs_get_object_entry(ctx->fs, meta.full_name,
-                                                  meta.user_name, &obj) == NDFS_OK) {
-                            const char *ptr_str = "Unknown";
-                            switch (obj.file_pointer.type) {
-                            case NDFS_PTR_CONTIGUOUS: ptr_str = "Contiguous"; break;
-                            case NDFS_PTR_INDEXED:    ptr_str = "Indexed"; break;
-                            case NDFS_PTR_SUBINDEXED: ptr_str = "SubIndexed"; break;
-                            default: break;
-                            }
-                            printf("  Alloc:  %s (block %u)\n", ptr_str,
-                                   obj.file_pointer.block_id);
-                            printf("  Index:  %u\n", obj.object_index);
-                        }
-                    }
+                    cmd_stat(ctx, path, verbose);
                 }
             }
             else if (strcmp(cmd, "users") == 0) {

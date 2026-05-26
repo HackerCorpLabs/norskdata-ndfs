@@ -132,9 +132,42 @@ static int test_name_uppercase(void)
     return 0;
 }
 
+/* Regression: default file access lives at offset 40 (not 38) and friends
+ * start at offset 48 (not 40). Verified against real ND images. */
+static int test_access_and_friend_offsets(void)
+{
+    uint8_t buf[NDFS_ENTRY_SIZE];
+    ndfs_user_entry_t ue;
+    size_t i;
+
+    for (i = 0; i < NDFS_ENTRY_SIZE; i++) buf[i] = 0;
+    buf[0] = NDFS_USER_ENTRY_FLAG;
+    buf[37] = 0;                  /* user index */
+    buf[38] = 0x00; buf[39] = 0x00;  /* offset 38 is unused -> must be ignored */
+    buf[40] = 0x04; buf[41] = 0xFF;  /* default access at offset 40 */
+    buf[48] = 0x87; buf[49] = 0x01;  /* first friend at offset 48 */
+
+    TEST_ASSERT_OK(ndfs_ue_from_bytes(buf, NDFS_ENTRY_SIZE, 0, &ue));
+    TEST_ASSERT_EQUAL(0x04FF, ue.default_file_access);
+    TEST_ASSERT(ndfs_uf_is_active(&ue.friends[0]));
+
+    /* Round-trip must put the bytes back at the same offsets. */
+    {
+        uint8_t out[NDFS_ENTRY_SIZE];
+        ndfs_ue_to_bytes(&ue, out);
+        TEST_ASSERT_EQUAL(0x04, out[40]);
+        TEST_ASSERT_EQUAL(0xFF, out[41]);
+        TEST_ASSERT_EQUAL(0x87, out[48]);
+        TEST_ASSERT_EQUAL(0x01, out[49]);
+        TEST_ASSERT_EQUAL(0x00, out[38]);
+    }
+    return 0;
+}
+
 void run_user_entry_tests(void)
 {
     TEST_SUITE_BEGIN("UserEntry Tests");
+    RUN_TEST(test_access_and_friend_offsets);
     RUN_TEST(test_init);
     RUN_TEST(test_roundtrip);
     RUN_TEST(test_invalid_flag);

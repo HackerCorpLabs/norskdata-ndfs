@@ -6,11 +6,18 @@ Byte offsets:
   1:     Reserved
   2-17:  Object name (16 bytes, terminated by 0x27)
   18-21: File type (4 bytes, terminated by 0x27)
-  22-31: Reserved / versioning / access
+  22-23: Next version (u16)
+  24-25: Previous version (u16)
+  26-27: Access bits (u16, 3x5-bit OWN/FRIEND/PUBLIC)
+  28-29: File type flags (u16: L M A C I B P T)
+  30-31: Device number (u16)
   32:    File type code (0=DATA, 1=PROG, 2=SYMB, 3=TEXT)
-  33:    Reserved
-  34:    User index (owner)
-  35-51: Reserved / tracking
+  34:    User index (owner) / object-index word
+  36-37: Current open count (u16)
+  38-39: Total open count (u16)
+  40-43: Date created (u32, ND timestamp)
+  44-47: Last date opened for read (u32, ND timestamp)
+  48-51: Last date opened for write (u32, ND timestamp)
   52-55: Pages in file (32-bit, big-endian)
   56-59: Bytes in file - 1 (32-bit, big-endian; actual = stored + 1)
   60-63: File pointer (BlockPointer, big-endian)
@@ -29,11 +36,29 @@ from ndfs.constants import (
     NDFS_NAME_MAX,
     NDFS_TYPE_MAX,
 )
-from ndfs.endian import read_uint32_be, write_uint32_be
+from ndfs.endian import (
+    read_uint16_be,
+    write_uint16_be,
+    read_uint32_be,
+    write_uint32_be,
+)
 from ndfs.ndfs_name import read_ndfs_name, write_ndfs_name
 from ndfs.block_pointer import BlockPointer
 
 _BufType = Union[bytes, bytearray, memoryview]
+
+# Object file_type_flags bits (offset 28): "L M A C I B P T".
+FT_TERMINAL = 1 << 0
+FT_PERIPHERAL = 1 << 1
+FT_SPOOLING = 1 << 2
+FT_INDEXED = 1 << 3
+FT_CONTIGUOUS = 1 << 4
+FT_ALLOCATED = 1 << 5
+FT_MAGTAPE = 1 << 6
+FT_LIBRARY = 1 << 7
+
+# Default access for a new file: OWN + FRIEND all rights, PUBLIC none.
+ACCESS_DEFAULT = 0x03FF
 
 
 class ObjectEntry:
@@ -41,6 +66,7 @@ class ObjectEntry:
 
     __slots__ = (
         "header",
+        "header_word",
         "object_index",
         "object_name",
         "type",
@@ -51,13 +77,22 @@ class ObjectEntry:
         "bytes_in_file",
         "file_pointer",
         "access_bits",
+        "next_version",
+        "prev_version",
+        "file_type_flags",
+        "device_number",
+        "disk_object_index",
+        "current_open_count",
+        "total_open_count",
         "date_created",
         "last_date_read",
         "last_date_written",
+        "raw",
     )
 
     def __init__(self) -> None:
         self.header: int = OBJECT_ENTRY_IN_USE
+        self.header_word: int = OBJECT_ENTRY_IN_USE << 8
         self.object_index: int = 0
         self.object_name: str = ""
         self.type: str = "DATA"
@@ -68,9 +103,19 @@ class ObjectEntry:
         self.bytes_in_file: int = 0
         self.file_pointer: Optional[BlockPointer] = None
         self.access_bits: int = 0
+        self.next_version: int = 0
+        self.prev_version: int = 0
+        self.file_type_flags: int = 0
+        self.device_number: int = 0
+        self.disk_object_index: int = 0
+        self.current_open_count: int = 0
+        self.total_open_count: int = 0
         self.date_created: int = 0
         self.last_date_read: int = 0
         self.last_date_written: int = 0
+        # Verbatim on-disk 64 bytes, used as the base when re-serializing so
+        # unmodelled bytes survive. None for freshly-built entries.
+        self.raw: Optional[bytes] = None
 
     @property
     def full_name(self) -> str:
@@ -107,7 +152,13 @@ class ObjectEntry:
             return None
 
         entry = cls()
+
+        # Preserve the verbatim 64 bytes so re-serialization never loses
+        # fields we do not explicitly model.
+        entry.raw = bytes(data[offset:offset + ENTRY_SIZE])
+
         entry.header = data[offset]
+        entry.header_word = read_uint16_be(data, offset + 0)
 
         # Object name (16 bytes at offset+2)
         entry.object_name = read_ndfs_name(data, offset + 2, NDFS_NAME_MAX)
@@ -116,11 +167,26 @@ class ObjectEntry:
         type_str = read_ndfs_name(data, offset + 18, NDFS_TYPE_MAX)
         entry.type = type_str if len(type_str) > 0 else "DATA"
 
+        # Versioning, access, flags, device (offsets 22-31)
+        entry.next_version = read_uint16_be(data, offset + 22)
+        entry.prev_version = read_uint16_be(data, offset + 24)
+        entry.access_bits = read_uint16_be(data, offset + 26)
+        entry.file_type_flags = read_uint16_be(data, offset + 28)
+        entry.device_number = read_uint16_be(data, offset + 30)
+
         # File type code (byte 32)
         entry.file_type = data[offset + 32]
 
-        # User index (byte 34)
+        # User index (byte 34) / object-index word
         entry.user_index = data[offset + 34]
+        entry.disk_object_index = read_uint16_be(data, offset + 34)
+
+        # Open counts and timestamps (offsets 36-51, big-endian)
+        entry.current_open_count = read_uint16_be(data, offset + 36)
+        entry.total_open_count = read_uint16_be(data, offset + 38)
+        entry.date_created = read_uint32_be(data, offset + 40)
+        entry.last_date_read = read_uint32_be(data, offset + 44)
+        entry.last_date_written = read_uint32_be(data, offset + 48)
 
         # Pages in file (bytes 52-55, big-endian)
         entry.pages_in_file = read_uint32_be(data, offset + 52)
@@ -138,9 +204,14 @@ class ObjectEntry:
         if len(buffer) < offset + ENTRY_SIZE:
             raise ValueError("Insufficient buffer for object entry")
 
-        # Clear the entry area
-        for i in range(ENTRY_SIZE):
-            buffer[offset + i] = 0
+        # Base on the original on-disk bytes when available so unmodelled
+        # bytes (e.g. byte 33, the low byte of the object-index word) survive;
+        # otherwise start from zero.
+        if self.raw is not None and len(self.raw) == ENTRY_SIZE:
+            buffer[offset:offset + ENTRY_SIZE] = self.raw
+        else:
+            for i in range(ENTRY_SIZE):
+                buffer[offset + i] = 0
 
         # Header (0x80 = in use)
         buffer[offset] = OBJECT_ENTRY_IN_USE
@@ -151,11 +222,25 @@ class ObjectEntry:
         # File type string
         write_ndfs_name(buffer, offset + 18, self.type, NDFS_TYPE_MAX)
 
+        # Versioning, access, flags, device (offsets 22-31)
+        write_uint16_be(buffer, offset + 22, self.next_version)
+        write_uint16_be(buffer, offset + 24, self.prev_version)
+        write_uint16_be(buffer, offset + 26, self.access_bits)
+        write_uint16_be(buffer, offset + 28, self.file_type_flags)
+        write_uint16_be(buffer, offset + 30, self.device_number)
+
         # File type code
         buffer[offset + 32] = self.file_type & 0xFF
 
         # User index
         buffer[offset + 34] = self.user_index & 0xFF
+
+        # Open counts and timestamps (offsets 36-51)
+        write_uint16_be(buffer, offset + 36, self.current_open_count)
+        write_uint16_be(buffer, offset + 38, self.total_open_count)
+        write_uint32_be(buffer, offset + 40, self.date_created)
+        write_uint32_be(buffer, offset + 44, self.last_date_read)
+        write_uint32_be(buffer, offset + 48, self.last_date_written)
 
         # Pages in file
         write_uint32_be(buffer, offset + 52, self.pages_in_file)

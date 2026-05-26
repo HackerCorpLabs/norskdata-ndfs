@@ -213,6 +213,18 @@ ndfs_error_t ndfs_get_metadata(const ndfs_filesystem_t *fs, const char *path,
 ndfs_error_t ndfs_get_user(const ndfs_filesystem_t *fs, uint8_t index,
                            ndfs_user_entry_t *out_user);
 
+/**
+ * Get the list of data-block IDs that make up a file, in order.
+ * Walks contiguous / indexed / sub-indexed allocation. A block ID of 0 marks
+ * a sparse hole. The caller must free(*out_blocks).
+ *
+ * @param path        File path "USER/NAME:TYPE".
+ * @param out_blocks  Receives a malloc'd array of block IDs.
+ * @param out_count   Receives the number of entries.
+ */
+ndfs_error_t ndfs_get_file_blocks(const ndfs_filesystem_t *fs, const char *path,
+                                  uint32_t **out_blocks, size_t *out_count);
+
 /* ── Bitmap queries ──────────────────────────────────────────────── */
 
 bool ndfs_is_block_used(const ndfs_filesystem_t *fs, uint32_t block_id);

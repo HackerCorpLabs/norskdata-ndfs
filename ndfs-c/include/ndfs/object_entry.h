@@ -23,26 +23,71 @@
 #ifndef NDFS_OBJECT_ENTRY_H
 #define NDFS_OBJECT_ENTRY_H
 
+#include "types.h"
 #include "block_pointer.h"
 #include <stddef.h>
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
+/* Object file_type_flags bits (offset 28): "L M A C I B P T". */
+#define NDFS_FT_TERMINAL    (1u << 0)
+#define NDFS_FT_PERIPHERAL  (1u << 1)
+#define NDFS_FT_SPOOLING    (1u << 2)
+#define NDFS_FT_INDEXED     (1u << 3)
+#define NDFS_FT_CONTIGUOUS  (1u << 4)
+#define NDFS_FT_ALLOCATED   (1u << 5)
+#define NDFS_FT_MAGTAPE     (1u << 6)
+#define NDFS_FT_LIBRARY     (1u << 7)
+
+/* Access rights within a 5-bit tier (access_bits, offset 26). */
+#define NDFS_ACC_READ       (1u << 0)
+#define NDFS_ACC_WRITE      (1u << 1)
+#define NDFS_ACC_APPEND     (1u << 2)
+#define NDFS_ACC_COMMON     (1u << 3)  /* common / execute */
+#define NDFS_ACC_DIRECTORY  (1u << 4)  /* directory / delete */
+#define NDFS_ACC_TIER_MASK  0x1Fu
+/* Tier shifts: OWN bits 0-4, FRIEND 5-9, PUBLIC 10-14. */
+#define NDFS_ACC_OWN_SHIFT     0
+#define NDFS_ACC_FRIEND_SHIFT  5
+#define NDFS_ACC_PUBLIC_SHIFT  10
+
+/* Default access for a newly-created file: OWN + FRIEND all five rights,
+ * PUBLIC none (0x3FF). Matches the RetroCore reference implementation. */
+#define NDFS_ACCESS_DEFAULT 0x03FFu
+
 /** 64-byte object (file) entry. */
 typedef struct {
-    uint8_t              header;
-    uint32_t             object_index;
+    uint8_t              header;        /**< Byte 0: bit7 = in use. */
+    uint16_t             header_word;   /**< Bytes 0-1: full 16-bit header. */
+    uint32_t             object_index;  /**< Physical slot in the object file. */
     char                 object_name[NDFS_NAME_MAX + 1];
     char                 type[NDFS_TYPE_MAX + 1];
     char                 user_name[NDFS_NAME_MAX + 1]; /**< Resolved at load time. */
     uint8_t              user_index;
-    uint8_t              file_type;    /**< 0=DATA, 1=PROG, 2=SYMB, 3=TEXT */
+    uint8_t              file_type;    /**< 0=DATA, 1=PROG, 2=SYMB, 3=TEXT (byte 32) */
     uint32_t             pages_in_file;
     uint32_t             bytes_in_file;
     ndfs_block_pointer_t file_pointer;
-    uint16_t             access_bits;
+    uint16_t             access_bits;  /**< Offset 26: 3x5-bit OWN/FRIEND/PUBLIC. */
+    /* Fields at offsets 22-51 (previously unparsed "reserved / tracking"). */
+    uint16_t             next_version;        /**< Offset 22. */
+    uint16_t             prev_version;        /**< Offset 24. */
+    uint16_t             file_type_flags;     /**< Offset 28: L M A C I B P T. */
+    uint16_t             device_number;       /**< Offset 30. */
+    uint16_t             disk_object_index;   /**< Offset 34 word: [user|file]. */
+    uint16_t             current_open_count;  /**< Offset 36. */
+    uint16_t             total_open_count;    /**< Offset 38. */
+    uint32_t             date_created;        /**< Offset 40 (ND timestamp). */
+    uint32_t             last_read_date;      /**< Offset 44 (ND timestamp). */
+    uint32_t             last_write_date;     /**< Offset 48 (ND timestamp). */
+    /* Verbatim copy of the on-disk 64 bytes, used as the base when
+     * re-serializing so bytes we do not model are never lost. has_raw is
+     * false for freshly-built entries (ndfs_oe_init). */
+    uint8_t              raw[NDFS_ENTRY_SIZE];
+    bool                 has_raw;
 } ndfs_object_entry_t;
 
 /**

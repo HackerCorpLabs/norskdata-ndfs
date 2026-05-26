@@ -85,6 +85,7 @@ add_executable(ndtool
     tools/ndtool/cmd_user.c
     tools/ndtool/cmd_info.c
     tools/ndtool/cmd_create.c
+    tools/ndtool/cmd_stat.c
     tools/ndtool/cmd_shell.c
     tools/ndtool/parity.c
 )

@@ -1,0 +1,162 @@
+/**
+ * ndtool: detailed file stat (RetroCommander-style), with -v for the full
+ * record including the data-block list.
+ *
+ * SPDX-License-Identifier: MIT
+ */
+
+#include "ndtool.h"
+
+#include <stdio.h>
+#include <string.h>
+
+/* Format an ND-100 packed timestamp (32-bit) as "YYYY-MM-DD HH:MM:SS".
+ *   bits 31-26 year (+1950), 25-22 month, 21-17 day,
+ *   bits 16-12 hour, 11-6 minute, 5-0 second.
+ * A zero value renders as the 1950 epoch (matching the reference ndfs tool). */
+void ndtool_format_nd_date(uint32_t v, char *out, size_t len)
+{
+    unsigned year  = 1950 + ((v >> 26) & 0x3F);
+    unsigned month = (v >> 22) & 0x0F;
+    unsigned day   = (v >> 17) & 0x1F;
+    unsigned hour  = (v >> 12) & 0x1F;
+    unsigned min   = (v >> 6) & 0x3F;
+    unsigned sec   = v & 0x3F;
+    if (month == 0) month = 1;
+    if (day == 0) day = 1;
+    snprintf(out, len, "%04u-%02u-%02u %02u:%02u:%02u",
+             year, month, day, hour, min, sec);
+}
+
+/* Decode one 5-bit access tier into a human list, e.g. "READ, WRITE". */
+void ndtool_access_tier_str(uint16_t access_bits, unsigned shift,
+                            char *out, size_t len)
+{
+    unsigned t = (access_bits >> shift) & NDFS_ACC_TIER_MASK;
+    size_t n = 0;
+    out[0] = '\0';
+    if (t == 0) {
+        snprintf(out, len, "NONE");
+        return;
+    }
+    #define APPEND_RIGHT(bit, name) \
+        do { \
+            if (t & (bit)) { \
+                int w = snprintf(out + n, len > n ? len - n : 0, \
+                                 "%s%s", n ? ", " : "", name); \
+                if (w > 0) n += (size_t)w; \
+            } \
+        } while (0)
+    APPEND_RIGHT(NDFS_ACC_READ,      "READ");
+    APPEND_RIGHT(NDFS_ACC_WRITE,     "WRITE");
+    APPEND_RIGHT(NDFS_ACC_APPEND,    "APPEND");
+    APPEND_RIGHT(NDFS_ACC_COMMON,    "COMMON");
+    APPEND_RIGHT(NDFS_ACC_DIRECTORY, "DIRECTORY");
+    #undef APPEND_RIGHT
+}
+
+/* Decode file_type_flags into the SINTRAN letter set, e.g. "I" or "It". */
+static void file_type_flags_str(uint16_t f, char *out, size_t len)
+{
+    size_t n = 0;
+    out[0] = '\0';
+    #define FLAG(bit, ch) do { if ((f & (bit)) && n + 1 < len) out[n++] = (ch); } while (0)
+    FLAG(NDFS_FT_LIBRARY,    'L');
+    FLAG(NDFS_FT_MAGTAPE,    'M');
+    FLAG(NDFS_FT_ALLOCATED,  'A');
+    FLAG(NDFS_FT_CONTIGUOUS, 'C');
+    FLAG(NDFS_FT_INDEXED,    'I');
+    FLAG(NDFS_FT_SPOOLING,   'S');
+    FLAG(NDFS_FT_PERIPHERAL, 'P');
+    FLAG(NDFS_FT_TERMINAL,   'T');
+    #undef FLAG
+    out[n] = '\0';
+    if (n == 0) snprintf(out, len, "-");
+}
+
+static const char *ptr_type_str(ndfs_pointer_type_t t)
+{
+    switch (t) {
+    case NDFS_PTR_CONTIGUOUS: return "Contiguous";
+    case NDFS_PTR_INDEXED:    return "Indexed";
+    case NDFS_PTR_SUBINDEXED: return "SubIndexed";
+    default:                  return "Reserved";
+    }
+}
+
+int cmd_stat(ndtool_ctx_t *ctx, const char *path, bool verbose)
+{
+    ndfs_file_entry_t meta;
+    ndfs_object_entry_t obj;
+    char buf[64];
+    char own[64], frnd[64], pub[64];
+
+    if (ndfs_get_metadata(ctx->fs, path, &meta) != NDFS_OK) {
+        fprintf(stderr, "File not found: %s\n", path);
+        return -1;
+    }
+    if (ndfs_get_object_entry(ctx->fs, meta.full_name, meta.user_name, &obj) != NDFS_OK) {
+        fprintf(stderr, "Cannot read object entry: %s\n", path);
+        return -1;
+    }
+
+    file_type_flags_str(obj.file_type_flags, buf, sizeof(buf));
+
+    printf("ObjectName                       : %s\n", obj.object_name);
+    printf("ObjectIndexOfThisObjectEntry     : %u\n", obj.disk_object_index);
+    printf("\n");
+    printf("Type                             : %s\n", obj.type);
+    printf("FileType                         : %s\n", ptr_type_str(obj.file_pointer.type));
+    printf("FileTypeAsText                   : %s\n", buf);
+    printf("\n");
+    printf("PagesInFile                      : %u [%u bytes]\n",
+           obj.pages_in_file, obj.pages_in_file * 2048u);
+    printf("BytesInFile                      : %u\n", obj.bytes_in_file);
+    printf("FilePointer Type                 : %s\n", ptr_type_str(obj.file_pointer.type));
+    printf("FilePointer BlockID              : %u\n", obj.file_pointer.block_id);
+    printf("\n");
+    printf("UserIndexOfReservingUser         : %u\n", obj.user_index);
+    printf("UserName                         : %s\n", obj.user_name);
+    printf("\n");
+    printf("ObjectEntryNextVersion           : %u\n", obj.next_version);
+    printf("ObjectEntryPrevVersion           : %u\n", obj.prev_version);
+    printf("\n");
+
+    ndtool_access_tier_str(obj.access_bits, NDFS_ACC_PUBLIC_SHIFT, pub, sizeof(pub));
+    ndtool_access_tier_str(obj.access_bits, NDFS_ACC_FRIEND_SHIFT, frnd, sizeof(frnd));
+    ndtool_access_tier_str(obj.access_bits, NDFS_ACC_OWN_SHIFT, own, sizeof(own));
+    printf("AccessBits PUBLIC                : %s\n", pub);
+    printf("AccessBits FRIEND                : %s\n", frnd);
+    printf("AccessBits OWN                   : %s\n", own);
+    printf("\n");
+    printf("DeviceNumber                     : %u\n", obj.device_number);
+    printf("\n");
+    printf("CurrentOpenCount                 : %u\n", obj.current_open_count);
+    printf("TotalOpenCount                   : %u\n", obj.total_open_count);
+
+    ndtool_format_nd_date(obj.date_created, buf, sizeof(buf));
+    printf("DateCreated                      : %s\n", buf);
+    ndtool_format_nd_date(obj.last_read_date, buf, sizeof(buf));
+    printf("LastDateOpenedForRead            : %s\n", buf);
+    ndtool_format_nd_date(obj.last_write_date, buf, sizeof(buf));
+    printf("LastDateOpenedForWrite           : %s\n", buf);
+
+    if (verbose) {
+        uint32_t *blocks = NULL;
+        size_t count = 0, i;
+        if (ndfs_get_file_blocks(ctx->fs, meta.full_name, &blocks, &count) == NDFS_OK) {
+            printf("\nFileBlocks: %zu\n", count);
+            for (i = 0; i < count; i++) {
+                if (blocks[i] == 0) {
+                    printf("* (sparse hole)\n");
+                } else {
+                    printf("* %u (%s)\n", blocks[i],
+                           ptr_type_str(obj.file_pointer.type));
+                }
+            }
+            free(blocks);
+        }
+    }
+
+    return 0;
+}

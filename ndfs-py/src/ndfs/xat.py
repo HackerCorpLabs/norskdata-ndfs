@@ -63,7 +63,7 @@ def object_entry_to_xat(entry: ObjectEntry) -> dict:
     props[XAT_USER_NAME] = entry.user_name
     props[XAT_USER_INDEX] = entry.user_index
     props[XAT_ACCESS_BITS] = entry.access_bits
-    props[XAT_FILE_TYPE_FLAGS] = 0
+    props[XAT_FILE_TYPE_FLAGS] = entry.file_type_flags
     props[XAT_FILE_TYPE] = entry.file_type
     props[XAT_PAGES_IN_FILE] = entry.pages_in_file
     props[XAT_BYTES_IN_FILE] = entry.bytes_in_file
@@ -90,6 +90,8 @@ def xat_to_object_entry(xat: dict, entry: ObjectEntry) -> None:
         entry.access_bits = xat[XAT_ACCESS_BITS]
     if XAT_FILE_TYPE in xat and isinstance(xat[XAT_FILE_TYPE], int):
         entry.file_type = xat[XAT_FILE_TYPE]
+    if XAT_FILE_TYPE_FLAGS in xat and isinstance(xat[XAT_FILE_TYPE_FLAGS], int):
+        entry.file_type_flags = xat[XAT_FILE_TYPE_FLAGS]
     if XAT_PAGES_IN_FILE in xat and isinstance(xat[XAT_PAGES_IN_FILE], int):
         entry.pages_in_file = xat[XAT_PAGES_IN_FILE]
     if XAT_BYTES_IN_FILE in xat and isinstance(xat[XAT_BYTES_IN_FILE], int):

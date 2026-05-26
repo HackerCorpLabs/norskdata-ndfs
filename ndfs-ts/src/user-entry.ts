@@ -12,9 +12,10 @@
  *   32-35: Pages used (32-bit, big-endian)
  *   36:    Directory index
  *   37:    User index
- *   38-39: Default file access (16-bit, big-endian)
- *   40-55: Friends (8 x 2-byte entries, big-endian)
- *   56-63: Reserved
+ *   38-39: Reserved
+ *   40-41: Default file access (16-bit, big-endian)
+ *   42-47: Reserved / tracking (byte 47 = mxobl/acobl nibbles)
+ *   48-63: Friends (8 x 2-byte entries, big-endian)
  *
  * SPDX-License-Identifier: MIT
  * Copyright (c) 1985-2026 Ronny Hansen
@@ -44,6 +45,9 @@ export class UserEntry {
   directoryIndex: number = 0;
   defaultFileAccess: number = 0x4ff;
   friends: UserFriend[];
+  /** Verbatim on-disk 64 bytes, used as the base when re-serializing so
+   * unmodelled bytes (38-39, 42-47) survive. Null for freshly-built entries. */
+  raw: Uint8Array | null = null;
 
   constructor() {
     this.friends = [];
@@ -65,6 +69,7 @@ export class UserEntry {
     if ((data[offset] & USER_ENTRY_FLAG) !== USER_ENTRY_FLAG) return null;
 
     const entry = new UserEntry();
+    entry.raw = data.slice(offset, offset + ENTRY_SIZE);
     entry.enterCount = data[offset + 1];
     entry.userName = readNdfsName(data, offset + 2, NDFS_NAME_MAX);
     entry.password = readUint16BE(data, offset + 18);
@@ -74,11 +79,12 @@ export class UserEntry {
     entry.pagesUsed = readUint32BE(data, offset + 32);
     entry.directoryIndex = data[offset + 36];
     entry.userIndex = data[offset + 37];
-    entry.defaultFileAccess = readUint16BE(data, offset + 38);
+    // Default file access is at offset 40 (verified on-disk); 38-39 is unused.
+    entry.defaultFileAccess = readUint16BE(data, offset + 40);
 
-    // Parse friends (8 x 2 bytes starting at offset 40)
+    // Parse friends (8 x 2 bytes starting at offset 48)
     for (let i = 0; i < MAX_FRIENDS; i++) {
-      entry.friends[i] = UserFriend.fromBytes(data, offset + 40 + i * 2);
+      entry.friends[i] = UserFriend.fromBytes(data, offset + 48 + i * 2);
     }
 
     return entry;
@@ -87,6 +93,9 @@ export class UserEntry {
   /** Serialize to a 64-byte Uint8Array. */
   toBytes(): Uint8Array {
     const buf = new Uint8Array(ENTRY_SIZE);
+    if (this.raw && this.raw.length === ENTRY_SIZE) {
+      buf.set(this.raw, 0);
+    }
 
     buf[0] = USER_ENTRY_FLAG;
     buf[1] = this.enterCount & 0xff;
@@ -99,10 +108,10 @@ export class UserEntry {
     writeUint32BE(buf, 32, this.pagesUsed);
     buf[36] = this.directoryIndex;
     buf[37] = this.userIndex & 0xff;
-    writeUint16BE(buf, 38, this.defaultFileAccess);
+    writeUint16BE(buf, 40, this.defaultFileAccess);
 
     for (let i = 0; i < MAX_FRIENDS; i++) {
-      this.friends[i].toBytes(buf, 40 + i * 2);
+      this.friends[i].toBytes(buf, 48 + i * 2);
     }
 
     return buf;

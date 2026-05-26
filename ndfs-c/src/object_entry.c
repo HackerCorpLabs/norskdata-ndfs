@@ -35,7 +35,13 @@ ndfs_error_t ndfs_oe_from_bytes(const uint8_t *data, size_t data_len,
 
     ndfs_oe_init(out);
 
+    /* Preserve the verbatim 64 bytes so re-serialization never loses fields
+     * we do not explicitly model. */
+    memcpy(out->raw, data + offset, NDFS_ENTRY_SIZE);
+    out->has_raw = true;
+
     out->header = data[offset];
+    out->header_word = ndfs_read_u16be(data, offset + 0);
 
     /* Object name (16 bytes at offset+2) */
     ndfs_read_name(data, offset + 2, NDFS_NAME_MAX, out->object_name);
@@ -48,11 +54,26 @@ ndfs_error_t ndfs_oe_from_bytes(const uint8_t *data, size_t data_len,
         out->type[4] = '\0';
     }
 
+    /* Versioning, access, flags, device (offsets 22-31). */
+    out->next_version    = ndfs_read_u16be(data, offset + 22);
+    out->prev_version    = ndfs_read_u16be(data, offset + 24);
+    out->access_bits     = ndfs_read_u16be(data, offset + 26);
+    out->file_type_flags = ndfs_read_u16be(data, offset + 28);
+    out->device_number   = ndfs_read_u16be(data, offset + 30);
+
     /* File type code (byte 32) */
     out->file_type = data[offset + 32];
 
-    /* User index (byte 34) */
+    /* User index (byte 34, high byte of the object-index word) */
     out->user_index = data[offset + 34];
+    out->disk_object_index = ndfs_read_u16be(data, offset + 34);
+
+    /* Open counts and timestamps (offsets 36-51). */
+    out->current_open_count = ndfs_read_u16be(data, offset + 36);
+    out->total_open_count   = ndfs_read_u16be(data, offset + 38);
+    out->date_created    = ndfs_read_u32be(data, offset + 40);
+    out->last_read_date  = ndfs_read_u32be(data, offset + 44);
+    out->last_write_date = ndfs_read_u32be(data, offset + 48);
 
     /* Pages in file (bytes 52-55, big-endian) */
     out->pages_in_file = ndfs_read_u32be(data, offset + 52);
@@ -78,8 +99,14 @@ ndfs_error_t ndfs_oe_to_bytes(const ndfs_object_entry_t *entry,
     if (!entry || !buffer) return NDFS_ERR_NULL_PTR;
     if (buf_len < offset + NDFS_ENTRY_SIZE) return NDFS_ERR_TOO_SMALL;
 
-    /* Clear the entry area */
-    memset(buffer + offset, 0, NDFS_ENTRY_SIZE);
+    /* Base the output on the original on-disk bytes when available, so any
+     * bytes we do not model (e.g. byte 33, the low byte of the object-index
+     * word) survive a round trip. Freshly-built entries start from zero. */
+    if (entry->has_raw) {
+        memcpy(buffer + offset, entry->raw, NDFS_ENTRY_SIZE);
+    } else {
+        memset(buffer + offset, 0, NDFS_ENTRY_SIZE);
+    }
 
     /* Header (0x80 = in use) */
     buffer[offset] = NDFS_OBJECT_IN_USE;
@@ -90,11 +117,25 @@ ndfs_error_t ndfs_oe_to_bytes(const ndfs_object_entry_t *entry,
     /* File type string */
     ndfs_write_name(buffer, offset + 18, entry->type, NDFS_TYPE_MAX);
 
+    /* Versioning, access, flags, device (offsets 22-31). */
+    ndfs_write_u16be(buffer, offset + 22, entry->next_version);
+    ndfs_write_u16be(buffer, offset + 24, entry->prev_version);
+    ndfs_write_u16be(buffer, offset + 26, entry->access_bits);
+    ndfs_write_u16be(buffer, offset + 28, entry->file_type_flags);
+    ndfs_write_u16be(buffer, offset + 30, entry->device_number);
+
     /* File type code */
     buffer[offset + 32] = entry->file_type;
 
-    /* User index */
+    /* User index (byte 34, high byte of the object-index word) */
     buffer[offset + 34] = entry->user_index;
+
+    /* Open counts and timestamps (offsets 36-51). */
+    ndfs_write_u16be(buffer, offset + 36, entry->current_open_count);
+    ndfs_write_u16be(buffer, offset + 38, entry->total_open_count);
+    ndfs_write_u32be(buffer, offset + 40, entry->date_created);
+    ndfs_write_u32be(buffer, offset + 44, entry->last_read_date);
+    ndfs_write_u32be(buffer, offset + 48, entry->last_write_date);
 
     /* Pages in file */
     ndfs_write_u32be(buffer, offset + 52, entry->pages_in_file);
