@@ -98,26 +98,20 @@ INTERACTIVE:
 
 ## Listing Files
 
-List all files on a disk image:
+List all files on a disk image. Each file shows its octal object ID, creation date, owning user, name:type, size, and page count:
 
 ```
 $ ndtool -t BIGDISK0-L.IMG
 USER: SYSTEM
-  SINTRAN:DATA                   0 bytes    63 pages
-  MACM-AREA:DATA                 0 bytes    64 pages
-  SEGFIL0:DATA            17618944 bytes  10000 pages
-  MAILBOX:DATA                6144 bytes     3 pages
-  RTFIL:DATA                  3122 bytes     2 pages
-  FILSYS-SYMBOLS:SYMB        61049 bytes    30 pages
-  FMAC-1920C:PROG            28791 bytes    15 pages
-  DMAC-1915G:BPUN            57476 bytes    29 pages
+  [0000]  1988-12-16 09:39:59  (SYSTEM)SINTRAN:DATA;1                        0 bytes     63 pages
+  [0001]  1988-12-16 09:40:00  (SYSTEM)MACM-AREA:DATA;1                      0 bytes     64 pages
+  [0002]  1988-12-16 09:40:45  (SYSTEM)SEGFIL0:DATA;1                 17618944 bytes  10000 pages
+  [0003]  1988-12-16 09:42:28  (SYSTEM)MAILBOX:DATA;1                     6144 bytes      3 pages
+  [0004]  1988-12-16 09:42:47  (SYSTEM)RTFIL:DATA;1                       3122 bytes      2 pages
   ...
 USER: RONNY
-  CAT:C                        814 bytes     1 pages
-  CSESSION:MODE                115 bytes     1 pages
-  CAT:PROG                  141312 bytes    11 pages
-  DDBTABLES-C:VTM            56110 bytes    28 pages
-  CONFIGURATIO-C08:BPUN       1536 bytes     1 pages
+  [1400]  1995-10-30 05:30:08  (RONNY)CAT:C;1                               814 bytes      1 pages
+  [1401]  1995-10-30 05:30:08  (RONNY)CAT:PROG;1                         141312 bytes     11 pages
   ...
 ```
 
@@ -126,25 +120,25 @@ Filter by user:
 ```
 $ ndtool -t -u RONNY BIGDISK0-L.IMG
 USER: RONNY
-  CAT:C                        814 bytes     1 pages
-  HELLO:SYMB                     7 bytes     1 pages
-  CAT:PROG                  141312 bytes    11 pages
-  CONFIGURATIO-C08:BPUN       1536 bytes     1 pages
+  [1400]  1995-10-30 05:30:08  (RONNY)CAT:C;1                               814 bytes      1 pages
+  [1401]  1995-10-30 05:30:08  (RONNY)CAT:PROG;1                         141312 bytes     11 pages
 ```
 
 ## Listing Users
 
+Users are shown with their octal index, file count, and quota info:
+
 ```
 $ ndtool -u BIGDISK0-L.IMG
 Users: 15
-  [  0]  SYSTEM            Reserved: 15000  Used: 11774  Free:  3226
-  [  1]  FLOPPY-USER       Reserved:     0  Used:     0  Free:     0
-  [  2]  UTILITY           Reserved:  1000  Used:   368  Free:   632
-  [  3]  BPUN-FILES        Reserved:  1000  Used:   687  Free:   313
-  [  4]  SCRATCH           Reserved:  2500  Used:   227  Free:  2273
-  [  6]  RONNY             Reserved:  1000  Used:    87  Free:   913
-  [  8]  GUEST             Reserved:   500  Used:     0  Free:   500
-  [ 10]  C-INCLUDE         Reserved:   300  Used:    15  Free:   285
+  [000]  SYSTEM             85 files  Reserved: 15000  Used: 11774  Free:  3226
+  [001]  FLOPPY-USER         0 files  Reserved:     0  Used:     0  Free:     0
+  [002]  UTILITY            17 files  Reserved:  1000  Used:   368  Free:   632
+  [003]  BPUN-FILES         30 files  Reserved:  1000  Used:   687  Free:   313
+  [004]  SCRATCH            25 files  Reserved:  2500  Used:   227  Free:  2273
+  [006]  RONNY              13 files  Reserved:  1000  Used:    87  Free:   913
+  [010]  GUEST               0 files  Reserved:   500  Used:     0  Free:   500
+  [012]  C-INCLUDE           7 files  Reserved:   300  Used:    15  Free:   285
   ...
 ```
 
@@ -526,13 +520,19 @@ $ ndtool --shell disk.ndfs
 ndtool shell - type 'help' for commands
 
 ndtool> ls
-  SYSTEM       (12 files)
-  RONNY        (3 files)
+  [000]  SYSTEM             12 files  Reserved:  1000  Used:    53
+  [006]  RONNY               3 files  Reserved:   500  Used:    12
 
 ndtool> ls SYSTEM
-  README:TEXT          1024 bytes     1 pages
-  STARTUP:MODE         4096 bytes     2 pages
-  PROGRAM:PROG       102400 bytes    50 pages
+  [0000]  1988-12-16 09:39:59  (SYSTEM)README:TEXT                 1024 bytes      1 pages
+  [0001]  1988-12-16 09:40:00  (SYSTEM)STARTUP:MODE                4096 bytes      2 pages
+  [0002]  1988-12-16 09:40:45  (SYSTEM)PROGRAM:PROG              102400 bytes     50 pages
+
+ndtool> ls system/:MODE
+  [0001]  1988-12-16 09:40:00  (SYSTEM)STARTUP:MODE                4096 bytes      2 pages
+
+ndtool> ls system/S*
+  [0001]  1988-12-16 09:40:00  (SYSTEM)STARTUP:MODE                4096 bytes      2 pages
 
 ndtool> cat SYSTEM/README:TEXT
 This is a test file on the ND-100 filesystem.
@@ -545,8 +545,8 @@ Deleted SYSTEM/MYFILE:TEXT
 
 ndtool> users
 Users: 2
-  [  0]  SYSTEM            Reserved:  1000  Used:    53  Free:   947
-  [  6]  RONNY             Reserved:   500  Used:    12  Free:   488
+  [000]  SYSTEM             12 files  Reserved:  1000  Used:    53  Free:   947
+  [006]  RONNY               3 files  Reserved:   500  Used:    12  Free:   488
 
 ndtool> stat SYSTEM/README:TEXT
   Name:   README:TEXT
@@ -582,7 +582,7 @@ Two kinds of path appear below:
 
 | Command | Description |
 |---------|-------------|
-| `ls [USER]` | List users, or a user's files |
+| `ls [USER[/PATTERN]]` | List users, or a user's files (wildcards: `*`, `?`, `:TYPE` shorthand) |
 | `cat PATH` | Display a file as text (parity stripped) |
 | `hexdump PATH` | Hex dump of a file's content |
 | `stat PATH` | Show detailed file metadata (size, allocation, block) |
@@ -604,7 +604,7 @@ Two kinds of path appear below:
 | `friendadd OWNER FRIEND [RWACD]` | Add a friend (default rights RWA) |
 | `frienddel OWNER FRIEND` | Remove a friend |
 | `stat USER` | Show a user's details + friend list (a name with no `/`) |
-| `save [HOSTFILE]` | Write in-memory changes to the `.ndfs` image on disk; give a `HOSTFILE` to save to a new image (save-as) |
+| `save [HOSTFILE]` | Save changes to disk (optional save-as) |
 | `help` | Show command list |
 | `quit` / `exit` | Exit (warns if unsaved changes) |
 
