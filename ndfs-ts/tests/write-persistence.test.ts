@@ -84,6 +84,24 @@ describe('WritePersistence', () => {
     }
   });
 
+  it('new file lands in the owning user region (object index high byte = user)', () => {
+    const fs = createFS();
+    fs.addUser('GUEST', 200);
+    const guest = fs.listDirectory('').find((e) => e.name === 'GUEST');
+    expect(guest).toBeDefined();
+    fs.writeFile('GUEST/HELLO:TEXT', new Uint8Array([1, 2]));
+    const e = fs.getObjectEntry('HELLO', 'GUEST')!;
+    expect(e.userIndex).not.toBe(0);
+    expect((e.diskObjectIndex >> 8) & 0xff).toBe(e.userIndex);
+    expect(e.objectIndex).toBeGreaterThanOrEqual(e.userIndex * 256);
+    expect(e.objectIndex).toBeLessThan((e.userIndex + 1) * 256);
+    expect(e.nextVersion).toBe(e.diskObjectIndex);
+    // survives a round-trip
+    const fs2 = new NdfsFileSystem(fs.toBuffer());
+    const e2 = fs2.getObjectEntry('HELLO', 'GUEST')!;
+    expect((e2.diskObjectIndex >> 8) & 0xff).toBe(e2.userIndex);
+  });
+
   it('deleted file stays deleted after export + re-open', () => {
     const fs = createFS();
     fs.writeFile('SYSTEM/A:TEXT', new Uint8Array([1]));

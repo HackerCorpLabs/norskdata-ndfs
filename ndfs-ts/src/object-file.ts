@@ -92,6 +92,19 @@ export class ObjectFile {
     return this.nextIndex;
   }
 
+  /**
+   * Find the next free object slot WITHIN a user's region. SINTRAN partitions
+   * the object file so user U owns slots U*256..U*256+255 and the object-index
+   * high byte is the owning user. Returns -1 if the user's table is full.
+   */
+  findFreeUserSlot(userIndex: number): number {
+    const base = (userIndex & 0xff) << 8;
+    for (let slot = base; slot < base + 256; slot++) {
+      if (!this.entries.has(slot)) return slot;
+    }
+    return -1;
+  }
+
   /** Get total pages used by all objects. */
   getTotalPagesUsed(): number {
     let total = 0;

@@ -779,6 +779,52 @@ export class NdfsFileSystem {
     }
   }
 
+  /**
+   * Ensure the object-file directory data page holding `objectIndex` exists,
+   * allocating and linking it on demand (SINTRAN/RetroCore do this so each
+   * user's region grows as needed). The page index in the object-file index
+   * block is objectIndex/32; for user U that maps to slots U*8..U*8+7.
+   */
+  private ensureObjectDirPage(objectIndex: number): void {
+    const mb = this.masterBlock;
+    if (!mb.objectFilePointer || !mb.objectFilePointer.isValid()) return;
+    const pageIdx = Math.floor(objectIndex / ENTRIES_PER_PAGE);
+
+    const allocPage = (): number => {
+      const blk = this.bitFile.findFirstFreeBlock();
+      if (blk < 0) throw new Error('No free blocks for object directory page');
+      this.bitFile.markBlockUsed(blk);
+      this.writePage(blk, new Uint8Array(NDFS_PAGE_SIZE));
+      return blk;
+    };
+
+    if (mb.objectFilePointer.type === PointerType.Indexed) {
+      const indexPage = this.readPage(mb.objectFilePointer.blockId);
+      const ptr = BlockPointer.fromBytes(indexPage, pageIdx * 4);
+      if (ptr.isValid()) return;
+      const blk = allocPage();
+      new BlockPointer(blk, PointerType.Contiguous).toBytes(indexPage, pageIdx * 4);
+      this.writePage(mb.objectFilePointer.blockId, indexPage);
+    } else if (mb.objectFilePointer.type === PointerType.SubIndexed) {
+      const subIdx = Math.floor(pageIdx / MAX_OBJECT_FILE_POINTERS);
+      const innerIdx = pageIdx % MAX_OBJECT_FILE_POINTERS;
+      const subPage = this.readPage(mb.objectFilePointer.blockId);
+      let subPtr = BlockPointer.fromBytes(subPage, subIdx * 4);
+      if (!subPtr.isValid()) {
+        const ib = allocPage();
+        new BlockPointer(ib, PointerType.Contiguous).toBytes(subPage, subIdx * 4);
+        this.writePage(mb.objectFilePointer.blockId, subPage);
+        subPtr = new BlockPointer(ib, PointerType.Contiguous);
+      }
+      const innerPage = this.readPage(subPtr.blockId);
+      const ptr = BlockPointer.fromBytes(innerPage, innerIdx * 4);
+      if (ptr.isValid()) return;
+      const blk = allocPage();
+      new BlockPointer(blk, PointerType.Contiguous).toBytes(innerPage, innerIdx * 4);
+      this.writePage(subPtr.blockId, innerPage);
+    }
+  }
+
   private createNewFile(
     objectName: string,
     fileType: string,
@@ -788,12 +834,18 @@ export class NdfsFileSystem {
     let dataPages = Math.ceil(fileData.length / NDFS_PAGE_SIZE);
     if (dataPages === 0) dataPages = 1;
 
+    // Choose the object slot inside the owning user's region, and make sure
+    // that user's directory page exists, before allocating file data.
+    const slot = this.objectFile.findFreeUserSlot(user.userIndex);
+    if (slot < 0) throw new Error(`User ${user.userName} object table is full`);
+    this.ensureObjectDirPage(slot);
+
     const { topBlockId, pointerType, indexBlocksUsed } =
       this.allocateAndWriteData(fileData, dataPages);
 
     // Create object entry
     const entry = new ObjectEntry();
-    entry.objectIndex = this.objectFile.getNextAvailableIndex();
+    entry.objectIndex = slot;
     entry.objectName = objectName.toUpperCase().substring(0, NDFS_NAME_MAX);
     entry.type = fileType.toUpperCase().substring(0, NDFS_TYPE_MAX);
     entry.userIndex = user.userIndex;
@@ -807,10 +859,10 @@ export class NdfsFileSystem {
     entry.accessBits = ACCESS_DEFAULT;
     entry.fileTypeFlags =
       pointerType === PointerType.Contiguous ? FT_CONTIGUOUS : FT_INDEXED;
-    entry.diskObjectIndex =
-      ((entry.userIndex & 0xff) << 8) | (entry.objectIndex & 0xff);
-    entry.nextVersion = entry.diskObjectIndex;
-    entry.prevVersion = entry.diskObjectIndex;
+    // objectIndex already encodes [user|fileEntry] (chosen in the user region).
+    entry.diskObjectIndex = entry.objectIndex;
+    entry.nextVersion = entry.objectIndex;
+    entry.prevVersion = entry.objectIndex;
     this.objectFile.addObject(entry);
 
     // Update user pages used

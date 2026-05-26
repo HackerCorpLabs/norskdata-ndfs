@@ -90,6 +90,19 @@ class ObjectFile:
                 return i
         return self._next_index
 
+    def find_free_user_slot(self, user_index: int) -> int:
+        """Find the next free object slot WITHIN a user's region.
+
+        SINTRAN partitions the object file so user U owns slots
+        U*256..U*256+255 and the object-index high byte is the owning user.
+        Returns -1 if the user's table is full.
+        """
+        base = (user_index & 0xFF) << 8
+        for slot in range(base, base + 256):
+            if slot not in self._entries:
+                return slot
+        return -1
+
     def get_total_pages_used(self) -> int:
         """Get total pages used by all objects."""
         total = 0

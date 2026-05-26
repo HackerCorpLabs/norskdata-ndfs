@@ -155,3 +155,22 @@ def test_deleted_file_stays_deleted_after_reload():
     fs2 = NdfsFileSystem(fs.to_buffer())
     assert fs2.file_exists("SYSTEM/A:TEXT") is False
     assert fs2.file_exists("SYSTEM/B:TEXT") is True
+
+
+def test_new_file_lands_in_owning_user_region():
+    """A file created for a non-SYSTEM user gets an object index inside that
+    user's region (high byte == user index), so SINTRAN places it correctly."""
+    fs = _make_fs()
+    fs.add_user("GUEST", 200)
+    fs.write_file("GUEST/HELLO:TEXT", b"\x01\x02")
+    e = next(o for o in fs.get_object_entries()
+             if o.object_name == "HELLO" and o.user_name == "GUEST")
+    assert e.user_index != 0
+    assert ((e.disk_object_index >> 8) & 0xFF) == e.user_index
+    assert e.user_index * 256 <= e.object_index < (e.user_index + 1) * 256
+    assert e.next_version == e.disk_object_index
+    # survives a round-trip
+    fs2 = NdfsFileSystem(fs.to_buffer())
+    e2 = next(o for o in fs2.get_object_entries()
+              if o.object_name == "HELLO" and o.user_name == "GUEST")
+    assert ((e2.disk_object_index >> 8) & 0xFF) == e2.user_index

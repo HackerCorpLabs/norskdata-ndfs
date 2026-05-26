@@ -664,6 +664,51 @@ class NdfsFileSystem:
                     bytes_read += to_copy
         return bytes_read
 
+    def _ensure_object_dir_page(self, object_index: int) -> None:
+        """Ensure the object-file directory page holding *object_index* exists,
+        allocating and linking it on demand (each user's region grows as
+        needed). Page index in the object-file index block is object_index/32;
+        for user U that maps to index-pointer slots U*8..U*8+7.
+        """
+        mb = self._master_block
+        if mb.object_file_pointer is None or not mb.object_file_pointer.is_valid():
+            return
+        page_idx = object_index // ENTRIES_PER_PAGE
+
+        def alloc_page() -> int:
+            blk = self._bit_file.find_first_free_block()
+            if blk < 0:
+                raise IOError("No free blocks for object directory page")
+            self._bit_file.mark_block_used(blk)
+            self._write_page(blk, bytearray(NDFS_PAGE_SIZE))
+            return blk
+
+        if mb.object_file_pointer.type == PointerType.Indexed:
+            index_page = bytearray(self._read_page(mb.object_file_pointer.block_id))
+            ptr = BlockPointer.from_bytes(index_page, page_idx * 4)
+            if ptr.is_valid():
+                return
+            blk = alloc_page()
+            BlockPointer(blk, PointerType.Contiguous).to_bytes(index_page, page_idx * 4)
+            self._write_page(mb.object_file_pointer.block_id, index_page)
+        elif mb.object_file_pointer.type == PointerType.SubIndexed:
+            sub_idx = page_idx // MAX_OBJECT_FILE_POINTERS
+            inner_idx = page_idx % MAX_OBJECT_FILE_POINTERS
+            sub_page = bytearray(self._read_page(mb.object_file_pointer.block_id))
+            sub_ptr = BlockPointer.from_bytes(sub_page, sub_idx * 4)
+            if not sub_ptr.is_valid():
+                ib = alloc_page()
+                BlockPointer(ib, PointerType.Contiguous).to_bytes(sub_page, sub_idx * 4)
+                self._write_page(mb.object_file_pointer.block_id, sub_page)
+                sub_ptr = BlockPointer(ib, PointerType.Contiguous)
+            inner_page = bytearray(self._read_page(sub_ptr.block_id))
+            ptr = BlockPointer.from_bytes(inner_page, inner_idx * 4)
+            if ptr.is_valid():
+                return
+            blk = alloc_page()
+            BlockPointer(blk, PointerType.Contiguous).to_bytes(inner_page, inner_idx * 4)
+            self._write_page(sub_ptr.block_id, inner_page)
+
     def _create_new_file(
         self,
         object_name: str,
@@ -675,6 +720,15 @@ class NdfsFileSystem:
         data_pages = math.ceil(len(file_data) / NDFS_PAGE_SIZE)
         if data_pages == 0:
             data_pages = 1
+
+        # Choose the object slot inside the OWNING USER's region (SINTRAN
+        # partitions the object file: user U owns slots U*256..U*256+255 and
+        # the object-index high byte is the owner) and ensure its directory
+        # page exists, before allocating file data.
+        obj_index = self._object_file.find_free_user_slot(user.user_index)
+        if obj_index < 0:
+            raise IOError("User object table is full")
+        self._ensure_object_dir_page(obj_index)
 
         # Allocate index block
         index_block_id = self._bit_file.find_first_free_block()
@@ -721,7 +775,7 @@ class NdfsFileSystem:
 
         # Create object entry
         entry = ObjectEntry()
-        entry.object_index = self._object_file.get_next_available_index()
+        entry.object_index = obj_index
         entry.object_name = object_name.upper()[:NDFS_NAME_MAX]
         entry.type = file_type.upper()[:NDFS_TYPE_MAX]
         entry.user_index = user.user_index
@@ -729,14 +783,14 @@ class NdfsFileSystem:
         entry.pages_in_file = data_pages
         entry.bytes_in_file = len(file_data) if len(file_data) > 0 else 1
         entry.file_pointer = BlockPointer(index_block_id, PointerType.Indexed)
-        # New-file defaults: owner+friend full rights; indexed allocation flag;
-        # and a self-referential version chain + object index ([user|slot]) so
-        # SINTRAN does not see a broken version chain (";2").
+        # New-file defaults: owner+friend full rights; indexed allocation flag.
         entry.access_bits = ACCESS_DEFAULT
         entry.file_type_flags = FT_INDEXED
-        entry.disk_object_index = ((entry.user_index & 0xFF) << 8) | (entry.object_index & 0xFF)
-        entry.next_version = entry.disk_object_index
-        entry.prev_version = entry.disk_object_index
+        # object_index already encodes [user|fileEntry]; the object-index word
+        # and the self-referential version chain all equal it.
+        entry.disk_object_index = obj_index
+        entry.next_version = obj_index
+        entry.prev_version = obj_index
         self._object_file.add_object(entry)
 
         # Update user pages used
