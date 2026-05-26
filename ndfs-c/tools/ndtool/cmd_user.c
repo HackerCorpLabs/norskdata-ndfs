@@ -206,3 +206,128 @@ int cmd_passwd(ndtool_ctx_t *ctx, const char *name)
     ctx->modified = false;
     return 0;
 }
+
+/* ── Friends ──────────────────────────────────────────────────────────
+ * Friend commands take colon-packed args so each maps to one CLI option:
+ *   --friendadd OWNER:FRIEND[:RWACD]   --frienddel OWNER:FRIEND
+ * OWNER/FRIEND may be a user name or a decimal index (0-255). The shell
+ * passes the same packed forms. */
+
+/* Split "a:b[:c]" in place into up to 3 fields. Returns the field count. */
+static int split_colon(char *s, char *fields[3])
+{
+    int n = 0;
+    char *p = s;
+    fields[0] = fields[1] = fields[2] = NULL;
+    if (!s || !*s) return 0;
+    fields[n++] = p;
+    for (; *p && n < 3; p++) {
+        if (*p == ':') {
+            *p = '\0';
+            fields[n++] = p + 1;
+        }
+    }
+    return n;
+}
+
+int cmd_friend_add(ndtool_ctx_t *ctx, const char *arg)
+{
+    char buf[96];
+    char *f[3];
+    const char *owner, *friend, *perms;
+    ndfs_error_t err;
+    int n;
+
+    strncpy(buf, arg ? arg : "", sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+    n = split_colon(buf, f);
+    if (n < 2 || !f[0][0] || !f[1][0]) {
+        fprintf(stderr, "Usage: --friendadd OWNER:FRIEND[:RWACD]\n");
+        return -1;
+    }
+    owner = f[0];
+    friend = f[1];
+    perms = (n >= 3 && f[2][0]) ? f[2] : "RWA";
+
+    if (ctx->dry_run) {
+        printf("Would add friend '%s' to '%s' with rights %s [dry run]\n",
+               friend, owner, perms);
+        return 0;
+    }
+
+    err = ndfs_add_friend(ctx->fs, owner, friend, perms);
+    if (err != NDFS_OK) {
+        fprintf(stderr, "Error adding friend: %s\n", ndfs_strerror(err));
+        return -1;
+    }
+    if (ndtool_save_image(ctx) != 0) return -1;
+    printf("Added friend '%s' to '%s' (%s)\n", friend, owner, perms);
+    ctx->modified = false;
+    return 0;
+}
+
+int cmd_friend_del(ndtool_ctx_t *ctx, const char *arg)
+{
+    char buf[96];
+    char *f[3];
+    const char *owner, *friend;
+    ndfs_error_t err;
+    int n;
+
+    strncpy(buf, arg ? arg : "", sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+    n = split_colon(buf, f);
+    if (n < 2 || !f[0][0] || !f[1][0]) {
+        fprintf(stderr, "Usage: --frienddel OWNER:FRIEND\n");
+        return -1;
+    }
+    owner = f[0];
+    friend = f[1];
+
+    if (ctx->dry_run) {
+        printf("Would remove friend '%s' from '%s' [dry run]\n", friend, owner);
+        return 0;
+    }
+
+    err = ndfs_remove_friend(ctx->fs, owner, friend);
+    if (err != NDFS_OK) {
+        fprintf(stderr, "Error removing friend: %s\n", ndfs_strerror(err));
+        return -1;
+    }
+    if (ndtool_save_image(ctx) != 0) return -1;
+    printf("Removed friend '%s' from '%s'\n", friend, owner);
+    ctx->modified = false;
+    return 0;
+}
+
+int cmd_friend_list(ndtool_ctx_t *ctx, const char *user_ref)
+{
+    ndfs_friend_info_t *friends = NULL;
+    size_t count = 0, i;
+    ndfs_error_t err;
+
+    err = ndfs_list_friends(ctx->fs, user_ref, &friends, &count);
+    if (err != NDFS_OK) {
+        fprintf(stderr, "Error listing friends for '%s': %s\n",
+                user_ref, ndfs_strerror(err));
+        return -1;
+    }
+
+    if (count == 0) {
+        printf("User '%s' has no friends.\n", user_ref);
+        return 0;
+    }
+
+    printf("Friends of '%s': %zu\n", user_ref, count);
+    for (i = 0; i < count; i++) {
+        if (friends[i].name[0]) {
+            printf("  [%3u]  %-16s  %s\n",
+                   friends[i].index, friends[i].name, friends[i].perms);
+        } else {
+            printf("  [%3u]  %-16s  %s\n",
+                   friends[i].index, "(no such user)", friends[i].perms);
+        }
+    }
+    ndfs_free_friends(friends);
+    return 0;
+}

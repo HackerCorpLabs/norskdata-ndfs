@@ -71,9 +71,17 @@ DELETE:
 USERS:
   ndtool --useradd NEWUSER 500 <image>       Add user with 500-page quota
   ndtool --userdel NEWUSER <image>           Remove user (must have no files)
-  ndtool --addquota SYSTEM 200 <image>       Add 200 pages to SYSTEM's quota
-  ndtool --remquota SYSTEM 100 <image>       Remove 100 pages from quota
+  ndtool --quotaadd SYSTEM 200 <image>       Add 200 pages to SYSTEM's quota
+  ndtool --quotadel SYSTEM 100 <image>       Remove 100 pages from quota
   ndtool --passwd SYSTEM <image>             Clear user password
+
+FRIENDS (a user grants another user rights to its files):
+  ndtool --friends ALICE <image>             List ALICE's friends and rights
+  ndtool --friendadd ALICE:BOB:RWA <image>   Add BOB as ALICE's friend (rights RWA)
+  ndtool --frienddel ALICE:BOB <image>       Remove BOB from ALICE's friends
+  ndtool --stat ALICE <image>                Show ALICE's details + friend list
+    OWNER/FRIEND may be a user name or index (0-255). Rights letters:
+    R read  W write  A append  C common  D directory  (default RWA)
 
 DIAGNOSTICS:
   ndtool --fsck <image>                      Full filesystem check
@@ -343,14 +351,14 @@ The user must have no files. Delete their files first.
 Add pages to a user's quota (checks disk space first):
 
 ```
-$ ndtool --addquota SYSTEM 200 disk.ndfs
+$ ndtool --quotaadd SYSTEM 200 disk.ndfs
 User 'SYSTEM' quota: 500 -> 700 pages (+200)
 ```
 
 Remove pages from quota (checks that user isn't using more than the new limit):
 
 ```
-$ ndtool --remquota SYSTEM 100 disk.ndfs
+$ ndtool --quotadel SYSTEM 100 disk.ndfs
 User 'SYSTEM' quota: 700 -> 600 pages (-100)
 ```
 
@@ -359,6 +367,45 @@ User 'SYSTEM' quota: 700 -> 600 pages (-100)
 ```
 $ ndtool --passwd SYSTEM disk.ndfs
 Password cleared for 'SYSTEM'
+```
+
+## Friends
+
+A user has 0 or more *friends* stored in its own user entry. A friend grants
+one specific other user a set of rights to this user's files — independent of
+the file's own "friend tier" access bits. The rights are **R**ead, **W**rite,
+**A**ppend, **C**ommon, **D**irectory. Both the owner and the friend may be
+given by **user name or by decimal index** (0-255).
+
+> This is distinct from a user's **default file access**
+> (`SET-DEFAULT-FILE-ACCESS` in SINTRAN, stored in the user entry): that value
+> is the OWN/FRIEND/PUBLIC access copied onto *new files the user creates*.
+> `chmod` edits an individual file's access. The friend list, by contrast,
+> names *which users* get rights to this user's files.
+
+```
+$ ndtool --friendadd ALICE:BOB:RWA disk.ndfs
+Added friend 'BOB' to 'ALICE' (RWA)
+
+$ ndtool --friends ALICE disk.ndfs
+Friends of 'ALICE': 1
+  [  2]  BOB               RWA--
+
+$ ndtool --frienddel ALICE:BOB disk.ndfs
+Removed friend 'BOB' from 'ALICE'
+```
+
+If you omit the rights on `--friendadd`, the friend gets **RWA** by default.
+`--stat USER` (a name with no `/`) shows a user's quota, dates, default file
+access, and full friend list. A user may have at most 8 friends.
+
+In the interactive shell the same operations are space-separated:
+
+```
+ndtool> friendadd ALICE BOB RWA
+ndtool> friends ALICE
+ndtool> frienddel ALICE BOB
+ndtool> stat ALICE
 ```
 
 ## Editing Files
@@ -515,7 +562,7 @@ NDFS Filesystem Check
 ...
 Filesystem is CLEAN. No errors, no warnings.
 
-ndtool> addquota RONNY 100
+ndtool> quotaadd RONNY 100
 User 'RONNY' quota: 500 -> 600 pages (+100)
 
 ndtool> save
@@ -526,27 +573,38 @@ ndtool> quit
 
 ### Shell Commands
 
+Two kinds of path appear below:
+
+- **`PATH`** — a file **inside the image** (a SINTRAN file), written `USER/NAME:TYPE`, e.g. `SYSTEM/STARTUP:MODE`. This is *not* a file on your computer.
+- **`HOSTFILE`** — a file **on your computer** (the host OS), e.g. `./startup.txt`.
+
+> **The shell edits a copy of the image in memory.** Commands like `put`, `rm`, `chmod`, and `useradd` change that in-memory copy only — nothing is written to the `.ndfs` file until you run **`save`**. Quitting without saving discards your changes.
+
 | Command | Description |
 |---------|-------------|
 | `ls [USER]` | List users, or a user's files |
-| `cat PATH` | Display file as text (parity stripped) |
-| `hexdump PATH` | Hex dump of file content |
+| `cat PATH` | Display a file as text (parity stripped) |
+| `hexdump PATH` | Hex dump of a file's content |
 | `stat PATH` | Show detailed file metadata (size, allocation, block) |
-| `edit PATH` | Edit file in external editor (extract, edit, re-import) |
-| `get PATH [LOCAL]` | Extract file to local disk |
-| `put LOCAL [PATH]` | Copy local file into image |
-| `rm PATH` | Delete a file |
-| `mv OLD NEW` | Rename a file |
+| `edit PATH` | Edit a file in an external editor (extract, edit, re-import) |
+| `get PATH [HOSTFILE]` | Copy a file **out of** the image onto your computer |
+| `put HOSTFILE [PATH]` | Copy a file from your computer **into** the image |
+| `rm PATH` | Delete a file inside the image |
+| `mv OLD NEW` | Rename a file inside the image |
 | `info` | Filesystem summary |
 | `bitmap` | Bitmap visualization with Unicode block map |
 | `fsck` | Full 5-phase filesystem check |
 | `users` | List users with quotas |
 | `useradd NAME [QUOTA]` | Add user (default quota: 100) |
 | `userdel NAME` | Remove user (must have no files) |
-| `addquota NAME PAGES` | Add pages to user quota |
-| `remquota NAME PAGES` | Remove pages from quota |
+| `quotaadd NAME PAGES` | Add pages to user quota |
+| `quotadel NAME PAGES` | Remove pages from quota |
 | `passwd NAME` | Clear user password |
-| `save [PATH]` | Save image to disk |
+| `friends USER` | List a user's friends and their rights |
+| `friendadd OWNER FRIEND [RWACD]` | Add a friend (default rights RWA) |
+| `frienddel OWNER FRIEND` | Remove a friend |
+| `stat USER` | Show a user's details + friend list (a name with no `/`) |
+| `save [HOSTFILE]` | Write in-memory changes to the `.ndfs` image on disk; give a `HOSTFILE` to save to a new image (save-as) |
 | `help` | Show command list |
 | `quit` / `exit` | Exit (warns if unsaved changes) |
 
@@ -631,7 +689,8 @@ ndtool is inspired by [Tor Arntsen's ndfs tool](https://www.ndwiki.org/wiki/User
 | Copy files in | No | Yes (`--put`) |
 | Delete files | No | Yes (`--rm`) |
 | User management | No | Yes (`--useradd`, `--userdel`) |
-| Quota management | No | Yes (`--addquota`, `--remquota`) |
+| Quota management | No | Yes (`--quotaadd`, `--quotadel`) |
+| Friend management | No | Yes (`--friends`, `--friendadd`, `--frienddel`) |
 | Password clearing | No | Yes (`--passwd`) |
 | Image creation | No | Yes (`--create`) |
 | Interactive shell | No | Yes (`--shell`) |

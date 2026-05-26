@@ -74,6 +74,11 @@ int cmd_userdel(ndtool_ctx_t *ctx, const char *name);
 int cmd_addquota(ndtool_ctx_t *ctx, const char *name, uint32_t pages);
 int cmd_remquota(ndtool_ctx_t *ctx, const char *name, uint32_t pages);
 int cmd_passwd(ndtool_ctx_t *ctx, const char *name);
+/* Friend commands. add/del take "OWNER:FRIEND[:RWACD]" / "OWNER:FRIEND";
+ * list takes a user name or index. */
+int cmd_friend_add(ndtool_ctx_t *ctx, const char *arg);
+int cmd_friend_del(ndtool_ctx_t *ctx, const char *arg);
+int cmd_friend_list(ndtool_ctx_t *ctx, const char *user_ref);
 int cmd_create(ndtool_ctx_t *ctx, const char *template_name, uint32_t custom_pages, const char *dir_name);
 int cmd_shell(ndtool_ctx_t *ctx);
 int cmd_stat(ndtool_ctx_t *ctx, const char *path, bool verbose);

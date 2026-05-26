@@ -38,10 +38,13 @@ static void print_version(void);
 static struct option long_options[] = {
     {"put",       required_argument, 0, 'P'},
     {"rm",        required_argument, 0, 'R'},
-    {"useradd",   required_argument, 0, 'A'},
-    {"userdel",   required_argument, 0, 'D'},
-    {"addquota",  required_argument, 0, 1003},
-    {"remquota",  required_argument, 0, 1004},
+    {"useradd",  required_argument, 0, 'A'},
+    {"userdel",  required_argument, 0, 'D'},
+    {"quotaadd", required_argument, 0, 1003},
+    {"quotadel", required_argument, 0, 1004},
+    {"friendadd", required_argument, 0, 1013},
+    {"frienddel", required_argument, 0, 1014},
+    {"friends",    required_argument, 0, 1015},
     {"passwd",    required_argument, 0, 'W'},
     {"create",    required_argument, 0, 'C'},
     {"shell",     no_argument,       0, 'S'},
@@ -83,6 +86,9 @@ int main(int argc, char **argv)
     const char *remquota_name = NULL;
     uint32_t quota_pages = 0;
     const char *passwd_name = NULL;
+    const char *friend_add_arg = NULL;
+    const char *friend_del_arg = NULL;
+    const char *friends_arg = NULL;
     const char *create_template = NULL;
     uint32_t custom_pages = 0;
     const char *dir_name = NULL;
@@ -125,6 +131,9 @@ int main(int argc, char **argv)
         case 1003: addquota_name = optarg; needs_write = 1; break;
         case 1004: remquota_name = optarg; needs_write = 1; break;
         case 'W': passwd_name = optarg; needs_write = 1; break;
+        case 1013: friend_add_arg = optarg; needs_write = 1; break;
+        case 1014: friend_del_arg = optarg; needs_write = 1; break;
+        case 1015: friends_arg = optarg; break;
         case 'C': create_template = optarg; needs_write = 1; break;
         case 'S': mode_shell = 1; needs_write = 1; break;
         case 1005: mode_fsck = 1; break;
@@ -263,6 +272,12 @@ int main(int argc, char **argv)
         ret = cmd_remquota(&ctx, remquota_name, quota_pages);
     } else if (passwd_name) {
         ret = cmd_passwd(&ctx, passwd_name);
+    } else if (friend_add_arg) {
+        ret = cmd_friend_add(&ctx, friend_add_arg);
+    } else if (friend_del_arg) {
+        ret = cmd_friend_del(&ctx, friend_del_arg);
+    } else if (friends_arg) {
+        ret = cmd_friend_list(&ctx, friends_arg);
     } else {
         /* Default: show info */
         ret = cmd_info(&ctx);
@@ -278,19 +293,27 @@ static void print_usage(const char *prog)
 {
     printf("ndtool %s - NDFS disk image tool\n\n", NDTOOL_VERSION);
     printf("Usage: %s [options] [args] <image>\n\n", prog);
+    printf("Paths: NDFS_PATH = a file INSIDE the image (USER/NAME:TYPE, a SINTRAN\n");
+    printf("       file); HOSTFILE = a file on your computer. <image> is the .ndfs\n");
+    printf("       image file on your computer.\n\n");
     printf("Modes:\n");
     printf("  -t              List files\n");
     printf("  -u              List users (combine with -t to filter by user)\n");
     printf("  -i              Show filesystem info\n");
-    printf("  -x              Extract files\n");
-    printf("  --put LOCAL [NDFS_PATH]  Copy file into image\n");
-    printf("                  LOCAL may be a wildcard (quote it); use --dest USER\n");
-    printf("  --rm NDFS_PATH  Delete file from image\n");
-    printf("  --useradd NAME [QUOTA]   Add user (default quota: 100 pages)\n");
-    printf("  --userdel NAME           Remove user (must have no files)\n");
-    printf("  --addquota NAME PAGES    Add pages to user quota (checks disk space)\n");
-    printf("  --remquota NAME PAGES    Remove pages from user quota (checks usage)\n");
+    printf("  -x              Extract files OUT of the image onto your computer\n");
+    printf("  --put HOSTFILE [NDFS_PATH]  Copy a file from your computer INTO the image\n");
+    printf("                  HOSTFILE may be a wildcard (quote it); use --dest USER\n");
+    printf("  --rm NDFS_PATH  Delete a file from inside the image\n");
+    printf("  --useradd NAME [QUOTA]  Add user (default quota: 100 pages)\n");
+    printf("  --userdel NAME          Remove user (must have no files)\n");
+    printf("  --quotaadd NAME PAGES   Add pages to user quota (checks disk space)\n");
+    printf("  --quotadel NAME PAGES   Remove pages from user quota (checks usage)\n");
     printf("  --passwd NAME            Clear user password\n");
+    printf("  --friends USER           List USER's friends and their rights\n");
+    printf("  --friendadd OWNER:FRIEND[:RWACD]  Add a friend (default rights RWA)\n");
+    printf("  --frienddel OWNER:FRIEND          Remove a friend\n");
+    printf("                  OWNER/FRIEND may be a user name or index (0-255).\n");
+    printf("                  Rights: R read W write A append C common D directory\n");
     printf("  --fsck          Full filesystem check\n");
     printf("  --stat PATH     Show detailed file metadata (add -v for block list)\n");
     printf("  --chmod SPEC PATH   Change a file's access permissions\n");

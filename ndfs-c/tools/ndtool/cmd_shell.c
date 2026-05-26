@@ -17,30 +17,42 @@
 
 static void shell_help(void)
 {
-    printf("Commands:\n");
-    printf("  ls [USER]          List users or user's files\n");
-    printf("  cat PATH           Display file contents (parity stripped)\n");
-    printf("  hexdump PATH       Hex dump of file contents\n");
-    printf("  get PATH [LOCAL]   Extract file to local disk\n");
-    printf("  put LOCAL [PATH]   Copy local file into image\n");
-    printf("  rm PATH            Delete file\n");
-    printf("  mv OLD NEW         Rename file\n");
-    printf("  info               Show filesystem info\n");
-    printf("  bitmap             Show bitmap visualization and validation\n");
-    printf("  fsck               Full filesystem check (block refs, quotas, etc.)\n");
-    printf("  stat [-v] PATH     Show detailed file metadata (-v adds block list)\n");
-    printf("  chmod SPEC PATH    Change access, e.g. OWN+WD,FRIEND=RW,PUBLIC-A\n");
-    printf("                     rights: R read W write A append C common D directory\n");
-    printf("  edit PATH          Edit file in external editor (extracts, edits, re-imports)\n");
-    printf("  users              List users with quota info\n");
-    printf("  useradd NAME [Q]   Add user (Q = quota, default 100)\n");
-    printf("  userdel NAME       Remove user by name\n");
-    printf("  addquota NAME N    Add N pages to user quota\n");
-    printf("  remquota NAME N    Remove N pages from user quota\n");
-    printf("  passwd NAME        Clear user password\n");
-    printf("  save [PATH]        Save image (optionally to new path)\n");
-    printf("  help               Show this help\n");
-    printf("  quit / exit        Exit shell\n");
+    printf("Paths:\n");
+    printf("  PATH      a file INSIDE the image (a SINTRAN file): USER/NAME:TYPE,\n");
+    printf("            e.g. SYSTEM/STARTUP:MODE  (this is NOT a file on your computer)\n");
+    printf("  HOSTFILE  a file on your computer (the host OS): e.g. ./startup.txt\n");
+    printf("\nCommands:\n");
+    printf("  ls [USER]            List users or user's files\n");
+    printf("  cat PATH             Show a file's contents (parity stripped)\n");
+    printf("  hexdump PATH         Hex dump of a file's contents\n");
+    printf("  get PATH [HOSTFILE]  Copy a file OUT of the image onto your computer\n");
+    printf("  put HOSTFILE [PATH]  Copy a file from your computer INTO the image\n");
+    printf("  rm PATH              Delete a file inside the image\n");
+    printf("  mv OLD NEW           Rename a file inside the image\n");
+    printf("  info                 Show filesystem info\n");
+    printf("  bitmap               Show bitmap visualization and validation\n");
+    printf("  fsck                 Full filesystem check (block refs, quotas, etc.)\n");
+    printf("  stat [-v] PATH       Show file metadata (-v adds block list)\n");
+    printf("  stat [-v] USER       Show user details + friends (no '/' = a user)\n");
+    printf("  chmod SPEC PATH      Change access, e.g. OWN+WD,FRIEND=RW,PUBLIC-A\n");
+    printf("                       rights: R read W write A append C common D directory\n");
+    printf("  edit PATH            Edit file in external editor (extracts, edits, re-imports)\n");
+    printf("  users                List users with quota info\n");
+    printf("  useradd NAME [Q]    Add user (Q = quota, default 100)\n");
+    printf("  userdel NAME        Remove user by name\n");
+    printf("  quotaadd NAME N     Add N pages to user quota\n");
+    printf("  quotadel NAME N     Remove N pages from user quota\n");
+    printf("  passwd NAME          Clear user password\n");
+    printf("  friends USER         List a user's friends and their rights\n");
+    printf("  friendadd OWNER FRIEND [RWACD]  Add a friend (default rights RWA)\n");
+    printf("  frienddel OWNER FRIEND          Remove a friend\n");
+    printf("                       OWNER/FRIEND may be a name or index (0-255)\n");
+    printf("  save [HOSTFILE]      Write your changes to the .ndfs image file on disk.\n");
+    printf("                       The shell edits a copy in memory -- nothing is written\n");
+    printf("                       until you save. Quit without saving to discard changes.\n");
+    printf("                       Give a HOSTFILE to save to a new image (save-as).\n");
+    printf("  help                 Show this help\n");
+    printf("  quit / exit          Exit shell\n");
 }
 
 static void shell_ls(ndtool_ctx_t *ctx, const char *user)
@@ -315,7 +327,8 @@ static void shell_get(ndtool_ctx_t *ctx, const char *ndfs_path, const char *loca
     ndfs_error_t err;
 
     if (!ndfs_path) {
-        fprintf(stderr, "Usage: get USER/FILE:TYPE [local_path]\n");
+        fprintf(stderr, "Usage: get USER/FILE:TYPE [HOSTFILE]   "
+                        "(copies a file OUT of the image to your computer)\n");
         return;
     }
 
@@ -347,7 +360,8 @@ static void shell_get(ndtool_ctx_t *ctx, const char *ndfs_path, const char *loca
 static void shell_put(ndtool_ctx_t *ctx, const char *local_path, const char *ndfs_path)
 {
     if (!local_path) {
-        fprintf(stderr, "Usage: put local_file [USER/FILE:TYPE]\n");
+        fprintf(stderr, "Usage: put HOSTFILE [USER/FILE:TYPE]   "
+                        "(copies a file from your computer INTO the image)\n");
         return;
     }
 
@@ -417,6 +431,7 @@ int cmd_shell(ndtool_ctx_t *ctx)
             char *cmd = strtok(line, " \t");
             char *arg1 = strtok(NULL, " \t");
             char *arg2 = strtok(NULL, " \t");
+            char *arg3 = strtok(NULL, " \t");
 
             if (!cmd) continue;
 
@@ -511,7 +526,8 @@ int cmd_shell(ndtool_ctx_t *ctx)
             }
             else if (strcmp(cmd, "useradd") == 0) {
                 uint32_t q = arg2 ? (uint32_t)atoi(arg2) : 100;
-                cmd_useradd(ctx, arg1, q);
+                if (!arg1) fprintf(stderr, "Usage: useradd NAME [QUOTA]\n");
+                else cmd_useradd(ctx, arg1, q);
             }
             else if (strcmp(cmd, "userdel") == 0) {
                 if (!arg1) {
@@ -520,18 +536,53 @@ int cmd_shell(ndtool_ctx_t *ctx)
                     cmd_userdel(ctx, arg1);
                 }
             }
-            else if (strcmp(cmd, "addquota") == 0) {
+            else if (strcmp(cmd, "quotaadd") == 0) {
                 if (!arg1 || !arg2) {
-                    fprintf(stderr, "Usage: addquota NAME PAGES\n");
+                    fprintf(stderr, "Usage: quotaadd NAME PAGES\n");
                 } else {
                     cmd_addquota(ctx, arg1, (uint32_t)atoi(arg2));
                 }
             }
-            else if (strcmp(cmd, "remquota") == 0) {
+            else if (strcmp(cmd, "quotadel") == 0) {
                 if (!arg1 || !arg2) {
-                    fprintf(stderr, "Usage: remquota NAME PAGES\n");
+                    fprintf(stderr, "Usage: quotadel NAME PAGES\n");
                 } else {
                     cmd_remquota(ctx, arg1, (uint32_t)atoi(arg2));
+                }
+            }
+            else if (strcmp(cmd, "friends") == 0) {
+                if (!arg1) {
+                    fprintf(stderr, "Usage: friends USER\n");
+                } else {
+                    cmd_friend_list(ctx, arg1);
+                }
+            }
+            else if (strcmp(cmd, "friendadd") == 0) {
+                if (!arg1 || !arg2) {
+                    fprintf(stderr, "Usage: friendadd OWNER FRIEND [RWACD]\n");
+                } else {
+                    ndfs_error_t e = ndfs_add_friend(ctx->fs, arg1, arg2,
+                                                     arg3 ? arg3 : "RWA");
+                    if (e != NDFS_OK) {
+                        fprintf(stderr, "Error: %s\n", ndfs_strerror(e));
+                    } else {
+                        printf("Added friend '%s' to '%s' (%s)\n",
+                               arg2, arg1, arg3 ? arg3 : "RWA");
+                        ctx->modified = true;
+                    }
+                }
+            }
+            else if (strcmp(cmd, "frienddel") == 0) {
+                if (!arg1 || !arg2) {
+                    fprintf(stderr, "Usage: frienddel OWNER FRIEND\n");
+                } else {
+                    ndfs_error_t e = ndfs_remove_friend(ctx->fs, arg1, arg2);
+                    if (e != NDFS_OK) {
+                        fprintf(stderr, "Error: %s\n", ndfs_strerror(e));
+                    } else {
+                        printf("Removed friend '%s' from '%s'\n", arg2, arg1);
+                        ctx->modified = true;
+                    }
                 }
             }
             else if (strcmp(cmd, "passwd") == 0) {

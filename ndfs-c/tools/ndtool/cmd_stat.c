@@ -9,6 +9,18 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <ctype.h>
+#include <stdlib.h>
+
+/* Portable case-insensitive string compare (avoids strcasecmp/_stricmp). */
+static int ci_equal(const char *a, const char *b)
+{
+    while (*a && *b) {
+        if (toupper((unsigned char)*a) != toupper((unsigned char)*b)) return 0;
+        a++; b++;
+    }
+    return *a == *b;
+}
 
 /* Format an ND-100 packed timestamp (32-bit) as "YYYY-MM-DD HH:MM:SS".
  *   bits 31-26 year (+1950), 25-22 month, 21-17 day,
@@ -84,12 +96,91 @@ static const char *ptr_type_str(ndfs_pointer_type_t t)
     }
 }
 
+/* Show user details + friend list. Used when 'stat NAME' names a user
+ * (an argument with no '/'). NAME may be a user name or index (0-255). */
+static int cmd_stat_user(ndtool_ctx_t *ctx, const char *user_ref, bool verbose)
+{
+    ndfs_user_entry_t *users = NULL;
+    size_t count = 0, i;
+    const ndfs_user_entry_t *u = NULL;
+    char own[64], frnd[64], pub[64], buf[64];
+    ndfs_friend_info_t *friends = NULL;
+    size_t fcount = 0;
+    long as_index = -1;
+    const char *p;
+
+    if (ndfs_get_users(ctx->fs, &users, &count) != NDFS_OK || count == 0) {
+        fprintf(stderr, "No users found\n");
+        return -1;
+    }
+
+    /* A purely-numeric ref matches by index, otherwise by name. */
+    as_index = 0;
+    for (p = user_ref; *p; p++) {
+        if (*p < '0' || *p > '9') { as_index = -1; break; }
+    }
+    if (as_index == 0) as_index = atol(user_ref);
+
+    for (i = 0; i < count; i++) {
+        if (as_index >= 0 ? (users[i].user_index == (uint8_t)as_index)
+                          : ci_equal(users[i].user_name, user_ref)) {
+            u = &users[i];
+            break;
+        }
+    }
+    if (!u) {
+        fprintf(stderr, "User not found: %s\n", user_ref);
+        ndfs_free_users(users);
+        return -1;
+    }
+
+    printf("UserName                         : %s\n", u->user_name);
+    printf("UserIndex                        : %u\n", u->user_index);
+    printf("PagesReserved                    : %u\n", u->pages_reserved);
+    printf("PagesUsed                        : %u\n", u->pages_used);
+    ndtool_format_nd_date(u->date_created, buf, sizeof(buf));
+    printf("DateCreated                      : %s\n", buf);
+    ndtool_format_nd_date(u->last_date_entered, buf, sizeof(buf));
+    printf("LastDateEntered                  : %s\n", buf);
+
+    ndtool_access_tier_str(u->default_file_access, NDFS_ACC_OWN_SHIFT, own, sizeof(own));
+    ndtool_access_tier_str(u->default_file_access, NDFS_ACC_FRIEND_SHIFT, frnd, sizeof(frnd));
+    ndtool_access_tier_str(u->default_file_access, NDFS_ACC_PUBLIC_SHIFT, pub, sizeof(pub));
+    printf("DefaultFileAccess OWN            : %s\n", own);
+    printf("DefaultFileAccess FRIEND         : %s\n", frnd);
+    printf("DefaultFileAccess PUBLIC         : %s\n", pub);
+
+    /* Friends. */
+    if (ndfs_list_friends(ctx->fs, user_ref, &friends, &fcount) == NDFS_OK) {
+        printf("\nFriends: %zu\n", fcount);
+        for (i = 0; i < fcount; i++) {
+            const char *fname = friends[i].name[0] ? friends[i].name : "(no such user)";
+            if (verbose) {
+                printf("  [%3u]  %-16s  %s  (R=read W=write A=append C=common D=directory)\n",
+                       friends[i].index, fname, friends[i].perms);
+            } else {
+                printf("  [%3u]  %-16s  %s\n",
+                       friends[i].index, fname, friends[i].perms);
+            }
+        }
+        ndfs_free_friends(friends);
+    }
+
+    ndfs_free_users(users);
+    return 0;
+}
+
 int cmd_stat(ndtool_ctx_t *ctx, const char *path, bool verbose)
 {
     ndfs_file_entry_t meta;
     ndfs_object_entry_t obj;
     char buf[64];
     char own[64], frnd[64], pub[64];
+
+    /* A name with no '/' is a user, not a file path: show user/friend info. */
+    if (path && !strchr(path, '/')) {
+        return cmd_stat_user(ctx, path, verbose);
+    }
 
     if (ndfs_get_metadata(ctx->fs, path, &meta) != NDFS_OK) {
         fprintf(stderr, "File not found: %s\n", path);
