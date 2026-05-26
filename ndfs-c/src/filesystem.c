@@ -671,6 +671,10 @@ static ndfs_error_t create_new_file(struct ndfs_filesystem *fs,
     ndfs_error_t err;
 
     if (data_pages == 0) data_pages = 1;
+    /* A single indexed block holds 512 data-page pointers; larger files need a
+     * sub-indexed layout (not yet implemented here). Reject rather than write
+     * pointers past the index page and corrupt the adjacent block. */
+    if (data_pages > NDFS_MAX_OBJECT_FILE_PTRS) return NDFS_ERR_NO_SPACE;
 
     /* Choose the object slot inside the OWNING USER's region (SINTRAN
      * partitions the object file: user U owns slots U*256..U*256+255 and the
@@ -793,6 +797,10 @@ static ndfs_error_t update_existing_file(struct ndfs_filesystem *fs,
     /* Allocate new */
     data_pages = (uint32_t)((file_size + NDFS_PAGE_SIZE - 1) / NDFS_PAGE_SIZE);
     if (data_pages == 0) data_pages = 1;
+    /* A single indexed block holds 512 data-page pointers; larger files need a
+     * sub-indexed layout (not yet implemented here). Reject rather than write
+     * pointers past the index page and corrupt the adjacent block. */
+    if (data_pages > NDFS_MAX_OBJECT_FILE_PTRS) return NDFS_ERR_NO_SPACE;
 
     err = ndfs_bf_find_free(&fs->bit_file, &index_block_id);
     if (err != NDFS_OK) return NDFS_ERR_NO_SPACE;

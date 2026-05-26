@@ -720,6 +720,11 @@ class NdfsFileSystem:
         data_pages = math.ceil(len(file_data) / NDFS_PAGE_SIZE)
         if data_pages == 0:
             data_pages = 1
+        # A single indexed block holds 512 data-page pointers; larger files
+        # need a sub-indexed layout (not implemented here). Reject rather than
+        # write pointers past the index page and corrupt the adjacent block.
+        if data_pages > MAX_OBJECT_FILE_POINTERS:
+            raise IOError("File too large for an indexed object file (>512 pages)")
 
         # Choose the object slot inside the OWNING USER's region (SINTRAN
         # partitions the object file: user U owns slots U*256..U*256+255 and
@@ -814,6 +819,8 @@ class NdfsFileSystem:
         data_pages = math.ceil(len(file_data) / NDFS_PAGE_SIZE)
         if data_pages == 0:
             data_pages = 1
+        if data_pages > MAX_OBJECT_FILE_POINTERS:
+            raise IOError("File too large for an indexed object file (>512 pages)")
 
         index_block_id = self._bit_file.find_first_free_block()
         if index_block_id < 0:
