@@ -102,6 +102,15 @@ describe('WritePersistence', () => {
     expect((e2.diskObjectIndex >> 8) & 0xff).toBe(e2.userIndex);
   });
 
+  it('deleting the sole file on a page clears it (no reappear)', () => {
+    const fs = createFS();
+    fs.writeFile('SYSTEM/ONLY:DATA', new Uint8Array([1]));
+    fs.deleteFile('SYSTEM/ONLY:DATA');
+    const fs2 = new NdfsFileSystem(fs.toBuffer());
+    expect(fs2.fileExists('SYSTEM/ONLY:DATA')).toBe(false);
+    expect(fs2.getObjectEntries().length).toBe(0);
+  });
+
   it('deleted file stays deleted after export + re-open', () => {
     const fs = createFS();
     fs.writeFile('SYSTEM/A:TEXT', new Uint8Array([1]));

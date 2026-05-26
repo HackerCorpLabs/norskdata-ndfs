@@ -990,19 +990,24 @@ export class NdfsFileSystem {
         }
       } else if (mb.objectFilePointer.type === PointerType.SubIndexed) {
         const subIndexPage = this.readPage(mb.objectFilePointer.blockId);
-        // For sub-indexed, we need to walk the two-level structure
-        dataPageMap.forEach((pageData, pageIndex) => {
-          const subIdx = Math.floor(pageIndex / MAX_OBJECT_FILE_POINTERS);
-          const innerIdx = pageIndex % MAX_OBJECT_FILE_POINTERS;
-          const subPtr = BlockPointer.fromBytes(subIndexPage, subIdx * 4);
-          if (subPtr.isValid()) {
-            const innerIndexPage = this.readPage(subPtr.blockId);
-            const dataPtr = BlockPointer.fromBytes(innerIndexPage, innerIdx * 4);
-            if (dataPtr.isValid()) {
-              this.writePage(dataPtr.blockId, pageData);
-            }
+        // Walk ALL linked pages (not just those still holding entries) so a
+        // page emptied by deletion is zeroed — otherwise its stale in-use bit
+        // survives and the file reappears on reload.
+        for (let si = 0; si < MAX_OBJECT_FILE_POINTERS; si++) {
+          const subPtr = BlockPointer.fromBytes(subIndexPage, si * 4);
+          if (!subPtr.isValid()) continue;
+          const innerIndexPage = this.readPage(subPtr.blockId);
+          for (let ii = 0; ii < MAX_OBJECT_FILE_POINTERS; ii++) {
+            const dataPtr = BlockPointer.fromBytes(innerIndexPage, ii * 4);
+            if (!dataPtr.isValid()) continue;
+            const pageIndex = si * MAX_OBJECT_FILE_POINTERS + ii;
+            const pageData = dataPageMap.get(pageIndex);
+            this.writePage(
+              dataPtr.blockId,
+              pageData ? pageData : new Uint8Array(NDFS_PAGE_SIZE),
+            );
           }
-        });
+        }
       }
     }
   }

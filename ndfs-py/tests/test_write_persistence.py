@@ -174,3 +174,14 @@ def test_new_file_lands_in_owning_user_region():
     e2 = next(o for o in fs2.get_object_entries()
               if o.object_name == "HELLO" and o.user_name == "GUEST")
     assert ((e2.disk_object_index >> 8) & 0xFF) == e2.user_index
+
+
+def test_delete_sole_file_on_page_clears_it():
+    """Deleting the only file on an object page must zero that page, else the
+    stale entry's in-use bit survives and the file reappears on reload."""
+    fs = _make_fs()
+    fs.write_file("SYSTEM/ONLY:DATA", b"x")
+    fs.delete_file("SYSTEM/ONLY:DATA")
+    fs2 = NdfsFileSystem(fs.to_buffer())
+    assert fs2.file_exists("SYSTEM/ONLY:DATA") is False
+    assert len(fs2.get_object_entries()) == 0

@@ -917,24 +917,32 @@ class NdfsFileSystem:
         if mb.object_file_pointer is not None and mb.object_file_pointer.is_valid():
             data_page_map = self._object_file.to_data_pages()
 
+            empty = bytearray(NDFS_PAGE_SIZE)
             if mb.object_file_pointer.type == PointerType.Indexed:
                 index_page = self._read_page(mb.object_file_pointer.block_id)
-                for page_index, page_data in data_page_map.items():
-                    if page_index < MAX_OBJECT_FILE_POINTERS:
-                        ptr = BlockPointer.from_bytes(index_page, page_index * 4)
-                        if ptr.is_valid():
-                            self._write_page(ptr.block_id, page_data)
+                # Iterate ALL linked pages, not just those still holding entries:
+                # a page emptied by deletion must be zeroed, else the stale
+                # entry's in-use bit survives and the file reappears on reload.
+                for page_index in range(MAX_OBJECT_FILE_POINTERS):
+                    ptr = BlockPointer.from_bytes(index_page, page_index * 4)
+                    if not ptr.is_valid():
+                        continue
+                    page_data = data_page_map.get(page_index)
+                    self._write_page(ptr.block_id, page_data if page_data is not None else empty)
             elif mb.object_file_pointer.type == PointerType.SubIndexed:
                 sub_index_page = self._read_page(mb.object_file_pointer.block_id)
-                for page_index, page_data in data_page_map.items():
-                    sub_idx = page_index // MAX_OBJECT_FILE_POINTERS
-                    inner_idx = page_index % MAX_OBJECT_FILE_POINTERS
-                    sub_ptr = BlockPointer.from_bytes(sub_index_page, sub_idx * 4)
-                    if sub_ptr.is_valid():
-                        inner_index_page = self._read_page(sub_ptr.block_id)
-                        data_ptr = BlockPointer.from_bytes(inner_index_page, inner_idx * 4)
-                        if data_ptr.is_valid():
-                            self._write_page(data_ptr.block_id, page_data)
+                for si in range(MAX_OBJECT_FILE_POINTERS):
+                    sub_ptr = BlockPointer.from_bytes(sub_index_page, si * 4)
+                    if not sub_ptr.is_valid():
+                        continue
+                    inner_index_page = self._read_page(sub_ptr.block_id)
+                    for ii in range(MAX_OBJECT_FILE_POINTERS):
+                        data_ptr = BlockPointer.from_bytes(inner_index_page, ii * 4)
+                        if not data_ptr.is_valid():
+                            continue
+                        page_index = si * MAX_OBJECT_FILE_POINTERS + ii
+                        page_data = data_page_map.get(page_index)
+                        self._write_page(data_ptr.block_id, page_data if page_data is not None else empty)
 
     def _find_object(self, path: str) -> Optional[ObjectEntry]:
         """Find an object entry by path."""
