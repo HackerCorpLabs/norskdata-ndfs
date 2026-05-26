@@ -200,8 +200,10 @@ export class ObjectEntry {
     // File type code
     buffer[offset + 32] = this.fileType & 0xff;
 
-    // User index
+    // Object index word at 34: high byte = user index, low byte = file slot
+    // (keeps the version pointers, which equal this word, consistent).
     buffer[offset + 34] = this.userIndex & 0xff;
+    buffer[offset + 35] = this.diskObjectIndex & 0xff;
 
     // Open counts and timestamps (offsets 36-51)
     writeUint16BE(buffer, offset + 36, this.currentOpenCount);

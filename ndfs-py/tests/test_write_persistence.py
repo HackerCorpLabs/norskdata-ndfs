@@ -133,3 +133,25 @@ class TestOverwriteRoundTrip:
 
         content = ndfs2.read_file("SYSTEM/FILE:DATA")
         assert content == b"version 2"
+
+
+def test_new_file_version_self_ref():
+    """New files get a self-referential version chain and [user|slot] index."""
+    fs = _make_fs()
+    fs.write_file("SYSTEM/A:TEXT", b"\x01\x02\x03")
+    fs.write_file("SYSTEM/B:TEXT", b"\x04\x05\x06")
+    for e in fs.get_object_entries():
+        assert e.next_version == e.disk_object_index
+        assert e.prev_version == e.disk_object_index
+        assert ((e.disk_object_index >> 8) & 0xFF) == e.user_index
+
+
+def test_deleted_file_stays_deleted_after_reload():
+    """A deleted file must not reappear after export + re-open."""
+    fs = _make_fs()
+    fs.write_file("SYSTEM/A:TEXT", b"\x01")
+    fs.write_file("SYSTEM/B:TEXT", b"\x02")
+    fs.delete_file("SYSTEM/A:TEXT")
+    fs2 = NdfsFileSystem(fs.to_buffer())
+    assert fs2.file_exists("SYSTEM/A:TEXT") is False
+    assert fs2.file_exists("SYSTEM/B:TEXT") is True

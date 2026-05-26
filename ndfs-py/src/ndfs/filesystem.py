@@ -32,7 +32,7 @@ from ndfs.bit_file import BitFile
 from ndfs.user_file import UserFile
 from ndfs.object_file import ObjectFile
 from ndfs.user_entry import UserEntry
-from ndfs.object_entry import ObjectEntry
+from ndfs.object_entry import ObjectEntry, ACCESS_DEFAULT, FT_INDEXED
 from ndfs.types import PointerType, FileEntry, ImageCreationOptions, BootFormat, BootCode
 from ndfs.xat import object_entry_to_xat, xat_to_object_entry
 
@@ -729,6 +729,14 @@ class NdfsFileSystem:
         entry.pages_in_file = data_pages
         entry.bytes_in_file = len(file_data) if len(file_data) > 0 else 1
         entry.file_pointer = BlockPointer(index_block_id, PointerType.Indexed)
+        # New-file defaults: owner+friend full rights; indexed allocation flag;
+        # and a self-referential version chain + object index ([user|slot]) so
+        # SINTRAN does not see a broken version chain (";2").
+        entry.access_bits = ACCESS_DEFAULT
+        entry.file_type_flags = FT_INDEXED
+        entry.disk_object_index = ((entry.user_index & 0xFF) << 8) | (entry.object_index & 0xFF)
+        entry.next_version = entry.disk_object_index
+        entry.prev_version = entry.disk_object_index
         self._object_file.add_object(entry)
 
         # Update user pages used

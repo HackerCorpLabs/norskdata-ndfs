@@ -232,8 +232,10 @@ class ObjectEntry:
         # File type code
         buffer[offset + 32] = self.file_type & 0xFF
 
-        # User index
+        # Object index word at 34: high byte = user index, low byte = file slot
+        # (keeps the version pointers, which equal this word, consistent).
         buffer[offset + 34] = self.user_index & 0xFF
+        buffer[offset + 35] = self.disk_object_index & 0xFF
 
         # Open counts and timestamps (offsets 36-51)
         write_uint16_be(buffer, offset + 36, self.current_open_count)

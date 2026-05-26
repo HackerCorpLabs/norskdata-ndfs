@@ -28,7 +28,12 @@ import { BitFile } from './bit-file.js';
 import { UserFile } from './user-file.js';
 import { ObjectFile } from './object-file.js';
 import { UserEntry } from './user-entry.js';
-import { ObjectEntry } from './object-entry.js';
+import {
+  ObjectEntry,
+  ACCESS_DEFAULT,
+  FT_INDEXED,
+  FT_CONTIGUOUS,
+} from './object-entry.js';
 import { PointerType, FileEntry, BootFormat, BootCode, ImageTemplate, ImageCreationOptions } from './types.js';
 import { createNdfsImage } from './image-creator.js';
 import { detectBootFormat, loadBootCode as loadBootCodeFromPage } from './boot-loader.js';
@@ -796,6 +801,16 @@ export class NdfsFileSystem {
     entry.pagesInFile = dataPages;
     entry.bytesInFile = fileData.length > 0 ? fileData.length : 1;
     entry.filePointer = new BlockPointer(topBlockId, pointerType);
+    // New-file defaults: owner+friend full rights; allocation flag; and a
+    // self-referential version chain + object index ([user|slot]) so SINTRAN
+    // does not see a broken version chain (";2") and refuse to open the file.
+    entry.accessBits = ACCESS_DEFAULT;
+    entry.fileTypeFlags =
+      pointerType === PointerType.Contiguous ? FT_CONTIGUOUS : FT_INDEXED;
+    entry.diskObjectIndex =
+      ((entry.userIndex & 0xff) << 8) | (entry.objectIndex & 0xff);
+    entry.nextVersion = entry.diskObjectIndex;
+    entry.prevVersion = entry.diskObjectIndex;
     this.objectFile.addObject(entry);
 
     // Update user pages used

@@ -72,4 +72,25 @@ describe('WritePersistence', () => {
     const fs2 = new NdfsFileSystem(fs1.toBuffer());
     expect(fs2.getUser(0)!.pagesReserved).toBe(9999);
   });
+
+  it('new files get a self-referential version chain and [user|slot] index', () => {
+    const fs = createFS();
+    fs.writeFile('SYSTEM/A:TEXT', new Uint8Array([1, 2, 3]));
+    fs.writeFile('SYSTEM/B:TEXT', new Uint8Array([4, 5, 6]));
+    for (const e of fs.getObjectEntries()) {
+      expect(e.nextVersion).toBe(e.diskObjectIndex);
+      expect(e.prevVersion).toBe(e.diskObjectIndex);
+      expect((e.diskObjectIndex >> 8) & 0xff).toBe(e.userIndex);
+    }
+  });
+
+  it('deleted file stays deleted after export + re-open', () => {
+    const fs = createFS();
+    fs.writeFile('SYSTEM/A:TEXT', new Uint8Array([1]));
+    fs.writeFile('SYSTEM/B:TEXT', new Uint8Array([2]));
+    fs.deleteFile('SYSTEM/A:TEXT');
+    const fs2 = new NdfsFileSystem(fs.toBuffer());
+    expect(fs2.fileExists('SYSTEM/A:TEXT')).toBe(false);
+    expect(fs2.fileExists('SYSTEM/B:TEXT')).toBe(true);
+  });
 });
