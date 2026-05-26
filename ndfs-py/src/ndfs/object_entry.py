@@ -163,9 +163,11 @@ class ObjectEntry:
         # Object name (16 bytes at offset+2)
         entry.object_name = read_ndfs_name(data, offset + 2, NDFS_NAME_MAX)
 
-        # File type (4 bytes at offset+18)
-        type_str = read_ndfs_name(data, offset + 18, NDFS_TYPE_MAX)
-        entry.type = type_str if len(type_str) > 0 else "DATA"
+        # File type (4 bytes at offset+18). Preserve an empty type as-is — do
+        # NOT default to "DATA". A parse must faithfully represent what is on
+        # disk; defaulting here corrupts files whose type is intentionally
+        # empty (e.g. TERMINAL: 27 00 00 00) on write-back. (Matches RetroFS.)
+        entry.type = read_ndfs_name(data, offset + 18, NDFS_TYPE_MAX)
 
         # Versioning, access, flags, device (offsets 22-31)
         entry.next_version = read_uint16_be(data, offset + 22)

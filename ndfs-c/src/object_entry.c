@@ -46,13 +46,11 @@ ndfs_error_t ndfs_oe_from_bytes(const uint8_t *data, size_t data_len,
     /* Object name (16 bytes at offset+2) */
     ndfs_read_name(data, offset + 2, NDFS_NAME_MAX, out->object_name);
 
-    /* File type (4 bytes at offset+18) */
+    /* File type (4 bytes at offset+18). Preserve an empty type as-is — do NOT
+     * default to "DATA". A parse must faithfully represent what is on disk;
+     * defaulting here corrupts files whose type is intentionally empty (e.g.
+     * TERMINAL: 27 00 00 00) on the next write-back. (Matches RetroFS.NDFS.) */
     ndfs_read_name(data, offset + 18, NDFS_TYPE_MAX, out->type);
-    if (out->type[0] == '\0') {
-        out->type[0] = 'D'; out->type[1] = 'A';
-        out->type[2] = 'T'; out->type[3] = 'A';
-        out->type[4] = '\0';
-    }
 
     /* Versioning, access, flags, device (offsets 22-31). */
     out->next_version    = ndfs_read_u16be(data, offset + 22);

@@ -88,6 +88,38 @@ static int test_golden_user_roundtrip(void)
     return 0;
 }
 
+/* Object entry whose type field is intentionally empty on disk:
+ * offset 18 = 0x27 (terminator) followed by NULs. SINTRAN writes such entries
+ * (e.g. TERMINAL). Parsing must NOT default the empty type to "DATA", or the
+ * round-trip clobbers 27 00 00 00 with 44 41 54 41. Regression for Bug 1. */
+static const uint8_t GOLDEN_OBJ_EMPTY_TYPE[64] = {
+    0x90,0x00,0x54,0x45,0x52,0x4d,0x49,0x4e,0x41,0x4c,0x27,0x00,0x00,0x00,0x00,0x00,
+    0x00,0x00,0x27,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x07,0xff,0x00,0x20,0x00,0x00,
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x28,0x96,0x26,0x96,0x85,0x9a,0x08,0xa1,0x8b,
+    0x9a,0x08,0xa1,0x8b,0x00,0x00,0x00,0x3f,0x00,0x01,0xe7,0xff,0x00,0x00,0x00,0x01
+};
+
+static int test_golden_empty_type_preserved(void)
+{
+    ndfs_object_entry_t oe;
+    TEST_ASSERT_OK(ndfs_oe_from_bytes(GOLDEN_OBJ_EMPTY_TYPE, 64, 0, &oe));
+    TEST_ASSERT_EQUAL_STRING("TERMINAL", oe.object_name);
+    /* Empty type must stay empty — not "DATA". */
+    TEST_ASSERT_EQUAL_STRING("", oe.type);
+    return 0;
+}
+
+static int test_golden_empty_type_roundtrip(void)
+{
+    ndfs_object_entry_t oe;
+    uint8_t out[64];
+    TEST_ASSERT_OK(ndfs_oe_from_bytes(GOLDEN_OBJ_EMPTY_TYPE, 64, 0, &oe));
+    TEST_ASSERT_OK(ndfs_oe_to_bytes(&oe, out, 64, 0));
+    /* The empty type field (27 00 00 00) must survive byte-for-byte. */
+    TEST_ASSERT(memcmp(GOLDEN_OBJ_EMPTY_TYPE, out, 64) == 0);
+    return 0;
+}
+
 void run_golden_tests(void)
 {
     TEST_SUITE_BEGIN("Golden Byte-Vector Tests");
@@ -95,4 +127,6 @@ void run_golden_tests(void)
     RUN_TEST(test_golden_object_roundtrip);
     RUN_TEST(test_golden_user_fields);
     RUN_TEST(test_golden_user_roundtrip);
+    RUN_TEST(test_golden_empty_type_preserved);
+    RUN_TEST(test_golden_empty_type_roundtrip);
 }

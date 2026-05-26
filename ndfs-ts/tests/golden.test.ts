@@ -61,4 +61,28 @@ describe('Golden byte-vectors (real SINTRAN entries)', () => {
     const u = UserEntry.fromBytes(GOLDEN_USR, 0)!;
     expect(Array.from(u.toBytes())).toEqual(Array.from(GOLDEN_USR));
   });
+
+  // Object entry whose type field is intentionally empty on disk: offset 18 =
+  // 0x27 (terminator) + NULs. SINTRAN writes such entries (e.g. TERMINAL).
+  // Parsing must NOT default the empty type to 'DATA', or the round-trip
+  // clobbers 27 00 00 00 with 44 41 54 41. Regression for Bug 1.
+  const GOLDEN_OBJ_EMPTY_TYPE = hex(
+    '90005445524d494e414c270000000000' +
+      '0000270000000000000007ff00200000' +
+      '0000000000000028962696859a08a18b' +
+      '9a08a18b0000003f0001e7ff00000001',
+  );
+
+  it('preserves an empty type field (does not default to DATA)', () => {
+    const e = ObjectEntry.fromBytes(GOLDEN_OBJ_EMPTY_TYPE, 0)!;
+    expect(e.objectName).toBe('TERMINAL');
+    expect(e.type).toBe('');
+  });
+
+  it('round-trips an empty type field byte-for-byte', () => {
+    const e = ObjectEntry.fromBytes(GOLDEN_OBJ_EMPTY_TYPE, 0)!;
+    const out = new Uint8Array(64);
+    e.toBytes(out, 0);
+    expect(Array.from(out)).toEqual(Array.from(GOLDEN_OBJ_EMPTY_TYPE));
+  });
 });

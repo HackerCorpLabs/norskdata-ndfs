@@ -58,3 +58,30 @@ def test_golden_user_fields():
 def test_golden_user_roundtrip():
     u = UserEntry.from_bytes(GOLDEN_USR, 0)
     assert bytes(u.to_bytes()) == GOLDEN_USR
+
+
+# Object entry whose type field is intentionally empty on disk: offset 18 =
+# 0x27 (terminator) + NULs. SINTRAN writes such entries (e.g. TERMINAL).
+# Parsing must NOT default the empty type to "DATA", or the round-trip
+# clobbers 27 00 00 00 with 44 41 54 41. Regression for Bug 1.
+GOLDEN_OBJ_EMPTY_TYPE = bytes.fromhex(
+    "90005445524d494e414c270000000000"
+    "0000270000000000000007ff00200000"
+    "0000000000000028962696859a08a18b"
+    "9a08a18b0000003f0001e7ff00000001"
+)
+
+
+def test_golden_empty_type_preserved():
+    e = ObjectEntry.from_bytes(GOLDEN_OBJ_EMPTY_TYPE, 0)
+    assert e.object_name == "TERMINAL"
+    # Empty type must stay empty — not "DATA".
+    assert e.type == ""
+
+
+def test_golden_empty_type_roundtrip():
+    e = ObjectEntry.from_bytes(GOLDEN_OBJ_EMPTY_TYPE, 0)
+    out = bytearray(64)
+    e.to_bytes(out, 0)
+    # The empty type field (27 00 00 00) must survive byte-for-byte.
+    assert bytes(out) == GOLDEN_OBJ_EMPTY_TYPE
