@@ -103,6 +103,9 @@ ndfs_error_t ndfs_xat_from_object(const ndfs_object_entry_t *entry,
     out->date_created = entry->date_created;
     out->last_read_date = entry->last_read_date;
     out->last_write_date = entry->last_write_date;
+    out->device_number = entry->device_number;
+    out->next_version = entry->next_version;
+    out->prev_version = entry->prev_version;
 
     return NDFS_OK;
 }
@@ -132,6 +135,12 @@ ndfs_error_t ndfs_xat_to_object(const ndfs_xat_properties_t *xat,
 
     entry->user_index = xat->user_index;
 
+    /* device_number is a logical id, safe to restore in a new location. The
+     * version pointers (next/prev) are recorded in the sidecar but NOT applied:
+     * they reference object slots that are reassigned on import, so restoring
+     * them would create a dangling/incorrect version chain. */
+    entry->device_number = xat->device_number;
+
     return NDFS_OK;
 }
 
@@ -144,10 +153,10 @@ ndfs_error_t ndfs_xat_serialize(const ndfs_xat_properties_t *xat,
     if (!xat || !out_json) return NDFS_ERR_NULL_PTR;
 
     /* Allocate generous buffer */
-    buf = (char *)malloc(1024);
+    buf = (char *)malloc(1536);
     if (!buf) return NDFS_ERR_ALLOC;
 
-    len = snprintf(buf, 1024,
+    len = snprintf(buf, 1536,
         "{\n"
         "  \"ndfs.object_name\": \"%s\",\n"
         "  \"ndfs.type\": \"%s\",\n"
@@ -156,6 +165,9 @@ ndfs_error_t ndfs_xat_serialize(const ndfs_xat_properties_t *xat,
         "  \"ndfs.access_bits\": %u,\n"
         "  \"ndfs.file_type_flags\": %u,\n"
         "  \"ndfs.file_type\": %u,\n"
+        "  \"ndfs.device_number\": %u,\n"
+        "  \"ndfs.next_version\": %u,\n"
+        "  \"ndfs.prev_version\": %u,\n"
         "  \"ndfs.pages_in_file\": %u,\n"
         "  \"ndfs.bytes_in_file\": %u,\n"
         "  \"ndfs.date_created\": %u,\n"
@@ -169,6 +181,9 @@ ndfs_error_t ndfs_xat_serialize(const ndfs_xat_properties_t *xat,
         (unsigned)xat->access_bits,
         (unsigned)xat->file_type_flags,
         (unsigned)xat->file_type,
+        (unsigned)xat->device_number,
+        (unsigned)xat->next_version,
+        (unsigned)xat->prev_version,
         (unsigned)xat->pages_in_file,
         (unsigned)xat->bytes_in_file,
         (unsigned)xat->date_created,
@@ -207,6 +222,12 @@ ndfs_error_t ndfs_xat_deserialize(const char *json,
         out->file_type_flags = (uint16_t)val;
     if (find_json_int(json, "ndfs.file_type", &val))
         out->file_type = (uint8_t)val;
+    if (find_json_int(json, "ndfs.device_number", &val))
+        out->device_number = (uint16_t)val;
+    if (find_json_int(json, "ndfs.next_version", &val))
+        out->next_version = (uint16_t)val;
+    if (find_json_int(json, "ndfs.prev_version", &val))
+        out->prev_version = (uint16_t)val;
     if (find_json_int(json, "ndfs.pages_in_file", &val))
         out->pages_in_file = (uint32_t)val;
     if (find_json_int(json, "ndfs.bytes_in_file", &val))

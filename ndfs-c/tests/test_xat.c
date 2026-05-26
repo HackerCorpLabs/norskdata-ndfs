@@ -430,6 +430,51 @@ static int test_xat_get_file_properties_integration(void)
 
 /* ---- Suite runner ---- */
 
+/* ---- Test: device_number + version pointers ---- */
+
+static int test_xat_device_and_version(void)
+{
+    ndfs_object_entry_t entry;
+    ndfs_xat_properties_t xat;
+    char *json = NULL;
+    ndfs_xat_properties_t back;
+    ndfs_object_entry_t applied;
+
+    ndfs_oe_init(&entry);
+    strcpy(entry.object_name, "TTY");
+    entry.device_number = 0x1234;
+    entry.next_version = 0x0501;
+    entry.prev_version = 0x0502;
+
+    /* from_object captures all three. */
+    TEST_ASSERT_OK(ndfs_xat_from_object(&entry, &xat));
+    TEST_ASSERT_EQUAL(0x1234, xat.device_number);
+    TEST_ASSERT_EQUAL(0x0501, xat.next_version);
+    TEST_ASSERT_EQUAL(0x0502, xat.prev_version);
+
+    /* JSON round-trip preserves all three values. */
+    TEST_ASSERT_OK(ndfs_xat_serialize(&xat, &json));
+    TEST_ASSERT(strstr(json, "\"ndfs.device_number\": 4660") != NULL);
+    TEST_ASSERT(strstr(json, "\"ndfs.next_version\"") != NULL);
+    TEST_ASSERT(strstr(json, "\"ndfs.prev_version\"") != NULL);
+    TEST_ASSERT_OK(ndfs_xat_deserialize(json, &back));
+    TEST_ASSERT_EQUAL(0x1234, back.device_number);
+    TEST_ASSERT_EQUAL(0x0501, back.next_version);
+    TEST_ASSERT_EQUAL(0x0502, back.prev_version);
+    ndfs_free_string(json);
+
+    /* Apply: device_number IS restored; version pointers are NOT (conservative
+     * — they reference object slots that are reassigned on import). */
+    ndfs_oe_init(&applied);
+    applied.next_version = 0x00AA;
+    applied.prev_version = 0x00BB;
+    TEST_ASSERT_OK(ndfs_xat_to_object(&back, &applied));
+    TEST_ASSERT_EQUAL(0x1234, applied.device_number);
+    TEST_ASSERT_EQUAL(0x00AA, applied.next_version); /* unchanged */
+    TEST_ASSERT_EQUAL(0x00BB, applied.prev_version); /* unchanged */
+    return 0;
+}
+
 void run_xat_tests(void)
 {
     TEST_SUITE_BEGIN("XAT Tests");
@@ -439,6 +484,7 @@ void run_xat_tests(void)
     RUN_TEST(test_xat_json_roundtrip);
     RUN_TEST(test_xat_json_contains_all_keys);
     RUN_TEST(test_xat_to_object_selective);
+    RUN_TEST(test_xat_device_and_version);
     RUN_TEST(test_xat_deserialize_empty_json);
     RUN_TEST(test_xat_deserialize_malformed);
     RUN_TEST(test_xat_serialize_valid_json);

@@ -33,6 +33,9 @@ typedef struct {
     uint32_t date_created;
     uint32_t last_read_date;
     uint32_t last_write_date;
+    uint16_t device_number;   /* logical device id (restored on import)        */
+    uint16_t next_version;    /* version-chain links — recorded, NOT restored  */
+    uint16_t prev_version;    /* (they reference object slots that change)      */
 } ndfs_xat_properties_t;
 
 /** XAT file extension. */
@@ -49,7 +52,9 @@ ndfs_error_t ndfs_xat_from_object(const ndfs_object_entry_t *entry,
 
 /**
  * Apply XAT properties to an object entry.
- * Only applies status-related fields (access_bits, file_type, dates).
+ * Restores fields that are valid in a new location (access_bits, file_type,
+ * names, user_index, device_number). Version pointers and allocation/runtime
+ * state are intentionally NOT restored — see ndfs_xat_to_object.
  *
  * @param xat    Source XAT properties.
  * @param entry  Target object entry to modify.
