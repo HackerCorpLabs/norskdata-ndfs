@@ -13,46 +13,50 @@
 #include <ctype.h>
 #include <sys/stat.h>
 
+/* Portable case-insensitive string compare. */
+static int ci_equal(const char *a, const char *b)
+{
+    while (*a && *b) {
+        if (toupper((unsigned char)*a) != toupper((unsigned char)*b)) return 0;
+        a++; b++;
+    }
+    return *a == *b;
+}
+
 /* ── Shell helpers ────────────────────────────────────────────────── */
 
 static void shell_help(void)
 {
     printf("Paths:\n");
-    printf("  PATH      a file INSIDE the image (a SINTRAN file): USER/NAME:TYPE,\n");
-    printf("            e.g. SYSTEM/STARTUP:MODE  (this is NOT a file on your computer)\n");
-    printf("  HOSTFILE  a file on your computer (the host OS): e.g. ./startup.txt\n");
+    printf("  PATH      a file INSIDE the image: USER/NAME:TYPE  (e.g. SYSTEM/STARTUP:MODE)\n");
+    printf("  HOSTFILE  a file on your computer  (e.g. ./startup.txt)\n");
     printf("\nCommands:\n");
-    printf("  ls [USER]            List users or user's files\n");
-    printf("  cat PATH             Show a file's contents (parity stripped)\n");
-    printf("  hexdump PATH         Hex dump of a file's contents\n");
-    printf("  get PATH [HOSTFILE]  Copy a file OUT of the image onto your computer\n");
-    printf("  put HOSTFILE [PATH]  Copy a file from your computer INTO the image\n");
-    printf("  rm PATH              Delete a file inside the image\n");
-    printf("  mv OLD NEW           Rename a file inside the image\n");
-    printf("  info                 Show filesystem info\n");
-    printf("  bitmap               Show bitmap visualization and validation\n");
-    printf("  fsck                 Full filesystem check (block refs, quotas, etc.)\n");
-    printf("  stat [-v] PATH       Show file metadata (-v adds block list)\n");
-    printf("  stat [-v] USER       Show user details + friends (no '/' = a user)\n");
-    printf("  chmod SPEC PATH      Change access, e.g. OWN+WD,FRIEND=RW,PUBLIC-A\n");
-    printf("                       rights: R read W write A append C common D directory\n");
-    printf("  edit PATH            Edit file in external editor (extracts, edits, re-imports)\n");
-    printf("  users                List users with quota info\n");
-    printf("  useradd NAME [Q]    Add user (Q = quota, default 100)\n");
-    printf("  userdel NAME        Remove user by name\n");
-    printf("  quotaadd NAME N     Add N pages to user quota\n");
-    printf("  quotadel NAME N     Remove N pages from user quota\n");
-    printf("  passwd NAME          Clear user password\n");
-    printf("  friends USER         List a user's friends and their rights\n");
-    printf("  friendadd OWNER FRIEND [RWACD]  Add a friend (default rights RWA)\n");
-    printf("  frienddel OWNER FRIEND          Remove a friend\n");
-    printf("                       OWNER/FRIEND may be a name or index (0-255)\n");
-    printf("  save [HOSTFILE]      Write your changes to the .ndfs image file on disk.\n");
-    printf("                       The shell edits a copy in memory -- nothing is written\n");
-    printf("                       until you save. Quit without saving to discard changes.\n");
-    printf("                       Give a HOSTFILE to save to a new image (save-as).\n");
-    printf("  help                 Show this help\n");
-    printf("  quit / exit          Exit shell\n");
+    printf("  ls [USER[/PATTERN]]          List users or files (* ? :TYPE wildcards)\n");
+    printf("  cat PATH                     Show file contents (parity stripped)\n");
+    printf("  hexdump PATH                 Hex dump of file contents\n");
+    printf("  get PATH [HOSTFILE]          Copy file OUT of the image to your computer\n");
+    printf("  put HOSTFILE [PATH]          Copy file from your computer INTO the image\n");
+    printf("  rm PATH                      Delete a file inside the image\n");
+    printf("  mv OLD NEW                   Rename a file inside the image\n");
+    printf("  edit PATH                    Edit in external editor (extract, edit, re-import)\n");
+    printf("  stat [-v] PATH               File metadata (-v adds block list)\n");
+    printf("  stat [-v] USER               User details + friends\n");
+    printf("  chmod SPEC PATH              Change access (e.g. OWN+WD,FRIEND=RW,PUBLIC-A)\n");
+    printf("  info                         Filesystem info\n");
+    printf("  bitmap                       Bitmap visualization and validation\n");
+    printf("  fsck                         Full filesystem check\n");
+    printf("  users                        List users with quota info\n");
+    printf("  useradd NAME [QUOTA]         Add user (default quota: 100)\n");
+    printf("  userdel NAME                 Remove user (must have no files)\n");
+    printf("  quotaadd NAME PAGES          Add pages to user quota\n");
+    printf("  quotadel NAME PAGES          Remove pages from user quota\n");
+    printf("  passwd NAME                  Clear user password\n");
+    printf("  friends USER                 List a user's friends and their rights\n");
+    printf("  friendadd OWNER FRIEND [R]   Add friend (R = rights, default RWA)\n");
+    printf("  frienddel OWNER FRIEND       Remove a friend\n");
+    printf("  save [HOSTFILE]              Save changes to disk (optional save-as)\n");
+    printf("  help                         Show this help\n");
+    printf("  quit / exit                  Exit shell\n");
 }
 
 static void shell_ls(ndtool_ctx_t *ctx, const char *arg)
@@ -128,7 +132,7 @@ static void shell_ls(ndtool_ctx_t *ctx, const char *arg)
             const ndfs_object_entry_t *e = &objs[i];
             char full[NDFS_NAME_MAX + NDFS_TYPE_MAX + 2];
             char datebuf[24];
-            if (strcmp(e->user_name, user_name) != 0) continue;
+            if (!ci_equal(e->user_name, user_name)) continue;
             ndfs_oe_full_name(e, full, sizeof(full));
             if (file_pat && !ndfs_wildmatch(file_pat, full, true)) continue;
             ndtool_format_nd_date(e->date_created, datebuf, sizeof(datebuf));
