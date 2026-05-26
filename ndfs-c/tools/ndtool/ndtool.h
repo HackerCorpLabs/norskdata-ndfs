@@ -77,6 +77,7 @@ int cmd_passwd(ndtool_ctx_t *ctx, const char *name);
 int cmd_create(ndtool_ctx_t *ctx, const char *template_name, uint32_t custom_pages, const char *dir_name);
 int cmd_shell(ndtool_ctx_t *ctx);
 int cmd_stat(ndtool_ctx_t *ctx, const char *path, bool verbose);
+int cmd_chmod(ndtool_ctx_t *ctx, const char *spec, const char *path);
 
 /* stat/chmod helpers (also used by the access-edit command) */
 void ndtool_format_nd_date(uint32_t v, char *out, size_t len);

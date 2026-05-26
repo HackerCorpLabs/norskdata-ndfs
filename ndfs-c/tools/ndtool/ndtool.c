@@ -45,6 +45,8 @@ static struct option long_options[] = {
     {"dest",      required_argument, 0, 1008},
     {"overwrite", no_argument,       0, 1009},
     {"interactive", no_argument,     0, 1010},
+    {"stat",      required_argument, 0, 1011},
+    {"chmod",     required_argument, 0, 1012},
     {"pages",     required_argument, 0, 1001},
     {"name",      required_argument, 0, 1002},
     {0, 0, 0, 0}
@@ -78,6 +80,8 @@ int main(int argc, char **argv)
     const char *create_template = NULL;
     uint32_t custom_pages = 0;
     const char *dir_name = NULL;
+    const char *stat_path = NULL;
+    const char *chmod_spec = NULL;
 
     int needs_write = 0;
 
@@ -123,6 +127,8 @@ int main(int argc, char **argv)
         case 1008: ctx.dest_user = optarg; break;
         case 1009: ctx.on_exist = NDTOOL_ON_EXIST_OVERWRITE; break;
         case 1010: ctx.on_exist = NDTOOL_ON_EXIST_PROMPT; break;
+        case 1011: stat_path = optarg; break;
+        case 1012: chmod_spec = optarg; needs_write = 1; break;
 
         case 1001: custom_pages = (uint32_t)atol(optarg); break;
         case 1002: dir_name = optarg; break;
@@ -220,6 +226,12 @@ int main(int argc, char **argv)
         ret = cmd_list(&ctx);
     } else if (mode_users && !mode_list) {
         ret = cmd_users(&ctx);
+    } else if (stat_path) {
+        ret = cmd_stat(&ctx, stat_path, ctx.verbose);
+    } else if (chmod_spec) {
+        /* --chmod SPEC PATH <image>: PATH is the positional before the image. */
+        const char *path = (optind < argc - 1) ? argv[optind] : NULL;
+        ret = cmd_chmod(&ctx, chmod_spec, path);
     } else if (mode_extract) {
         ret = cmd_extract(&ctx);
     } else if (put_local) {
@@ -274,6 +286,8 @@ static void print_usage(const char *prog)
     printf("  --remquota NAME PAGES    Remove pages from user quota (checks usage)\n");
     printf("  --passwd NAME            Clear user password\n");
     printf("  --fsck          Full filesystem check\n");
+    printf("  --stat PATH     Show detailed file metadata (add -v for block list)\n");
+    printf("  --chmod SPEC PATH   Change a file's access permissions\n");
     printf("  --create TEMPLATE  Create new image\n");
     printf("  --shell         Interactive shell\n");
     printf("\nOptions:\n");
@@ -293,6 +307,14 @@ static void print_usage(const char *prog)
     printf("  --editor CMD    Editor for 'edit' command (default: $EDITOR or code --wait)\n");
     printf("  -h              Show this help\n");
     printf("  -V              Show version\n");
+    printf("\nAccess permissions (--chmod / shell 'chmod'):\n");
+    printf("  SPEC is comma-separated clauses: TIER OP RIGHTS\n");
+    printf("    TIER   OWN | FRIEND | PUBLIC | ALL   (or O | F | P)\n");
+    printf("    OP     =  set exactly    +  add    -  remove\n");
+    printf("    RIGHTS letters: R read  W write  A append  C common  D directory\n");
+    printf("  Examples:  OWN+WD   OWN=RWACD,FRIEND=RW   PUBLIC-A   ALL=R\n");
+    printf("  Raw form:  a 0x.. or decimal value sets the whole 15-bit word (0x03FF)\n");
+    printf("  Use -n to preview the before -> after change without writing.\n");
     printf("\nCreate templates:\n");
     printf("  floppy360       360 KB floppy (154 pages)\n");
     printf("  floppy12        1.2 MB floppy (512 pages)\n");
@@ -309,6 +331,8 @@ static void print_usage(const char *prog)
     printf("  %s --put myfile.txt SYSTEM/MYFILE:TEXT disk.ndfs\n", prog);
     printf("  %s -x -p -F 'SYSTEM/*:MODE' -o out/ disk.ndfs\n", prog);
     printf("  %s --put '*.NPL' --dest TEST -p disk.ndfs\n", prog);
+    printf("  %s --stat -v SYSTEM/LOAD:MODE disk.ndfs\n", prog);
+    printf("  %s --chmod 'OWN+WD,PUBLIC-A' SYSTEM/LOAD:MODE disk.ndfs\n", prog);
     printf("  %s --create floppy360 --name MYDISK newdisk.ndfs\n", prog);
     printf("  %s --shell disk.ndfs\n", prog);
 }

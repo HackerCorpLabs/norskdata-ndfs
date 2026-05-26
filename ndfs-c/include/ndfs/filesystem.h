@@ -225,6 +225,14 @@ ndfs_error_t ndfs_get_user(const ndfs_filesystem_t *fs, uint8_t index,
 ndfs_error_t ndfs_get_file_blocks(const ndfs_filesystem_t *fs, const char *path,
                                   uint32_t **out_blocks, size_t *out_count);
 
+/**
+ * Set the 15-bit access word for a file and persist the change.
+ * @param path         File path "USER/NAME:TYPE".
+ * @param access_bits  New access word (3x5-bit OWN/FRIEND/PUBLIC tiers).
+ */
+ndfs_error_t ndfs_set_file_access(ndfs_filesystem_t *fs, const char *path,
+                                  uint16_t access_bits);
+
 /* ── Bitmap queries ──────────────────────────────────────────────── */
 
 bool ndfs_is_block_used(const ndfs_filesystem_t *fs, uint32_t block_id);

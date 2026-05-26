@@ -1527,6 +1527,21 @@ ndfs_error_t ndfs_file_exists(const ndfs_filesystem_t *fs, const char *path,
     return NDFS_OK;
 }
 
+ndfs_error_t ndfs_set_file_access(ndfs_filesystem_t *fs, const char *path,
+                                  uint16_t access_bits)
+{
+    int idx;
+
+    if (!fs || !path) return NDFS_ERR_NULL_PTR;
+    if (fs->read_only) return NDFS_ERR_READ_ONLY;
+
+    idx = find_object(fs, path);
+    if (idx < 0) return NDFS_ERR_NOT_FOUND;
+
+    fs->objects[idx].access_bits = access_bits & 0x7FFF;
+    return persist_all(fs);
+}
+
 ndfs_error_t ndfs_get_metadata(const ndfs_filesystem_t *fs, const char *path,
                                ndfs_file_entry_t *out_entry)
 {

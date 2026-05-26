@@ -28,7 +28,9 @@ static void shell_help(void)
     printf("  info               Show filesystem info\n");
     printf("  bitmap             Show bitmap visualization and validation\n");
     printf("  fsck               Full filesystem check (block refs, quotas, etc.)\n");
-    printf("  stat PATH          Show detailed file metadata\n");
+    printf("  stat [-v] PATH     Show detailed file metadata (-v adds block list)\n");
+    printf("  chmod SPEC PATH    Change access, e.g. OWN+WD,FRIEND=RW,PUBLIC-A\n");
+    printf("                     rights: R read W write A append C common D directory\n");
     printf("  edit PATH          Edit file in external editor (extracts, edits, re-imports)\n");
     printf("  users              List users with quota info\n");
     printf("  useradd NAME [Q]   Add user (Q = quota, default 100)\n");
@@ -492,6 +494,16 @@ int cmd_shell(ndtool_ctx_t *ctx)
                     fprintf(stderr, "Usage: stat [-v] USER/FILE:TYPE\n");
                 } else {
                     cmd_stat(ctx, path, verbose);
+                }
+            }
+            else if (strcmp(cmd, "chmod") == 0) {
+                /* chmod SPEC PATH */
+                if (!arg1 || !arg2) {
+                    fprintf(stderr, "Usage: chmod SPEC USER/FILE:TYPE\n");
+                    fprintf(stderr, "  SPEC e.g. OWN+WD,FRIEND=RW,PUBLIC-A  or  0x03FF\n");
+                    fprintf(stderr, "  rights: R read W write A append C common D directory\n");
+                } else {
+                    cmd_chmod(ctx, arg1, arg2);
                 }
             }
             else if (strcmp(cmd, "users") == 0) {
