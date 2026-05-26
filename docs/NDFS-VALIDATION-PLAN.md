@@ -244,6 +244,18 @@ For each divergence the matrix surfaces:
 - ✅ **>512-page files** rejected in C/PY (were corrupting the adjacent block);
   TS uses sub-indexed.
 - ✅ Object header word preserved on rewrite (used/modified bits).
+- ✅ **Empty file type defaulted to "DATA" on read** — `from_bytes`/`fromBytes`
+  rewrote an intentionally-empty type field (e.g. `TERMINAL`: `27 00 00 00`)
+  to `44 41 54 41` on the next write-back. Now the empty type is preserved
+  verbatim, matching RetroCore (`ObjectEntry.FromBytes`). Fixed in C/TS/PY +
+  golden empty-type round-trip tests.
+- ✅ **`persist_all` rewrote the entire filesystem on every mutation** — each
+  add/delete/rename/chmod/quota re-serialized *all* metadata, giving every
+  write a filesystem-wide blast radius (and re-applying the empty-type bug to
+  unrelated files). Replaced with **immediate, surgical per-block writes**
+  matching RetroCore's `NDDiskBlock.WriteBlock` (write only the touched
+  object/user/bitmap page). C/TS/PY + a combined-regression test (empty-type
+  file survives an unrelated add-user).
 
 ### Verified NOT a bug (audit claim debunked against a real disk)
 - ✓ **Bit-file bit ordering** — the flat byte layout (`block/8`, `bit%8`) is

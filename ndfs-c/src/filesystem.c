@@ -45,7 +45,9 @@ struct ndfs_filesystem {
 static const uint8_t *read_page(const struct ndfs_filesystem *fs, uint32_t block_id);
 static uint8_t *write_page_ptr(struct ndfs_filesystem *fs, uint32_t block_id);
 static ndfs_error_t load_structures(struct ndfs_filesystem *fs);
-static ndfs_error_t persist_all(struct ndfs_filesystem *fs);
+static ndfs_error_t write_bit_file(struct ndfs_filesystem *fs);
+static ndfs_error_t write_user_page(struct ndfs_filesystem *fs, uint32_t user_index);
+static ndfs_error_t write_object_page(struct ndfs_filesystem *fs, uint32_t object_index);
 static void parse_path(const char *path,
                        char *user_name, size_t user_sz,
                        char *obj_name, size_t obj_sz,
@@ -775,6 +777,12 @@ static ndfs_error_t create_new_file(struct ndfs_filesystem *fs,
     /* Update user pages used */
     fs->users[user_slot].pages_used += data_pages + 1;
 
+    /* Surgical writes: the new object's directory page, the owner's user page,
+     * and the allocation bitmap. Index/data blocks were written above. */
+    write_object_page(fs, obj_index);
+    write_user_page(fs, fs->users[user_slot].user_index);
+    write_bit_file(fs);
+
     return NDFS_OK;
 }
 
@@ -860,150 +868,139 @@ static ndfs_error_t update_existing_file(struct ndfs_filesystem *fs,
 
     fs->users[user_slot].pages_used += data_pages + 1;
 
-    return NDFS_OK;
-}
-
-/* ── Persist all structures to disk ──────────────────────────────── */
-
-static ndfs_error_t persist_all(struct ndfs_filesystem *fs)
-{
-    const ndfs_master_block_t *mb = &fs->master_block;
-    size_t i, j;
-
-    /* BitFile: write contiguous pages */
-    if (ndfs_bp_is_valid(&mb->bit_file_ptr)) {
-        const uint8_t *bm_data;
-        size_t bm_len;
-        uint32_t bm_pages;
-
-        ndfs_bf_get_data(&fs->bit_file, &bm_data, &bm_len);
-        bm_pages = (uint32_t)((bm_len + NDFS_PAGE_SIZE - 1) / NDFS_PAGE_SIZE);
-
-        for (i = 0; i < bm_pages; i++) {
-            uint8_t *page = write_page_ptr(fs, mb->bit_file_ptr.block_id + (uint32_t)i);
-            size_t src_off = i * NDFS_PAGE_SIZE;
-            size_t copy_len = NDFS_PAGE_SIZE;
-            if (!page) continue;
-            memset(page, 0, NDFS_PAGE_SIZE);
-            if (src_off + copy_len > bm_len) copy_len = bm_len - src_off;
-            if (copy_len > 0 && src_off < bm_len) memcpy(page, bm_data + src_off, copy_len);
-        }
-    }
-
-    /* UserFile: write data pages via existing index pointers */
-    if (ndfs_bp_is_valid(&mb->user_file_ptr)) {
-        const uint8_t *existing_idx = read_page(fs, mb->user_file_ptr.block_id);
-        if (existing_idx) {
-            for (i = 0; i < NDFS_MAX_USER_FILE_PTRS; i++) {
-                ndfs_block_pointer_t ptr = ndfs_bp_from_bytes(existing_idx, i * 4);
-                uint8_t *page;
-                if (!ndfs_bp_is_valid(&ptr)) continue;
-
-                page = write_page_ptr(fs, ptr.block_id);
-                if (!page) continue;
-                memset(page, 0, NDFS_PAGE_SIZE);
-
-                /* Write user entries for this page */
-                for (j = 0; j < NDFS_ENTRIES_PER_PAGE; j++) {
-                    uint32_t user_idx = (uint32_t)(i * NDFS_ENTRIES_PER_PAGE + j);
-                    if (user_idx < MAX_INTERNAL_USERS && fs->user_valid[user_idx]) {
-                        ndfs_ue_to_bytes(&fs->users[user_idx],
-                                         page + j * NDFS_ENTRY_SIZE);
-                    }
-                }
-            }
-        }
-    }
-
-    /* ObjectFile: write data pages */
-    if (ndfs_bp_is_valid(&mb->object_file_ptr)) {
-        if (mb->object_file_ptr.type == NDFS_PTR_INDEXED) {
-            const uint8_t *idx_page = read_page(fs, mb->object_file_ptr.block_id);
-            if (idx_page) {
-                /* Determine which data pages have entries */
-                for (i = 0; i < fs->object_count; i++) {
-                    uint32_t page_idx = fs->objects[i].object_index / NDFS_ENTRIES_PER_PAGE;
-                    uint32_t slot = fs->objects[i].object_index % NDFS_ENTRIES_PER_PAGE;
-                    ndfs_block_pointer_t ptr;
-                    uint8_t *page;
-
-                    if (page_idx >= NDFS_MAX_OBJECT_FILE_PTRS) continue;
-                    ptr = ndfs_bp_from_bytes(idx_page, page_idx * 4);
-                    if (!ndfs_bp_is_valid(&ptr)) continue;
-
-                    page = write_page_ptr(fs, ptr.block_id);
-                    if (!page) continue;
-
-                    ndfs_oe_to_bytes(&fs->objects[i], page, NDFS_PAGE_SIZE,
-                                     slot * NDFS_ENTRY_SIZE);
-                }
-            }
-        } else if (mb->object_file_ptr.type == NDFS_PTR_SUBINDEXED) {
-            const uint8_t *sub_page = read_page(fs, mb->object_file_ptr.block_id);
-            if (sub_page) {
-                for (i = 0; i < fs->object_count; i++) {
-                    uint32_t page_idx = fs->objects[i].object_index / NDFS_ENTRIES_PER_PAGE;
-                    uint32_t slot = fs->objects[i].object_index % NDFS_ENTRIES_PER_PAGE;
-                    uint32_t sub_idx = page_idx / NDFS_MAX_OBJECT_FILE_PTRS;
-                    uint32_t inner_idx = page_idx % NDFS_MAX_OBJECT_FILE_PTRS;
-                    ndfs_block_pointer_t sub_ptr, data_ptr;
-                    const uint8_t *inner_idx_page;
-                    uint8_t *page;
-
-                    sub_ptr = ndfs_bp_from_bytes(sub_page, sub_idx * 4);
-                    if (!ndfs_bp_is_valid(&sub_ptr)) continue;
-                    inner_idx_page = read_page(fs, sub_ptr.block_id);
-                    if (!inner_idx_page) continue;
-                    data_ptr = ndfs_bp_from_bytes(inner_idx_page, inner_idx * 4);
-                    if (!ndfs_bp_is_valid(&data_ptr)) continue;
-
-                    page = write_page_ptr(fs, data_ptr.block_id);
-                    if (!page) continue;
-                    ndfs_oe_to_bytes(&fs->objects[i], page, NDFS_PAGE_SIZE,
-                                     slot * NDFS_ENTRY_SIZE);
-                }
-            }
-        }
-    }
+    /* Surgical writes: the file's object page, the owner's user page, and the
+     * allocation bitmap (old blocks freed + new blocks allocated above). */
+    write_object_page(fs, existing->object_index);
+    write_user_page(fs, fs->users[user_slot].user_index);
+    write_bit_file(fs);
 
     return NDFS_OK;
 }
 
-/* Zero the on-disk object entry at a physical slot so a deleted file does not
- * reappear when the image is reloaded (persist_all only rewrites surviving
- * objects and would otherwise leave the freed slot's in-use bit set). */
-static void clear_object_slot(struct ndfs_filesystem *fs, uint32_t object_index)
+/* ── Surgical metadata writes ─────────────────────────────────────────
+ *
+ * NDFS writes are immediate and surgical (matching RetroCommander/RetroCore):
+ * a mutation rewrites ONLY the block(s) it actually touched — never the whole
+ * filesystem. Each helper rebuilds a single 2048-byte page from the in-memory
+ * model and writes it into the image buffer. Rebuilding a page zero-filled
+ * also clears freed slots, so a deleted file does not reappear on reload. */
+
+/* Write the BitFile allocation bitmap (contiguous; a page or two for most
+ * disks). The bitmap is small, so it is written whole when allocation
+ * changed — that mirrors the C# reference, which writes the affected BitFile
+ * blocks on every allocate/free. */
+static ndfs_error_t write_bit_file(struct ndfs_filesystem *fs)
 {
     const ndfs_master_block_t *mb = &fs->master_block;
-    uint32_t page_idx = object_index / NDFS_ENTRIES_PER_PAGE;
-    uint32_t slot = object_index % NDFS_ENTRIES_PER_PAGE;
-    uint8_t *page = NULL;
+    const uint8_t *bm_data;
+    size_t bm_len;
+    uint32_t bm_pages, i;
 
-    if (!ndfs_bp_is_valid(&mb->object_file_ptr)) return;
+    if (!ndfs_bp_is_valid(&mb->bit_file_ptr)) return NDFS_OK;
+
+    ndfs_bf_get_data(&fs->bit_file, &bm_data, &bm_len);
+    bm_pages = (uint32_t)((bm_len + NDFS_PAGE_SIZE - 1) / NDFS_PAGE_SIZE);
+
+    for (i = 0; i < bm_pages; i++) {
+        uint8_t *page = write_page_ptr(fs, mb->bit_file_ptr.block_id + i);
+        size_t src_off = (size_t)i * NDFS_PAGE_SIZE;
+        size_t copy_len = NDFS_PAGE_SIZE;
+        if (!page) continue;
+        memset(page, 0, NDFS_PAGE_SIZE);
+        if (src_off + copy_len > bm_len) copy_len = bm_len - src_off;
+        if (copy_len > 0 && src_off < bm_len) memcpy(page, bm_data + src_off, copy_len);
+    }
+    return NDFS_OK;
+}
+
+/* Write the single UserFile data page that holds user `user_index`
+ * (page = user_index / 32), rebuilt from the in-memory user entries. */
+static ndfs_error_t write_user_page(struct ndfs_filesystem *fs, uint32_t user_index)
+{
+    const ndfs_master_block_t *mb = &fs->master_block;
+    uint32_t page_idx = user_index / NDFS_ENTRIES_PER_PAGE;
+    const uint8_t *index_block;
+    ndfs_block_pointer_t ptr;
+    uint8_t *page;
+    size_t j;
+
+    if (!ndfs_bp_is_valid(&mb->user_file_ptr)) return NDFS_OK;
+    if (page_idx >= NDFS_MAX_USER_FILE_PTRS) return NDFS_OK;
+
+    index_block = read_page(fs, mb->user_file_ptr.block_id);
+    if (!index_block) return NDFS_OK;
+    ptr = ndfs_bp_from_bytes(index_block, page_idx * 4);
+    if (!ndfs_bp_is_valid(&ptr)) return NDFS_OK;
+
+    page = write_page_ptr(fs, ptr.block_id);
+    if (!page) return NDFS_ERR_CORRUPT;
+
+    /* Rebuild the page zero-filled so a removed user's slot is cleared. */
+    memset(page, 0, NDFS_PAGE_SIZE);
+    for (j = 0; j < NDFS_ENTRIES_PER_PAGE; j++) {
+        uint32_t uidx = page_idx * NDFS_ENTRIES_PER_PAGE + (uint32_t)j;
+        if (uidx < MAX_INTERNAL_USERS && fs->user_valid[uidx]) {
+            ndfs_ue_to_bytes(&fs->users[uidx], page + j * NDFS_ENTRY_SIZE);
+        }
+    }
+    return NDFS_OK;
+}
+
+/* Resolve the on-disk data block backing ObjectFile page `page_idx`, or 0. */
+static uint32_t object_page_block(const struct ndfs_filesystem *fs, uint32_t page_idx)
+{
+    const ndfs_master_block_t *mb = &fs->master_block;
+
+    if (!ndfs_bp_is_valid(&mb->object_file_ptr)) return 0;
 
     if (mb->object_file_ptr.type == NDFS_PTR_INDEXED) {
-        const uint8_t *idx_page = read_page(fs, mb->object_file_ptr.block_id);
+        const uint8_t *idx = read_page(fs, mb->object_file_ptr.block_id);
         ndfs_block_pointer_t ptr;
-        if (!idx_page || page_idx >= NDFS_MAX_OBJECT_FILE_PTRS) return;
-        ptr = ndfs_bp_from_bytes(idx_page, page_idx * 4);
-        if (!ndfs_bp_is_valid(&ptr)) return;
-        page = write_page_ptr(fs, ptr.block_id);
+        if (!idx || page_idx >= NDFS_MAX_OBJECT_FILE_PTRS) return 0;
+        ptr = ndfs_bp_from_bytes(idx, page_idx * 4);
+        return ndfs_bp_is_valid(&ptr) ? ptr.block_id : 0;
     } else if (mb->object_file_ptr.type == NDFS_PTR_SUBINDEXED) {
-        const uint8_t *sub_page = read_page(fs, mb->object_file_ptr.block_id);
         uint32_t sub_idx = page_idx / NDFS_MAX_OBJECT_FILE_PTRS;
         uint32_t inner_idx = page_idx % NDFS_MAX_OBJECT_FILE_PTRS;
+        const uint8_t *sub = read_page(fs, mb->object_file_ptr.block_id);
         ndfs_block_pointer_t sub_ptr, data_ptr;
         const uint8_t *inner;
-        if (!sub_page) return;
-        sub_ptr = ndfs_bp_from_bytes(sub_page, sub_idx * 4);
-        if (!ndfs_bp_is_valid(&sub_ptr)) return;
+        if (!sub) return 0;
+        sub_ptr = ndfs_bp_from_bytes(sub, sub_idx * 4);
+        if (!ndfs_bp_is_valid(&sub_ptr)) return 0;
         inner = read_page(fs, sub_ptr.block_id);
-        if (!inner) return;
+        if (!inner) return 0;
         data_ptr = ndfs_bp_from_bytes(inner, inner_idx * 4);
-        if (!ndfs_bp_is_valid(&data_ptr)) return;
-        page = write_page_ptr(fs, data_ptr.block_id);
+        return ndfs_bp_is_valid(&data_ptr) ? data_ptr.block_id : 0;
     }
-    if (page) memset(page + (size_t)slot * NDFS_ENTRY_SIZE, 0, NDFS_ENTRY_SIZE);
+    return 0;
+}
+
+/* Write the single ObjectFile data page that holds object `object_index`
+ * (page = object_index / 32). Rebuilt zero-filled from the in-memory objects,
+ * which clears any slot freed by a delete (so it does not reappear on
+ * reload — folding in the old clear_object_slot behaviour). */
+static ndfs_error_t write_object_page(struct ndfs_filesystem *fs, uint32_t object_index)
+{
+    uint32_t page_idx = object_index / NDFS_ENTRIES_PER_PAGE;
+    uint32_t data_block = object_page_block(fs, page_idx);
+    uint8_t *page;
+    size_t i;
+
+    if (data_block == 0) return NDFS_OK;
+
+    page = write_page_ptr(fs, data_block);
+    if (!page) return NDFS_ERR_CORRUPT;
+
+    memset(page, 0, NDFS_PAGE_SIZE);
+    for (i = 0; i < fs->object_count; i++) {
+        if (fs->objects[i].object_index / NDFS_ENTRIES_PER_PAGE == page_idx) {
+            uint32_t slot = fs->objects[i].object_index % NDFS_ENTRIES_PER_PAGE;
+            ndfs_oe_to_bytes(&fs->objects[i], page, NDFS_PAGE_SIZE,
+                             slot * NDFS_ENTRY_SIZE);
+        }
+    }
+    return NDFS_OK;
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -1348,8 +1345,9 @@ ndfs_error_t ndfs_write_file(ndfs_filesystem_t *fs,
         err = create_new_file(fs, obj_name, file_type, user_slot, file_data, file_size);
     }
 
-    if (err != NDFS_OK) return err;
-    return persist_all(fs);
+    /* create_new_file / update_existing_file performed their own surgical
+     * metadata writes (object page, owner user page, bitmap). */
+    return err;
 }
 
 ndfs_error_t ndfs_delete_file(ndfs_filesystem_t *fs, const char *path)
@@ -1384,17 +1382,26 @@ ndfs_error_t ndfs_delete_file(ndfs_filesystem_t *fs, const char *path)
             fs->users[user_slot].pages_used = 0;
     }
 
-    /* Clear the freed entry's slot on disk so it does not reappear on reload. */
-    clear_object_slot(fs, obj->object_index);
+    /* Surgical writes (RetroCommander): capture the index/owner before the
+     * array removal invalidates `obj`, drop the entry, then rewrite the freed
+     * object's page (zero-fill clears the slot so it does not reappear), the
+     * owner's user page, and the allocation bitmap. */
+    {
+        uint32_t freed_index = obj->object_index;
+        uint8_t  owner       = obj->user_index;
 
-    /* Remove from object array */
-    if ((size_t)idx < fs->object_count - 1) {
-        memmove(&fs->objects[idx], &fs->objects[idx + 1],
-                (fs->object_count - (size_t)idx - 1) * sizeof(ndfs_object_entry_t));
+        if ((size_t)idx < fs->object_count - 1) {
+            memmove(&fs->objects[idx], &fs->objects[idx + 1],
+                    (fs->object_count - (size_t)idx - 1) * sizeof(ndfs_object_entry_t));
+        }
+        fs->object_count--;
+
+        write_object_page(fs, freed_index);
+        write_user_page(fs, owner);
+        write_bit_file(fs);
     }
-    fs->object_count--;
 
-    return persist_all(fs);
+    return NDFS_OK;
 }
 
 ndfs_error_t ndfs_rename(ndfs_filesystem_t *fs,
@@ -1431,7 +1438,8 @@ ndfs_error_t ndfs_rename(ndfs_filesystem_t *fs,
     fs->objects[idx].type[tlen] = '\0';
     str_toupper(fs->objects[idx].type);
 
-    return persist_all(fs);
+    /* Rename touches only this file's object entry. */
+    return write_object_page(fs, fs->objects[idx].object_index);
 }
 
 /* ── User management ─────────────────────────────────────────────── */
@@ -1513,7 +1521,8 @@ ndfs_error_t ndfs_add_user(ndfs_filesystem_t *fs,
     fs->user_valid[slot] = true;
     fs->user_count++;
 
-    return persist_all(fs);
+    /* Add-user touches only the UserFile page holding this new user. */
+    return write_user_page(fs, (uint32_t)slot);
 }
 
 ndfs_error_t ndfs_remove_user(ndfs_filesystem_t *fs, uint8_t index)
@@ -1532,7 +1541,8 @@ ndfs_error_t ndfs_remove_user(ndfs_filesystem_t *fs, uint8_t index)
     fs->user_valid[slot] = false;
     fs->user_count--;
 
-    return persist_all(fs);
+    /* Remove-user touches only this user's UserFile page (slot zeroed). */
+    return write_user_page(fs, index);
 }
 
 ndfs_error_t ndfs_update_user_quota(ndfs_filesystem_t *fs,
@@ -1549,7 +1559,7 @@ ndfs_error_t ndfs_update_user_quota(ndfs_filesystem_t *fs,
 
     fs->users[slot].pages_reserved = new_pages;
 
-    return persist_all(fs);
+    return write_user_page(fs, index);
 }
 
 ndfs_error_t ndfs_clear_user_password(ndfs_filesystem_t *fs, const char *name)
@@ -1564,7 +1574,7 @@ ndfs_error_t ndfs_clear_user_password(ndfs_filesystem_t *fs, const char *name)
 
     fs->users[slot].password = 0;
 
-    return persist_all(fs);
+    return write_user_page(fs, fs->users[slot].user_index);
 }
 
 ndfs_error_t ndfs_clear_user_password_by_index(ndfs_filesystem_t *fs,
@@ -1580,7 +1590,7 @@ ndfs_error_t ndfs_clear_user_password_by_index(ndfs_filesystem_t *fs,
 
     fs->users[slot].password = 0;
 
-    return persist_all(fs);
+    return write_user_page(fs, index);
 }
 
 /* ── Read operations (extended) ──────────────────────────────────── */
@@ -1667,7 +1677,8 @@ ndfs_error_t ndfs_set_file_access(ndfs_filesystem_t *fs, const char *path,
     if (idx < 0) return NDFS_ERR_NOT_FOUND;
 
     fs->objects[idx].access_bits = access_bits & 0x7FFF;
-    return persist_all(fs);
+    /* Access change touches only this file's object entry. */
+    return write_object_page(fs, fs->objects[idx].object_index);
 }
 
 ndfs_error_t ndfs_get_metadata(const ndfs_filesystem_t *fs, const char *path,

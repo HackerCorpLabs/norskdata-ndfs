@@ -168,4 +168,19 @@ export class UserFile {
 
     return { indexPage, dataPages };
   }
+
+  /**
+   * Serialize the single user-file data page `pageIndex`, zero-filled.
+   * Zero-fill clears the slot of any removed user.
+   */
+  toDataPage(pageIndex: number): Uint8Array {
+    const page = new Uint8Array(NDFS_PAGE_SIZE);
+    this.entries.forEach((user) => {
+      if (Math.floor(user.userIndex / ENTRIES_PER_PAGE) === pageIndex) {
+        const slotInPage = user.userIndex % ENTRIES_PER_PAGE;
+        page.set(user.toBytes(), slotInPage * ENTRY_SIZE);
+      }
+    });
+    return page;
+  }
 }

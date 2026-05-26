@@ -120,4 +120,24 @@ describe('WritePersistence', () => {
     expect(fs2.fileExists('SYSTEM/A:TEXT')).toBe(false);
     expect(fs2.fileExists('SYSTEM/B:TEXT')).toBe(true);
   });
+
+  // Bug 1+2 regression: an unrelated mutation must not corrupt other files'
+  // metadata. A file with an empty type must keep it after an unrelated
+  // add-user. The original port re-serialized EVERY object entry on every
+  // mutation and defaulted empty types to 'DATA' on read, so adding a user
+  // corrupted unrelated files. Writes are now surgical and empty types are
+  // preserved.
+  it('surgical write preserves an empty type across an unrelated mutation', () => {
+    const fs = createFS();
+    // File with an EMPTY type (path carries no :TYPE suffix).
+    fs.writeFile('SYSTEM/NOTYPE', new Uint8Array([0x78]));
+    expect(fs.getMetadata('SYSTEM/NOTYPE')!.type).toBe('');
+
+    // Unrelated mutation: add a brand-new user.
+    fs.addUser('BACKUP', 50);
+
+    // Export + reload: the empty type must survive, not become 'DATA'.
+    const fs2 = new NdfsFileSystem(fs.toBuffer());
+    expect(fs2.getMetadata('SYSTEM/NOTYPE')!.type).toBe('');
+  });
 });

@@ -265,8 +265,8 @@ export class NdfsFileSystem {
     } else {
       this.createNewFile(objectName, fileType, user, fileData);
     }
-
-    this.persistAll();
+    // updateExistingFile / createNewFile perform their own surgical metadata
+    // writes (object page, owner user page, bitmap).
   }
 
   /** Delete a file. */
@@ -297,8 +297,15 @@ export class NdfsFileSystem {
       user.pagesUsed = user.pagesUsed >= totalBlocks ? user.pagesUsed - totalBlocks : 0;
     }
 
+    // Surgical writes: capture index/owner before removal, then rewrite the
+    // freed object's page (zero-fill clears the slot), the owner's user page,
+    // and the allocation bitmap.
+    const freedIndex = obj.objectIndex;
+    const owner = obj.userIndex;
     this.objectFile.removeObject(obj.objectIndex);
-    this.persistAll();
+    this.writeObjectPage(freedIndex);
+    this.writeUserPage(owner);
+    this.writeBitFile();
   }
 
   /** Rename a file. */
@@ -313,7 +320,8 @@ export class NdfsFileSystem {
 
     obj.objectName = objectName.toUpperCase().substring(0, NDFS_NAME_MAX);
     obj.type = fileType.toUpperCase().substring(0, NDFS_TYPE_MAX);
-    this.persistAll();
+    // Rename touches only this file's object entry.
+    this.writeObjectPage(obj.objectIndex);
   }
 
   // ── User management ────────────────────────────────────────────────
@@ -341,7 +349,8 @@ export class NdfsFileSystem {
     user.userIndex = idx;
     user.pagesReserved = reservedPages;
     this.userFile.addUser(user);
-    this.persistAll();
+    // Add-user touches only the UserFile page holding this new user.
+    this.writeUserPage(user.userIndex);
     return true;
   }
 
@@ -353,7 +362,8 @@ export class NdfsFileSystem {
     if (files.length > 0) return false; // user has files
 
     const ok = this.userFile.removeUser(index);
-    if (ok) this.persistAll();
+    // Removed user's UserFile page (slot zeroed by rebuild).
+    if (ok) this.writeUserPage(index);
     return ok;
   }
 
@@ -361,7 +371,7 @@ export class NdfsFileSystem {
   updateUserQuota(index: number, newPages: number): boolean {
     this.ensureWritable();
     const ok = this.userFile.updateUserQuota(index, newPages);
-    if (ok) this.persistAll();
+    if (ok) this.writeUserPage(index);
     return ok;
   }
 
@@ -378,7 +388,7 @@ export class NdfsFileSystem {
     if (!user) return false;
 
     user.password = 0;
-    this.persistAll();
+    this.writeUserPage(user.userIndex);
     return true;
   }
 
@@ -530,7 +540,8 @@ export class NdfsFileSystem {
       if (typeof properties['ndfs.last_write_date'] === 'number') {
         obj.lastDateWritten = properties['ndfs.last_write_date'] as number;
       }
-      this.persistAll();
+      // Properties change only this file's object entry.
+      this.writeObjectPage(obj.objectIndex);
     }
   }
 
@@ -867,6 +878,11 @@ export class NdfsFileSystem {
 
     // Update user pages used
     user.pagesUsed += dataPages + indexBlocksUsed;
+
+    // Surgical writes: new object's page, owner's user page, bitmap.
+    this.writeObjectPage(entry.objectIndex);
+    this.writeUserPage(user.userIndex);
+    this.writeBitFile();
   }
 
   private updateExistingFile(
@@ -906,6 +922,11 @@ export class NdfsFileSystem {
 
     // Update user pages used
     user.pagesUsed += dataPages + indexBlocksUsed;
+
+    // Surgical writes: the file's object page, owner's user page, bitmap.
+    this.writeObjectPage(existing.objectIndex);
+    this.writeUserPage(user.userIndex);
+    this.writeBitFile();
   }
 
   private freeFileBlocks(obj: ObjectEntry): void {
@@ -943,73 +964,66 @@ export class NdfsFileSystem {
    * Persist all three structures to the image buffer.
    * Order: BitFile -> UserFile -> ObjectFile (matching C# reference).
    */
-  private persistAll(): void {
+  // NDFS writes are immediate and surgical (matching RetroCommander/RetroCore):
+  // a mutation rewrites ONLY the block(s) it touched, never the whole
+  // filesystem. Each helper rebuilds a single 2048-byte page from the
+  // in-memory model; rebuilding zero-filled also clears freed slots so a
+  // deleted file/user does not reappear on reload.
+
+  /** Write the BitFile allocation bitmap (small, contiguous). */
+  private writeBitFile(): void {
     const mb = this.masterBlock;
-
-    // BitFile: write contiguous pages
-    if (mb.bitFilePointer && mb.bitFilePointer.isValid()) {
-      const pages = this.bitFile.toPageBuffers();
-      for (let i = 0; i < pages.length; i++) {
-        this.writePage(mb.bitFilePointer.blockId + i, pages[i]);
-      }
+    if (!mb.bitFilePointer || !mb.bitFilePointer.isValid()) return;
+    const pages = this.bitFile.toPageBuffers();
+    for (let i = 0; i < pages.length; i++) {
+      this.writePage(mb.bitFilePointer.blockId + i, pages[i]);
     }
+  }
 
-    // UserFile: write index + data pages
-    if (mb.userFilePointer && mb.userFilePointer.isValid()) {
-      const { indexPage, dataPages } = this.userFile.toPageBuffers();
+  /** Write only the UserFile data page holding `userIndex`. */
+  private writeUserPage(userIndex: number): void {
+    const mb = this.masterBlock;
+    if (!mb.userFilePointer || !mb.userFilePointer.isValid()) return;
+    const pageIndex = Math.floor(userIndex / ENTRIES_PER_PAGE);
+    if (pageIndex >= MAX_USER_FILE_POINTERS) return;
+    const indexPage = this.readPage(mb.userFilePointer.blockId);
+    const ptr = BlockPointer.fromBytes(indexPage, pageIndex * 4);
+    if (!ptr.isValid()) return;
+    this.writePage(ptr.blockId, this.userFile.toDataPage(pageIndex));
+  }
 
-      // Read existing index page to get data block pointers
-      const existingIndex = this.readPage(mb.userFilePointer.blockId);
-
-      // Write data pages to the locations pointed to by existing index pointers
-      for (let i = 0; i < MAX_USER_FILE_POINTERS; i++) {
-        const ptr = BlockPointer.fromBytes(existingIndex, i * 4);
-        if (ptr.isValid() && i < dataPages.length) {
-          this.writePage(ptr.blockId, dataPages[i]);
-        }
-      }
+  /** Resolve the on-disk data block backing ObjectFile page `pageIndex`. */
+  private objectPageBlock(pageIndex: number): number | null {
+    const mb = this.masterBlock;
+    if (!mb.objectFilePointer || !mb.objectFilePointer.isValid()) return null;
+    if (mb.objectFilePointer.type === PointerType.Indexed) {
+      if (pageIndex >= MAX_OBJECT_FILE_POINTERS) return null;
+      const indexPage = this.readPage(mb.objectFilePointer.blockId);
+      const ptr = BlockPointer.fromBytes(indexPage, pageIndex * 4);
+      return ptr.isValid() ? ptr.blockId : null;
     }
-
-    // ObjectFile: write data pages
-    if (mb.objectFilePointer && mb.objectFilePointer.isValid()) {
-      const dataPageMap = this.objectFile.toDataPages();
-
-      if (mb.objectFilePointer.type === PointerType.Indexed) {
-        const indexPage = this.readPage(mb.objectFilePointer.blockId);
-        // Write all valid data pages, zeroing pages that no longer have entries
-        for (let pi = 0; pi < MAX_OBJECT_FILE_POINTERS; pi++) {
-          const ptr = BlockPointer.fromBytes(indexPage, pi * 4);
-          if (!ptr.isValid()) continue;
-          const pageData = dataPageMap.get(pi);
-          if (pageData) {
-            this.writePage(ptr.blockId, pageData);
-          } else {
-            // Zero out the data page (all entries deleted)
-            this.writePage(ptr.blockId, new Uint8Array(NDFS_PAGE_SIZE));
-          }
-        }
-      } else if (mb.objectFilePointer.type === PointerType.SubIndexed) {
-        const subIndexPage = this.readPage(mb.objectFilePointer.blockId);
-        // Walk ALL linked pages (not just those still holding entries) so a
-        // page emptied by deletion is zeroed — otherwise its stale in-use bit
-        // survives and the file reappears on reload.
-        for (let si = 0; si < MAX_OBJECT_FILE_POINTERS; si++) {
-          const subPtr = BlockPointer.fromBytes(subIndexPage, si * 4);
-          if (!subPtr.isValid()) continue;
-          const innerIndexPage = this.readPage(subPtr.blockId);
-          for (let ii = 0; ii < MAX_OBJECT_FILE_POINTERS; ii++) {
-            const dataPtr = BlockPointer.fromBytes(innerIndexPage, ii * 4);
-            if (!dataPtr.isValid()) continue;
-            const pageIndex = si * MAX_OBJECT_FILE_POINTERS + ii;
-            const pageData = dataPageMap.get(pageIndex);
-            this.writePage(
-              dataPtr.blockId,
-              pageData ? pageData : new Uint8Array(NDFS_PAGE_SIZE),
-            );
-          }
-        }
-      }
+    if (mb.objectFilePointer.type === PointerType.SubIndexed) {
+      const subIdx = Math.floor(pageIndex / MAX_OBJECT_FILE_POINTERS);
+      const innerIdx = pageIndex % MAX_OBJECT_FILE_POINTERS;
+      const subIndexPage = this.readPage(mb.objectFilePointer.blockId);
+      const subPtr = BlockPointer.fromBytes(subIndexPage, subIdx * 4);
+      if (!subPtr.isValid()) return null;
+      const innerIndexPage = this.readPage(subPtr.blockId);
+      const dataPtr = BlockPointer.fromBytes(innerIndexPage, innerIdx * 4);
+      return dataPtr.isValid() ? dataPtr.blockId : null;
     }
+    return null;
+  }
+
+  /**
+   * Write only the ObjectFile data page holding `objectIndex`.
+   * Rebuilt zero-filled, which clears any slot freed by a delete.
+   */
+  private writeObjectPage(objectIndex: number): void {
+    const pageIndex = Math.floor(objectIndex / ENTRIES_PER_PAGE);
+    const dataBlock = this.objectPageBlock(pageIndex);
+    if (dataBlock === null) return;
+    this.writePage(dataBlock, this.objectFile.toDataPage(pageIndex));
   }
 
   private findObject(path: string): ObjectEntry | null {

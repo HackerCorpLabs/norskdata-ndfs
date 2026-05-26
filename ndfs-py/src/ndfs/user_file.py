@@ -165,3 +165,16 @@ class UserFile:
                 data_pages.append(bytearray(NDFS_PAGE_SIZE))
 
         return index_page, data_pages
+
+    def to_data_page(self, page_index: int) -> bytearray:
+        """Serialize the single user-file data page `page_index`, zero-filled.
+
+        Zero-fill clears the slot of any removed user.
+        """
+        page = bytearray(NDFS_PAGE_SIZE)
+        for user in self._entries.values():
+            if user.user_index // ENTRIES_PER_PAGE == page_index:
+                slot_in_page = user.user_index % ENTRIES_PER_PAGE
+                offset = slot_in_page * ENTRY_SIZE
+                page[offset:offset + ENTRY_SIZE] = user.to_bytes()
+        return page

@@ -189,3 +189,16 @@ class ObjectFile:
             entry.to_bytes(page, slot_in_page * ENTRY_SIZE)
 
         return page_map
+
+    def to_data_page(self, page_index: int) -> bytearray:
+        """Serialize the single object-file data page `page_index`, zero-filled.
+
+        Zero-fill clears any slot freed by a deletion so a removed file does
+        not reappear when the image is reloaded.
+        """
+        page = bytearray(NDFS_PAGE_SIZE)
+        for entry in self._entries.values():
+            if entry.object_index // ENTRIES_PER_PAGE == page_index:
+                slot_in_page = entry.object_index % ENTRIES_PER_PAGE
+                entry.to_bytes(page, slot_in_page * ENTRY_SIZE)
+        return page

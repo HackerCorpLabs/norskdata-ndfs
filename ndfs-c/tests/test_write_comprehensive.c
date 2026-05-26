@@ -560,9 +560,48 @@ static int test_write_delete_cycle(void)
     return 0;
 }
 
+/* Bug 1+2 regression: an unrelated mutation must not corrupt other files'
+ * metadata. A file with an empty type must keep it after an unrelated
+ * add-user. The original port re-serialized EVERY object entry on every
+ * mutation (persist_all) and defaulted empty types to "DATA" on read —
+ * adding a user thus corrupted unrelated files. Writes are now surgical
+ * (only the touched page) and empty types are preserved on round-trip. */
+static int test_surgical_write_preserves_empty_type(void)
+{
+    ndfs_filesystem_t *fs = create_writable(NDFS_TMPL_FLOPPY_360KB, "SURGERY");
+    uint8_t *exported = NULL;
+    size_t exported_size = 0;
+    ndfs_filesystem_t *fs2 = NULL;
+    ndfs_file_entry_t meta;
+
+    TEST_ASSERT_NOT_NULL(fs);
+
+    /* Create a file with an EMPTY type (path carries no :TYPE suffix). */
+    TEST_ASSERT_OK(ndfs_write_file(fs, "SYSTEM/NOTYPE",
+                                   (const uint8_t *)"x", 1));
+    TEST_ASSERT_OK(ndfs_get_metadata(fs, "SYSTEM/NOTYPE", &meta));
+    TEST_ASSERT_EQUAL_STRING("", meta.type);
+
+    /* Unrelated mutation: add a brand-new user. Must not touch the SYSTEM
+     * object page that holds NOTYPE. */
+    TEST_ASSERT_OK(ndfs_add_user(fs, "BACKUP", 50));
+
+    /* Export + reload: the empty type must survive, not become "DATA". */
+    TEST_ASSERT_OK(ndfs_to_buffer(fs, &exported, &exported_size));
+    TEST_ASSERT_OK(ndfs_open_buffer_copy(exported, exported_size, true, &fs2));
+    TEST_ASSERT_OK(ndfs_get_metadata(fs2, "SYSTEM/NOTYPE", &meta));
+    TEST_ASSERT_EQUAL_STRING("", meta.type);
+
+    ndfs_free_data(exported);
+    ndfs_close(fs2);
+    ndfs_close(fs);
+    return 0;
+}
+
 void run_write_comprehensive_tests(void)
 {
     TEST_SUITE_BEGIN("Write Comprehensive Tests");
+    RUN_TEST(test_surgical_write_preserves_empty_type);
     RUN_TEST(test_write_small_file);
     RUN_TEST(test_write_multi_page_file);
     RUN_TEST(test_overwrite_file);

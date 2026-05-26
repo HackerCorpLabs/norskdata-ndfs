@@ -204,4 +204,20 @@ export class ObjectFile {
 
     return pageMap;
   }
+
+  /**
+   * Serialize the single object-file data page `pageIndex`, zero-filled.
+   * Zero-fill clears any slot freed by a deletion so a removed file does not
+   * reappear when the image is reloaded.
+   */
+  toDataPage(pageIndex: number): Uint8Array {
+    const page = new Uint8Array(NDFS_PAGE_SIZE);
+    this.entries.forEach((entry) => {
+      if (Math.floor(entry.objectIndex / ENTRIES_PER_PAGE) === pageIndex) {
+        const slotInPage = entry.objectIndex % ENTRIES_PER_PAGE;
+        entry.toBytes(page, slotInPage * ENTRY_SIZE);
+      }
+    });
+    return page;
+  }
 }

@@ -185,3 +185,23 @@ def test_delete_sole_file_on_page_clears_it():
     fs2 = NdfsFileSystem(fs.to_buffer())
     assert fs2.file_exists("SYSTEM/ONLY:DATA") is False
     assert len(fs2.get_object_entries()) == 0
+
+
+def test_surgical_write_preserves_empty_type():
+    """Bug 1+2 regression: an unrelated mutation must not corrupt other files'
+    metadata. A file with an empty type must keep it after an unrelated
+    add-user. The original port re-serialized EVERY object entry on every
+    mutation and defaulted empty types to "DATA" on read, so adding a user
+    corrupted unrelated files. Writes are now surgical and empty types are
+    preserved."""
+    fs = _make_fs()
+    # File with an EMPTY type (path carries no :TYPE suffix).
+    fs.write_file("SYSTEM/NOTYPE", b"x")
+    assert fs.get_metadata("SYSTEM/NOTYPE").type == ""
+
+    # Unrelated mutation: add a brand-new user.
+    fs.add_user("BACKUP", 50)
+
+    # Export + reload: the empty type must survive, not become "DATA".
+    fs2 = NdfsFileSystem(fs.to_buffer())
+    assert fs2.get_metadata("SYSTEM/NOTYPE").type == ""

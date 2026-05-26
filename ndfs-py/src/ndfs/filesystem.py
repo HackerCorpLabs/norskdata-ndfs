@@ -255,8 +255,8 @@ class NdfsFileSystem:
             self._update_existing_file(existing, user, file_data)
         else:
             self._create_new_file(object_name, file_type, user, file_data)
-
-        self._persist_all()
+        # _update_existing_file / _create_new_file perform their own surgical
+        # metadata writes (object page, owner user page, bitmap).
 
     def delete_file(self, path: str) -> None:
         """Delete a file."""
@@ -284,8 +284,15 @@ class NdfsFileSystem:
                 total_blocks += 1  # index block
             user.pages_used = user.pages_used - total_blocks if user.pages_used >= total_blocks else 0
 
+        # Surgical writes: capture index/owner before removal, then rewrite the
+        # freed object's page (zero-fill clears the slot), the owner's user
+        # page, and the allocation bitmap.
+        freed_index = obj.object_index
+        owner = obj.user_index
         self._object_file.remove_object(obj.object_index)
-        self._persist_all()
+        self._write_object_page(freed_index)
+        self._write_user_page(owner)
+        self._write_bit_file()
 
     def rename(self, old_path: str, new_path: str) -> None:
         """Rename a file."""
@@ -301,7 +308,8 @@ class NdfsFileSystem:
 
         obj.object_name = object_name.upper()[:NDFS_NAME_MAX]
         obj.type = file_type.upper()[:NDFS_TYPE_MAX]
-        self._persist_all()
+        # Rename touches only this file's object entry.
+        self._write_object_page(obj.object_index)
 
     # -- User management ---------------------------------------------------
 
@@ -328,7 +336,8 @@ class NdfsFileSystem:
         user.user_index = idx
         user.pages_reserved = reserved_pages
         self._user_file.add_user(user)
-        self._persist_all()
+        # Add-user touches only the UserFile page holding this new user.
+        self._write_user_page(user.user_index)
         return True
 
     def remove_user(self, index: int) -> bool:
@@ -341,7 +350,8 @@ class NdfsFileSystem:
 
         ok = self._user_file.remove_user(index)
         if ok:
-            self._persist_all()
+            # Removed user's UserFile page (slot zeroed by rebuild).
+            self._write_user_page(index)
         return ok
 
     def update_user_quota(self, index: int, new_pages: int) -> bool:
@@ -349,7 +359,7 @@ class NdfsFileSystem:
         self._ensure_writable()
         ok = self._user_file.update_user_quota(index, new_pages)
         if ok:
-            self._persist_all()
+            self._write_user_page(index)
         return ok
 
     def clear_user_password(self, index_or_name: Union[int, str]) -> bool:
@@ -365,7 +375,7 @@ class NdfsFileSystem:
             return False
 
         user.password = 0
-        self._persist_all()
+        self._write_user_page(user.user_index)
         return True
 
     # -- Bitmap queries ----------------------------------------------------
@@ -523,7 +533,8 @@ class NdfsFileSystem:
                 obj.last_date_read = properties["ndfs.last_read_date"]
             if "ndfs.last_write_date" in properties and isinstance(properties["ndfs.last_write_date"], int):
                 obj.last_date_written = properties["ndfs.last_write_date"]
-            self._persist_all()
+            # Properties change only this file's object entry.
+            self._write_object_page(obj.object_index)
 
     # ==================================================================
     #  Private implementation
@@ -801,6 +812,11 @@ class NdfsFileSystem:
         # Update user pages used
         user.pages_used += data_pages + 1  # data pages + index block
 
+        # Surgical writes: new object's page, owner's user page, bitmap.
+        self._write_object_page(entry.object_index)
+        self._write_user_page(user.user_index)
+        self._write_bit_file()
+
     def _update_existing_file(
         self,
         existing: ObjectEntry,
@@ -865,6 +881,11 @@ class NdfsFileSystem:
         # Update user pages used
         user.pages_used += data_pages + 1
 
+        # Surgical writes: the file's object page, owner's user page, bitmap.
+        self._write_object_page(existing.object_index)
+        self._write_user_page(user.user_index)
+        self._write_bit_file()
+
     def _free_file_blocks(self, obj: ObjectEntry) -> None:
         """Free all blocks associated with a file."""
         if obj.file_pointer is None or obj.file_pointer.block_id == 0:
@@ -894,62 +915,68 @@ class NdfsFileSystem:
                 self._bit_file.mark_block_free(index_ptr.block_id)
             self._bit_file.mark_block_free(obj.file_pointer.block_id)
 
-    def _persist_all(self) -> None:
-        """Persist all three structures to the image buffer.
+    # NDFS writes are immediate and surgical (matching RetroCommander/RetroCore):
+    # a mutation rewrites ONLY the block(s) it touched, never the whole
+    # filesystem. Each helper rebuilds a single 2048-byte page from the
+    # in-memory model; rebuilding zero-filled also clears freed slots so a
+    # deleted file/user does not reappear on reload.
 
-        Order: BitFile -> UserFile -> ObjectFile (matching C# reference).
-        """
+    def _write_bit_file(self) -> None:
+        """Write the BitFile allocation bitmap (small, contiguous)."""
         mb = self._master_block
+        if mb.bit_file_pointer is None or not mb.bit_file_pointer.is_valid():
+            return
+        pages = self._bit_file.to_page_buffers()
+        for i in range(len(pages)):
+            self._write_page(mb.bit_file_pointer.block_id + i, pages[i])
 
-        # BitFile: write contiguous pages
-        if mb.bit_file_pointer is not None and mb.bit_file_pointer.is_valid():
-            pages = self._bit_file.to_page_buffers()
-            for i in range(len(pages)):
-                self._write_page(mb.bit_file_pointer.block_id + i, pages[i])
+    def _write_user_page(self, user_index: int) -> None:
+        """Write only the UserFile data page holding `user_index`."""
+        mb = self._master_block
+        if mb.user_file_pointer is None or not mb.user_file_pointer.is_valid():
+            return
+        page_index = user_index // ENTRIES_PER_PAGE
+        if page_index >= MAX_USER_FILE_POINTERS:
+            return
+        index_page = self._read_page(mb.user_file_pointer.block_id)
+        ptr = BlockPointer.from_bytes(index_page, page_index * 4)
+        if not ptr.is_valid():
+            return
+        self._write_page(ptr.block_id, self._user_file.to_data_page(page_index))
 
-        # UserFile: write index + data pages
-        if mb.user_file_pointer is not None and mb.user_file_pointer.is_valid():
-            _, data_pages = self._user_file.to_page_buffers()
+    def _object_page_block(self, page_index: int) -> Optional[int]:
+        """Resolve the on-disk data block backing ObjectFile page `page_index`."""
+        mb = self._master_block
+        if mb.object_file_pointer is None or not mb.object_file_pointer.is_valid():
+            return None
+        if mb.object_file_pointer.type == PointerType.Indexed:
+            if page_index >= MAX_OBJECT_FILE_POINTERS:
+                return None
+            index_page = self._read_page(mb.object_file_pointer.block_id)
+            ptr = BlockPointer.from_bytes(index_page, page_index * 4)
+            return ptr.block_id if ptr.is_valid() else None
+        if mb.object_file_pointer.type == PointerType.SubIndexed:
+            sub_idx = page_index // MAX_OBJECT_FILE_POINTERS
+            inner_idx = page_index % MAX_OBJECT_FILE_POINTERS
+            sub_index_page = self._read_page(mb.object_file_pointer.block_id)
+            sub_ptr = BlockPointer.from_bytes(sub_index_page, sub_idx * 4)
+            if not sub_ptr.is_valid():
+                return None
+            inner_index_page = self._read_page(sub_ptr.block_id)
+            data_ptr = BlockPointer.from_bytes(inner_index_page, inner_idx * 4)
+            return data_ptr.block_id if data_ptr.is_valid() else None
+        return None
 
-            # Read existing index page to get data block pointers
-            existing_index = self._read_page(mb.user_file_pointer.block_id)
+    def _write_object_page(self, object_index: int) -> None:
+        """Write only the ObjectFile data page holding `object_index`.
 
-            # Write data pages to the locations pointed to by existing index pointers
-            for i in range(MAX_USER_FILE_POINTERS):
-                ptr = BlockPointer.from_bytes(existing_index, i * 4)
-                if ptr.is_valid() and i < len(data_pages):
-                    self._write_page(ptr.block_id, data_pages[i])
-
-        # ObjectFile: write data pages
-        if mb.object_file_pointer is not None and mb.object_file_pointer.is_valid():
-            data_page_map = self._object_file.to_data_pages()
-
-            empty = bytearray(NDFS_PAGE_SIZE)
-            if mb.object_file_pointer.type == PointerType.Indexed:
-                index_page = self._read_page(mb.object_file_pointer.block_id)
-                # Iterate ALL linked pages, not just those still holding entries:
-                # a page emptied by deletion must be zeroed, else the stale
-                # entry's in-use bit survives and the file reappears on reload.
-                for page_index in range(MAX_OBJECT_FILE_POINTERS):
-                    ptr = BlockPointer.from_bytes(index_page, page_index * 4)
-                    if not ptr.is_valid():
-                        continue
-                    page_data = data_page_map.get(page_index)
-                    self._write_page(ptr.block_id, page_data if page_data is not None else empty)
-            elif mb.object_file_pointer.type == PointerType.SubIndexed:
-                sub_index_page = self._read_page(mb.object_file_pointer.block_id)
-                for si in range(MAX_OBJECT_FILE_POINTERS):
-                    sub_ptr = BlockPointer.from_bytes(sub_index_page, si * 4)
-                    if not sub_ptr.is_valid():
-                        continue
-                    inner_index_page = self._read_page(sub_ptr.block_id)
-                    for ii in range(MAX_OBJECT_FILE_POINTERS):
-                        data_ptr = BlockPointer.from_bytes(inner_index_page, ii * 4)
-                        if not data_ptr.is_valid():
-                            continue
-                        page_index = si * MAX_OBJECT_FILE_POINTERS + ii
-                        page_data = data_page_map.get(page_index)
-                        self._write_page(data_ptr.block_id, page_data if page_data is not None else empty)
+        Rebuilt zero-filled, which clears any slot freed by a delete.
+        """
+        page_index = object_index // ENTRIES_PER_PAGE
+        data_block = self._object_page_block(page_index)
+        if data_block is None:
+            return
+        self._write_page(data_block, self._object_file.to_data_page(page_index))
 
     def _find_object(self, path: str) -> Optional[ObjectEntry]:
         """Find an object entry by path."""
