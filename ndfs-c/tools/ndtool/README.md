@@ -50,6 +50,21 @@ OVERWRITE POLICY (import and extract):
   --interactive    Prompt before each overwrite (skips when no TTY)
   -n               Dry run: preview create / overwrite / skip per file
 
+FILE DETAILS:
+  ndtool --stat SYSTEM/LOAD:MODE <image>     Full metadata (RetroCommander-style)
+  ndtool --stat -v SYSTEM/LOAD:MODE <image>  ...also lists the file's data blocks
+  (shows access tiers, dates, versioning, device, open counts, file pointer)
+
+PERMISSIONS:
+  ndtool --chmod 'OWN+WD,PUBLIC-A' SYSTEM/LOAD:MODE <image>
+  ndtool --chmod 'OWN=RWACD,FRIEND=RW' SYSTEM/X:MODE <image>
+  ndtool --chmod 0x03FF SYSTEM/X:MODE <image>   (raw 15-bit access word)
+  ndtool --chmod 'PUBLIC+R' SYSTEM/X:MODE -n <image>   (preview before -> after)
+    TIER  = OWN | FRIEND | PUBLIC | ALL (or O | F | P)
+    OP    = '=' set   '+' add   '-' remove
+    RIGHT = R read  W write  A append  C common  D directory
+  New files default to OWN+FRIEND all rights, PUBLIC none (0x03FF).
+
 DELETE:
   ndtool --rm SYSTEM/OLD-FILE:DATA <image>
 
