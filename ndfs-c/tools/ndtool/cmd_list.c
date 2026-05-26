@@ -52,6 +52,7 @@ static void list_user_files(const char *user_name, const char *file_pat,
     size_t i;
     char full[NDFS_NAME_MAX + NDFS_TYPE_MAX + 2];
     char named[40];
+    char datebuf[24];
 
     for (i = 0; i < n; i++) {
         const ndfs_object_entry_t *e = &objs[i];
@@ -61,8 +62,11 @@ static void list_user_files(const char *user_name, const char *file_pat,
 
         /* "NAME:TYPE;V" joined tightly, like SINTRAN's investigator. */
         snprintf(named, sizeof(named), "%s;%u", full, file_version(objs, n, e));
-        printf("  %04o  %-28s %9u bytes  %5u pages\n",
-               e->disk_object_index, named, e->bytes_in_file, e->pages_in_file);
+        ndtool_format_nd_date(e->date_created, datebuf, sizeof(datebuf));
+        printf("  [%04o]  %s  (%s)%-28s %10u bytes  %5u pages\n",
+               e->disk_object_index, datebuf,
+               e->user_name, named,
+               e->bytes_in_file, e->pages_in_file);
     }
 }
 
@@ -150,11 +154,16 @@ int cmd_users(ndtool_ctx_t *ctx)
     printf("Users: %zu\n", count);
     for (i = 0; i < count; i++) {
         int32_t free_pages = ndfs_ue_free_pages(&users[i]);
+        ndfs_file_entry_t *files = NULL;
+        size_t file_count = 0;
+        ndfs_list_directory(ctx->fs, users[i].user_name, &files, &file_count);
+        ndfs_free_entries(files);
         /* User index shown in 3-digit octal, matching SINTRAN's
          * file-system-investigator (LIST-USERS) e.g. "011 BUILD". */
-        printf("  %03o  %-16s  Reserved: %5u  Used: %5u  Free: %5d\n",
+        printf("  [%03o]  %-16s  %3zu files  Reserved: %5u  Used: %5u  Free: %5d\n",
                users[i].user_index,
                users[i].user_name,
+               file_count,
                users[i].pages_reserved,
                users[i].pages_used,
                free_pages);
