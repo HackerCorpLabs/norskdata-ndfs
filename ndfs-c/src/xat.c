@@ -88,14 +88,11 @@ ndfs_error_t ndfs_xat_from_object(const ndfs_object_entry_t *entry,
 
     memset(out, 0, sizeof(*out));
 
-    strncpy(out->object_name, entry->object_name, NDFS_NAME_MAX);
-    out->object_name[NDFS_NAME_MAX] = '\0';
-
-    strncpy(out->type, entry->type, NDFS_TYPE_MAX);
-    out->type[NDFS_TYPE_MAX] = '\0';
-
-    strncpy(out->user_name, entry->user_name, NDFS_NAME_MAX);
-    out->user_name[NDFS_NAME_MAX] = '\0';
+    /* snprintf guarantees null-termination and avoids the strncpy truncation
+     * warning when the source is exactly the field width. */
+    snprintf(out->object_name, sizeof(out->object_name), "%s", entry->object_name);
+    snprintf(out->type, sizeof(out->type), "%s", entry->type);
+    snprintf(out->user_name, sizeof(out->user_name), "%s", entry->user_name);
 
     out->user_index = entry->user_index;
     out->access_bits = entry->access_bits;

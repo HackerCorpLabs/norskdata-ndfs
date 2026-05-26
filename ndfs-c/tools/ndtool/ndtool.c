@@ -339,7 +339,7 @@ static void print_usage(const char *prog)
 
 static void print_version(void)
 {
-    printf("ndtool %s\n", NDTOOL_VERSION);
+    printf("ndtool %s (built %s %s)\n", NDTOOL_VERSION, __DATE__, __TIME__);
 }
 
 /* ── Helper: convert NDFS name to host filename ───────────────────── */
