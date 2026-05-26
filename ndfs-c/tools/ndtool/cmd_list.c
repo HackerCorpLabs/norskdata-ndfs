@@ -9,41 +9,61 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* ── Version chain ────────────────────────────────────────────────── */
+
+/* Compute the SINTRAN-style version ordinal (the ";N" suffix). A single-
+ * version file points its next/prev version at itself -> version 1. For a
+ * chained file we count predecessors via prev_version. Best-effort for the
+ * rare multi-version case; exact (=1) for the universal single-version case. */
+static unsigned file_version(const ndfs_object_entry_t *objs, size_t n,
+                             const ndfs_object_entry_t *e)
+{
+    unsigned v = 1;
+    uint16_t cur;
+    size_t guard;
+
+    if (e->next_version == e->disk_object_index &&
+        e->prev_version == e->disk_object_index) {
+        return 1;
+    }
+    cur = e->prev_version;
+    for (guard = 0; guard < n; guard++) {
+        const ndfs_object_entry_t *p = NULL;
+        size_t k;
+        if (cur == e->disk_object_index) break;
+        for (k = 0; k < n; k++) {
+            if (objs[k].disk_object_index == cur) { p = &objs[k]; break; }
+        }
+        if (!p) break;
+        v++;
+        if (p->prev_version == cur) break;
+        cur = p->prev_version;
+    }
+    return v;
+}
+
 /* ── List files for one user ──────────────────────────────────────── */
 
-static int list_user_files(ndtool_ctx_t *ctx, const char *user_name,
-                           const char *file_pat)
+/* List a user's files from the object-entry table, in object-id order, with
+ * the SINTRAN-style "NNNN NAME:TYPE;V" layout (object id in 4-digit octal). */
+static void list_user_files(const char *user_name, const char *file_pat,
+                            const ndfs_object_entry_t *objs, size_t n)
 {
-    ndfs_file_entry_t *entries = NULL;
-    size_t count = 0;
     size_t i;
-    ndfs_error_t err;
+    char full[NDFS_NAME_MAX + NDFS_TYPE_MAX + 2];
+    char named[40];
 
-    err = ndfs_list_directory(ctx->fs, user_name, &entries, &count);
-    if (err != NDFS_OK) {
-        fprintf(stderr, "Error listing '%s': %s\n", user_name, ndfs_strerror(err));
-        return -1;
+    for (i = 0; i < n; i++) {
+        const ndfs_object_entry_t *e = &objs[i];
+        if (strcmp(e->user_name, user_name) != 0) continue;
+        ndfs_oe_full_name(e, full, sizeof(full));
+        if (file_pat && !ndfs_wildmatch(file_pat, full, true)) continue;
+
+        /* "NAME:TYPE;V" joined tightly, like SINTRAN's investigator. */
+        snprintf(named, sizeof(named), "%s;%u", full, file_version(objs, n, e));
+        printf("  %04o  %-28s %9u bytes  %5u pages\n",
+               e->disk_object_index, named, e->bytes_in_file, e->pages_in_file);
     }
-
-    for (i = 0; i < count; i++) {
-        if (file_pat && !ndfs_wildmatch(file_pat, entries[i].full_name, true)) {
-            continue;
-        }
-        if (ctx->verbose) {
-            printf("  %-24s %8u bytes  %4u pages\n",
-                   entries[i].full_name,
-                   entries[i].size,
-                   entries[i].pages);
-        } else {
-            printf("  %-24s %8u bytes  %4u pages\n",
-                   entries[i].full_name,
-                   entries[i].size,
-                   entries[i].pages);
-        }
-    }
-
-    ndfs_free_entries(entries);
-    return 0;
 }
 
 /* ── Volume header ────────────────────────────────────────────────── */
@@ -68,6 +88,8 @@ int cmd_list(ndtool_ctx_t *ctx)
     const char *file_pat = ctx->filter_file;
     ndfs_file_entry_t *users = NULL;
     size_t user_count = 0;
+    ndfs_object_entry_t *objs = NULL;
+    size_t obj_count = 0;
     size_t i;
     ndfs_error_t err;
 
@@ -94,13 +116,18 @@ int cmd_list(ndtool_ctx_t *ctx)
         return -1;
     }
 
+    /* All object entries up front, so per-file object id + version are shown
+     * without re-reading the object file for each user. */
+    ndfs_get_object_entries(ctx->fs, &objs, &obj_count);
+
     for (i = 0; i < user_count; i++) {
         if (!users[i].is_directory) continue;
         if (user_pat && !ndfs_wildmatch(user_pat, users[i].name, true)) continue;
         printf("USER: %s\n", users[i].name);
-        list_user_files(ctx, users[i].name, file_pat);
+        list_user_files(users[i].name, file_pat, objs, obj_count);
     }
 
+    ndfs_free_object_entries(objs);
     ndfs_free_entries(users);
     return 0;
 }
