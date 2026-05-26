@@ -54,6 +54,9 @@ int ndtool_write_local_file(const char *path, const uint8_t *data, size_t size);
 /* Helper: save modified image back to disk */
 int ndtool_save_image(ndtool_ctx_t *ctx);
 
+/* Print "ndtool <version> (built <date> <time>)". */
+void ndtool_print_version(void);
+
 /* Helper: true if the string contains a '*' or '?' wildcard. */
 bool ndtool_has_wildcard(const char *s);
 

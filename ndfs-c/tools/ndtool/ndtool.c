@@ -31,7 +31,6 @@
 /* ── Forward declarations ─────────────────────────────────────────── */
 
 static void print_usage(const char *prog);
-static void print_version(void);
 
 /* ── Long options ─────────────────────────────────────────────────── */
 
@@ -58,6 +57,8 @@ static struct option long_options[] = {
     {"chmod",     required_argument, 0, 1012},
     {"pages",     required_argument, 0, 1001},
     {"name",      required_argument, 0, 1002},
+    {"version",   no_argument,       0, 'V'},
+    {"ver",       no_argument,       0, 'V'},
     {0, 0, 0, 0}
 };
 
@@ -122,7 +123,7 @@ int main(int argc, char **argv)
         case 'n': ctx.dry_run = true; break;
         case 'o': ctx.output_dir = optarg; break;
         case 'h': print_usage(argv[0]); return 0;
-        case 'V': print_version(); return 0;
+        case 'V': ndtool_print_version(); return 0;
 
         case 'P': put_local = optarg; needs_write = 1; break;
         case 'R': rm_path = optarg; needs_write = 1; break;
@@ -335,7 +336,7 @@ static void print_usage(const char *prog)
     printf("  --xat           Write/read .xat sidecar files for metadata preservation\n");
     printf("  --editor CMD    Editor for 'edit' command (default: $EDITOR or code --wait)\n");
     printf("  -h              Show this help\n");
-    printf("  -V              Show version\n");
+    printf("  -V, --version, --ver  Show version and build date/time\n");
     printf("\nAccess permissions (--chmod / shell 'chmod'):\n");
     printf("  SPEC is comma-separated clauses: TIER OP RIGHTS\n");
     printf("    TIER   OWN | FRIEND | PUBLIC | ALL   (or O | F | P)\n");
@@ -366,7 +367,7 @@ static void print_usage(const char *prog)
     printf("  %s --shell disk.ndfs\n", prog);
 }
 
-static void print_version(void)
+void ndtool_print_version(void)
 {
     printf("ndtool %s (built %s %s)\n", NDTOOL_VERSION, __DATE__, __TIME__);
 }

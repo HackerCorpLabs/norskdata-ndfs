@@ -55,6 +55,7 @@ static void shell_help(void)
     printf("  friendadd OWNER FRIEND [R]   Add friend (R = rights, default RWA)\n");
     printf("  frienddel OWNER FRIEND       Remove a friend\n");
     printf("  save [HOSTFILE]              Save changes to disk (optional save-as)\n");
+    printf("  version / ver                Show tool version and build date/time\n");
     printf("  help                         Show this help\n");
     printf("  quit / exit                  Exit shell\n");
 }
@@ -458,6 +459,7 @@ int cmd_shell(ndtool_ctx_t *ctx)
 {
     char line[1024];
     printf("ndtool shell - type 'help' for commands\n");
+    ndtool_print_version();
 
     while (1) {
         printf("ndtool> ");
@@ -494,6 +496,9 @@ int cmd_shell(ndtool_ctx_t *ctx)
             }
             else if (strcmp(cmd, "help") == 0) {
                 shell_help();
+            }
+            else if (strcmp(cmd, "version") == 0 || strcmp(cmd, "ver") == 0) {
+                ndtool_print_version();
             }
             else if (strcmp(cmd, "ls") == 0) {
                 shell_ls(ctx, arg1);
