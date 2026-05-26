@@ -234,7 +234,12 @@ For each divergence the matrix surfaces:
 - ✅ `--dest` ignored with a bare name — fixed (C).
 - ☐ RFS `UserEntry`/`UserFile` offset audit — not yet checked.
 - ☐ TS/PY new-file flags for contiguous vs indexed — confirm matches RC.
-- ☐ Multi-version create/read — not yet implemented/validated in any port.
+- ☐ Multi-version create/read — **VERY LOW PRIORITY**. The `;N` version ordinal
+  is exact for single-version files (self-referential chain → `;1`, the
+  universal real-world case); the chained-version ordinal in `ndtool -t` is
+  best-effort and unvalidated. Needs a disk with genuine multiple versions of a
+  file to validate/fix, and creating extra versions isn't implemented in any
+  port. Defer unless a real multi-version use case appears.
 - ☐ **Object-file slot allocation on create** — when the next free object slot
   falls in an object-file page that is not yet allocated/linked in the index
   block, `persist` silently skips writing the entry (the file would vanish on
