@@ -102,6 +102,14 @@ static inline void ndfs_uf_clear(ndfs_user_friend_t *uf)
  */
 void ndfs_uf_permission_string(const ndfs_user_friend_t *uf, char *buf);
 
+/**
+ * Parse a permission letters string (any case) into the 5-bit permission
+ * value used by ndfs_uf_set_friend: R=read, W=write, A=append, C=common,
+ * D=directory. '-' is ignored. Returns NDFS_OK, or NDFS_ERR_INVALID_ARG on
+ * an unrecognised letter. A NULL or empty string yields 0 permissions.
+ */
+ndfs_error_t ndfs_uf_parse_permissions(const char *s, uint8_t *out_permissions);
+
 #ifdef __cplusplus
 }
 #endif

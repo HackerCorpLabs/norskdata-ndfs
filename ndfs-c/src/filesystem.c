@@ -1593,6 +1593,173 @@ ndfs_error_t ndfs_clear_user_password_by_index(ndfs_filesystem_t *fs,
     return write_user_page(fs, index);
 }
 
+/* ── Friends ─────────────────────────────────────────────────────── */
+
+/* Resolve a user reference (name or decimal index 0-255) to the in-memory
+ * slot (== user index). A purely-numeric reference is treated as an index.
+ * Returns the slot, or -1 if no such valid user. */
+static int resolve_user_ref(const struct ndfs_filesystem *fs, const char *ref)
+{
+    const char *p = ref;
+    bool numeric;
+
+    if (!ref || !ref[0]) return -1;
+
+    numeric = true;
+    for (p = ref; *p; p++) {
+        if (*p < '0' || *p > '9') { numeric = false; break; }
+    }
+    if (numeric) {
+        long v = atol(ref);
+        if (v >= 0 && v <= 255) {
+            int slot = find_user_by_index(fs, (uint8_t)v);
+            if (slot >= 0) return slot;
+        }
+        return -1;
+    }
+    return find_user_by_name(fs, ref);
+}
+
+/* Resolve a friend reference to a user index. A numeric reference is taken
+ * as a literal index (the friend need not be a named user); a name must
+ * resolve to an existing user. Returns NDFS_OK + *out_index, else an error. */
+static ndfs_error_t resolve_friend_index(const struct ndfs_filesystem *fs,
+                                         const char *ref, uint8_t *out_index)
+{
+    const char *p;
+    bool numeric;
+
+    if (!ref || !ref[0]) return NDFS_ERR_INVALID_ARG;
+
+    numeric = true;
+    for (p = ref; *p; p++) {
+        if (*p < '0' || *p > '9') { numeric = false; break; }
+    }
+    if (numeric) {
+        long v = atol(ref);
+        if (v < 0 || v > 255) return NDFS_ERR_INVALID_ARG;
+        *out_index = (uint8_t)v;
+        return NDFS_OK;
+    } else {
+        int slot = find_user_by_name(fs, ref);
+        if (slot < 0) return NDFS_ERR_NOT_FOUND;
+        *out_index = fs->users[slot].user_index;
+        return NDFS_OK;
+    }
+}
+
+ndfs_error_t ndfs_list_friends(const ndfs_filesystem_t *fs, const char *user_ref,
+                               ndfs_friend_info_t **out_friends, size_t *out_count)
+{
+    int owner_slot;
+    const ndfs_user_entry_t *owner;
+    ndfs_friend_info_t *arr;
+    size_t n = 0, i;
+
+    if (!fs || !user_ref || !out_friends || !out_count) return NDFS_ERR_NULL_PTR;
+    *out_friends = NULL;
+    *out_count = 0;
+
+    owner_slot = resolve_user_ref(fs, user_ref);
+    if (owner_slot < 0) return NDFS_ERR_NOT_FOUND;
+    owner = &fs->users[owner_slot];
+
+    /* Count active friends first. */
+    for (i = 0; i < NDFS_MAX_FRIENDS; i++) {
+        if (ndfs_uf_is_active(&owner->friends[i])) n++;
+    }
+    if (n == 0) return NDFS_OK;
+
+    arr = (ndfs_friend_info_t *)calloc(n, sizeof(*arr));
+    if (!arr) return NDFS_ERR_ALLOC;
+
+    {
+        size_t k = 0;
+        for (i = 0; i < NDFS_MAX_FRIENDS; i++) {
+            const ndfs_user_friend_t *uf = &owner->friends[i];
+            uint8_t fidx;
+            int fslot;
+            if (!ndfs_uf_is_active(uf)) continue;
+            fidx = ndfs_uf_friend_index(uf);
+            arr[k].index = fidx;
+            arr[k].bits  = uf->bits;
+            ndfs_uf_permission_string(uf, arr[k].perms);
+            fslot = find_user_by_index(fs, fidx);
+            if (fslot >= 0) {
+                memcpy(arr[k].name, fs->users[fslot].user_name, NDFS_NAME_MAX + 1);
+            } else {
+                arr[k].name[0] = '\0';
+            }
+            k++;
+        }
+    }
+
+    *out_friends = arr;
+    *out_count = n;
+    return NDFS_OK;
+}
+
+void ndfs_free_friends(ndfs_friend_info_t *friends)
+{
+    free(friends);
+}
+
+ndfs_error_t ndfs_add_friend(ndfs_filesystem_t *fs, const char *user_ref,
+                             const char *friend_ref, const char *perms)
+{
+    int owner_slot;
+    uint8_t friend_index;
+    uint8_t perm_bits;
+    ndfs_error_t err;
+
+    if (!fs || !user_ref || !friend_ref) return NDFS_ERR_NULL_PTR;
+    if (fs->read_only) return NDFS_ERR_READ_ONLY;
+
+    owner_slot = resolve_user_ref(fs, user_ref);
+    if (owner_slot < 0) return NDFS_ERR_NOT_FOUND;
+
+    err = resolve_friend_index(fs, friend_ref, &friend_index);
+    if (err != NDFS_OK) return err;
+
+    /* Default permissions: RWA (read/write/append). */
+    if (!perms || !perms[0]) {
+        perm_bits = 0x07; /* R|W|A */
+    } else {
+        err = ndfs_uf_parse_permissions(perms, &perm_bits);
+        if (err != NDFS_OK) return err;
+    }
+
+    if (ndfs_ue_is_friend(&fs->users[owner_slot], friend_index))
+        return NDFS_ERR_ALREADY_EXISTS;
+
+    if (!ndfs_ue_add_friend(&fs->users[owner_slot], friend_index, perm_bits))
+        return NDFS_ERR_NO_SLOTS;
+
+    return write_user_page(fs, fs->users[owner_slot].user_index);
+}
+
+ndfs_error_t ndfs_remove_friend(ndfs_filesystem_t *fs, const char *user_ref,
+                                const char *friend_ref)
+{
+    int owner_slot;
+    uint8_t friend_index;
+    ndfs_error_t err;
+
+    if (!fs || !user_ref || !friend_ref) return NDFS_ERR_NULL_PTR;
+    if (fs->read_only) return NDFS_ERR_READ_ONLY;
+
+    owner_slot = resolve_user_ref(fs, user_ref);
+    if (owner_slot < 0) return NDFS_ERR_NOT_FOUND;
+
+    err = resolve_friend_index(fs, friend_ref, &friend_index);
+    if (err != NDFS_OK) return err;
+
+    if (!ndfs_ue_remove_friend(&fs->users[owner_slot], friend_index))
+        return NDFS_ERR_NOT_FOUND;
+
+    return write_user_page(fs, fs->users[owner_slot].user_index);
+}
+
 /* ── Read operations (extended) ──────────────────────────────────── */
 
 ndfs_error_t ndfs_get_file_blocks(const ndfs_filesystem_t *fs, const char *path,

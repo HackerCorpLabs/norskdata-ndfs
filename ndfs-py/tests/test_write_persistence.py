@@ -187,6 +187,38 @@ def test_delete_sole_file_on_page_clears_it():
     assert len(fs2.get_object_entries()) == 0
 
 
+def test_friends_add_list_remove():
+    """Friend add/list/remove + persistence + error cases."""
+    import pytest
+    fs = _make_fs()
+    fs.add_user("ALICE", 100)
+    fs.add_user("BOB", 100)
+
+    fs.add_friend("ALICE", "BOB", "RW")
+    fr = fs.list_friends("ALICE")
+    assert len(fr) == 1
+    assert fr[0].name == "BOB"
+    assert fr[0].perms == "RW---"
+
+    # Already a friend -> error.
+    with pytest.raises(ValueError):
+        fs.add_friend("ALICE", "BOB", "R")
+    # Unknown friend name -> error.
+    with pytest.raises(KeyError):
+        fs.add_friend("ALICE", "NOBODY", "R")
+
+    # Survives export + reload.
+    fs2 = NdfsFileSystem(fs.to_buffer())
+    fr2 = fs2.list_friends("ALICE")
+    assert len(fr2) == 1 and fr2[0].name == "BOB"
+
+    # Remove.
+    fs.remove_friend("ALICE", "BOB")
+    assert fs.list_friends("ALICE") == []
+    with pytest.raises(KeyError):
+        fs.remove_friend("ALICE", "BOB")
+
+
 def test_surgical_write_preserves_empty_type():
     """Bug 1+2 regression: an unrelated mutation must not corrupt other files'
     metadata. A file with an empty type must keep it after an unrelated

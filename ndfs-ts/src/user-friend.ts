@@ -74,6 +74,24 @@ export class UserFriend {
     this.bits = (friendUserId & 0xff) | (1 << 15) | ((permissions & 0x1f) << 8);
   }
 
+  /**
+   * Parse a permission letters string into the 5-bit value used by setFriend:
+   * R=read, W=write, A=append, C=common, D=directory. '-' and spaces are
+   * ignored; null/empty yields 0. Throws on an unrecognised letter.
+   */
+  static parsePermissions(s: string | null | undefined): number {
+    if (!s) return 0;
+    let bits = 0;
+    const table: Record<string, number> = { R: 0x01, W: 0x02, A: 0x04, C: 0x08, D: 0x10 };
+    for (const ch of s) {
+      if (ch === '-' || ch === ' ') continue;
+      const up = ch.toUpperCase();
+      if (!(up in table)) throw new Error(`Invalid permission letter: '${ch}'`);
+      bits |= table[up];
+    }
+    return bits;
+  }
+
   /** Clear this friend slot. */
   clear(): void {
     this.bits = 0;

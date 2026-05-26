@@ -121,6 +121,34 @@ describe('WritePersistence', () => {
     expect(fs2.fileExists('SYSTEM/B:TEXT')).toBe(true);
   });
 
+  it('friend add/list/remove + persistence + error cases', () => {
+    const fs = createFS();
+    fs.addUser('ALICE', 100);
+    fs.addUser('BOB', 100);
+
+    fs.addFriend('ALICE', 'BOB', 'RW');
+    const fr = fs.listFriends('ALICE');
+    expect(fr.length).toBe(1);
+    expect(fr[0].name).toBe('BOB');
+    expect(fr[0].perms).toBe('RW---');
+
+    // Already a friend -> throws.
+    expect(() => fs.addFriend('ALICE', 'BOB', 'R')).toThrow();
+    // Unknown friend name -> throws.
+    expect(() => fs.addFriend('ALICE', 'NOBODY', 'R')).toThrow();
+
+    // Survives export + reload.
+    const fs2 = new NdfsFileSystem(fs.toBuffer());
+    const fr2 = fs2.listFriends('ALICE');
+    expect(fr2.length).toBe(1);
+    expect(fr2[0].name).toBe('BOB');
+
+    // Remove.
+    fs.removeFriend('ALICE', 'BOB');
+    expect(fs.listFriends('ALICE').length).toBe(0);
+    expect(() => fs.removeFriend('ALICE', 'BOB')).toThrow();
+  });
+
   // Bug 1+2 regression: an unrelated mutation must not corrupt other files'
   // metadata. A file with an empty type must keep it after an unrelated
   // add-user. The original port re-serialized EVERY object entry on every

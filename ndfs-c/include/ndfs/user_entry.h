@@ -86,6 +86,24 @@ static inline int32_t ndfs_ue_free_pages(const ndfs_user_entry_t *e)
 /** Initialize a new empty user entry with defaults. */
 void ndfs_ue_init(ndfs_user_entry_t *entry);
 
+/** True if friend_index is an active friend of this user. */
+bool ndfs_ue_is_friend(const ndfs_user_entry_t *entry, uint8_t friend_index);
+
+/**
+ * Add a friend in the first free slot with the given 5-bit permissions
+ * (see ndfs_uf_set_friend). Returns false if all NDFS_MAX_FRIENDS slots are
+ * in use. Does not dedupe — callers should check ndfs_ue_is_friend first.
+ */
+bool ndfs_ue_add_friend(ndfs_user_entry_t *entry, uint8_t friend_index,
+                        uint8_t permissions);
+
+/** Remove a friend by index. Returns false if not present. */
+bool ndfs_ue_remove_friend(ndfs_user_entry_t *entry, uint8_t friend_index);
+
+/** Get a pointer to a friend's entry, or NULL if not present. */
+const ndfs_user_friend_t *ndfs_ue_get_friend(const ndfs_user_entry_t *entry,
+                                             uint8_t friend_index);
+
 #ifdef __cplusplus
 }
 #endif

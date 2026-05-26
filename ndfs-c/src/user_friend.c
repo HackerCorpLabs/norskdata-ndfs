@@ -60,3 +60,25 @@ void ndfs_uf_permission_string(const ndfs_user_friend_t *uf, char *buf)
     buf[4] = ndfs_uf_directory_access(uf) ? 'D' : '-';
     buf[5] = '\0';
 }
+
+ndfs_error_t ndfs_uf_parse_permissions(const char *s, uint8_t *out_permissions)
+{
+    uint8_t p = 0;
+    if (!out_permissions) return NDFS_ERR_NULL_PTR;
+    *out_permissions = 0;
+    if (!s) return NDFS_OK;
+
+    for (; *s; s++) {
+        switch (*s) {
+        case 'R': case 'r': p |= 0x01; break; /* -> bit 8 read      */
+        case 'W': case 'w': p |= 0x02; break; /* -> bit 9 write     */
+        case 'A': case 'a': p |= 0x04; break; /* -> bit 10 append   */
+        case 'C': case 'c': p |= 0x08; break; /* -> bit 11 common   */
+        case 'D': case 'd': p |= 0x10; break; /* -> bit 12 directory*/
+        case '-': case ' ': break;            /* ignore separators  */
+        default: return NDFS_ERR_INVALID_ARG;
+        }
+    }
+    *out_permissions = p;
+    return NDFS_OK;
+}

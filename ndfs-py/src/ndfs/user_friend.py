@@ -16,7 +16,7 @@ HackerCorp Labs - https://github.com/HackerCorpLabs
 """
 from __future__ import annotations
 
-from typing import Union
+from typing import Optional, Union
 
 from ndfs.endian import read_uint16_be, write_uint16_be
 
@@ -103,6 +103,25 @@ class UserFriend:
     def to_bytes(self, data: bytearray, offset: int) -> None:
         """Write to big-endian bytes."""
         write_uint16_be(data, offset, self.bits)
+
+    @staticmethod
+    def parse_permissions(s: Optional[str]) -> int:
+        """Parse a permission letters string into the 5-bit value used by
+        set_friend: R=read, W=write, A=append, C=common, D=directory. '-' and
+        spaces are ignored. None/empty yields 0. Raises ValueError on an
+        unrecognised letter."""
+        if not s:
+            return 0
+        bits = 0
+        table = {"R": 0x01, "W": 0x02, "A": 0x04, "C": 0x08, "D": 0x10}
+        for ch in s:
+            if ch in ("-", " "):
+                continue
+            up = ch.upper()
+            if up not in table:
+                raise ValueError(f"Invalid permission letter: {ch!r}")
+            bits |= table[up]
+        return bits
 
     def get_permission_string(self) -> str:
         """Get a human-readable permission string like 'RWACD'."""

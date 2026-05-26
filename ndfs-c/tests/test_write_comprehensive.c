@@ -598,10 +598,61 @@ static int test_surgical_write_preserves_empty_type(void)
     return 0;
 }
 
+static int test_friends_add_list_remove(void)
+{
+    ndfs_filesystem_t *fs = create_writable(NDFS_TMPL_FLOPPY_360KB, "FRIENDS");
+    ndfs_friend_info_t *fr = NULL;
+    size_t n = 0;
+    uint8_t *exported = NULL;
+    size_t exported_size = 0;
+    ndfs_filesystem_t *fs2 = NULL;
+
+    TEST_ASSERT_NOT_NULL(fs);
+    TEST_ASSERT_OK(ndfs_add_user(fs, "ALICE", 100));
+    TEST_ASSERT_OK(ndfs_add_user(fs, "BOB", 100));
+
+    /* Add BOB as a friend of ALICE with RW. */
+    TEST_ASSERT_OK(ndfs_add_friend(fs, "ALICE", "BOB", "RW"));
+
+    /* List shows BOB with RW. */
+    TEST_ASSERT_OK(ndfs_list_friends(fs, "ALICE", &fr, &n));
+    TEST_ASSERT_EQUAL(1, n);
+    TEST_ASSERT_EQUAL_STRING("BOB", fr[0].name);
+    TEST_ASSERT_EQUAL_STRING("RW---", fr[0].perms);
+    ndfs_free_friends(fr); fr = NULL;
+
+    /* Adding the same friend again errors. */
+    TEST_ASSERT_EQUAL(NDFS_ERR_ALREADY_EXISTS, ndfs_add_friend(fs, "ALICE", "BOB", "R"));
+
+    /* Unknown friend name errors. */
+    TEST_ASSERT_EQUAL(NDFS_ERR_NOT_FOUND, ndfs_add_friend(fs, "ALICE", "NOBODY", "R"));
+
+    /* Persistence: friend survives export + reload. */
+    TEST_ASSERT_OK(ndfs_to_buffer(fs, &exported, &exported_size));
+    TEST_ASSERT_OK(ndfs_open_buffer_copy(exported, exported_size, true, &fs2));
+    TEST_ASSERT_OK(ndfs_list_friends(fs2, "ALICE", &fr, &n));
+    TEST_ASSERT_EQUAL(1, n);
+    TEST_ASSERT_EQUAL_STRING("BOB", fr[0].name);
+    ndfs_free_friends(fr); fr = NULL;
+    ndfs_close(fs2);
+    ndfs_free_data(exported);
+
+    /* Remove. */
+    TEST_ASSERT_OK(ndfs_remove_friend(fs, "ALICE", "BOB"));
+    TEST_ASSERT_OK(ndfs_list_friends(fs, "ALICE", &fr, &n));
+    TEST_ASSERT_EQUAL(0, n);
+    /* Removing again errors. */
+    TEST_ASSERT_EQUAL(NDFS_ERR_NOT_FOUND, ndfs_remove_friend(fs, "ALICE", "BOB"));
+
+    ndfs_close(fs);
+    return 0;
+}
+
 void run_write_comprehensive_tests(void)
 {
     TEST_SUITE_BEGIN("Write Comprehensive Tests");
     RUN_TEST(test_surgical_write_preserves_empty_type);
+    RUN_TEST(test_friends_add_list_remove);
     RUN_TEST(test_write_small_file);
     RUN_TEST(test_write_multi_page_file);
     RUN_TEST(test_overwrite_file);

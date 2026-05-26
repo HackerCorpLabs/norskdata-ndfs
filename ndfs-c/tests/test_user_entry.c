@@ -164,6 +164,59 @@ static int test_access_and_friend_offsets(void)
     return 0;
 }
 
+static int test_friend_helpers(void)
+{
+    ndfs_user_entry_t ue;
+    const ndfs_user_friend_t *f;
+    int i;
+
+    ndfs_ue_init(&ue);
+
+    /* Not a friend yet. */
+    TEST_ASSERT(!ndfs_ue_is_friend(&ue, 5));
+    TEST_ASSERT(ndfs_ue_get_friend(&ue, 5) == NULL);
+
+    /* Add with R|W (0x03). */
+    TEST_ASSERT(ndfs_ue_add_friend(&ue, 5, 0x03));
+    TEST_ASSERT(ndfs_ue_is_friend(&ue, 5));
+    f = ndfs_ue_get_friend(&ue, 5);
+    TEST_ASSERT_NOT_NULL(f);
+    TEST_ASSERT(ndfs_uf_read_access(f));
+    TEST_ASSERT(ndfs_uf_write_access(f));
+    TEST_ASSERT(!ndfs_uf_append_access(f));
+
+    /* Remove. */
+    TEST_ASSERT(ndfs_ue_remove_friend(&ue, 5));
+    TEST_ASSERT(!ndfs_ue_is_friend(&ue, 5));
+    TEST_ASSERT(!ndfs_ue_remove_friend(&ue, 5)); /* gone */
+
+    /* Fill all 8 slots, then the 9th add fails. */
+    for (i = 0; i < NDFS_MAX_FRIENDS; i++) {
+        TEST_ASSERT(ndfs_ue_add_friend(&ue, (uint8_t)(10 + i), 0x01));
+    }
+    TEST_ASSERT(!ndfs_ue_add_friend(&ue, 99, 0x01));
+    return 0;
+}
+
+static int test_parse_permissions(void)
+{
+    uint8_t p = 0xFF;
+    TEST_ASSERT_OK(ndfs_uf_parse_permissions("RWA", &p));
+    TEST_ASSERT_EQUAL(0x07, p);
+    TEST_ASSERT_OK(ndfs_uf_parse_permissions("rwacd", &p));
+    TEST_ASSERT_EQUAL(0x1F, p);
+    TEST_ASSERT_OK(ndfs_uf_parse_permissions("", &p));
+    TEST_ASSERT_EQUAL(0x00, p);
+    TEST_ASSERT_OK(ndfs_uf_parse_permissions(NULL, &p));
+    TEST_ASSERT_EQUAL(0x00, p);
+    /* Letter D maps to directory only (0x10). */
+    TEST_ASSERT_OK(ndfs_uf_parse_permissions("D", &p));
+    TEST_ASSERT_EQUAL(0x10, p);
+    /* Unknown letter rejected. */
+    TEST_ASSERT_EQUAL(NDFS_ERR_INVALID_ARG, ndfs_uf_parse_permissions("RWX", &p));
+    return 0;
+}
+
 void run_user_entry_tests(void)
 {
     TEST_SUITE_BEGIN("UserEntry Tests");
@@ -175,4 +228,6 @@ void run_user_entry_tests(void)
     RUN_TEST(test_over_quota);
     RUN_TEST(test_friends_roundtrip);
     RUN_TEST(test_name_uppercase);
+    RUN_TEST(test_friend_helpers);
+    RUN_TEST(test_parse_permissions);
 }

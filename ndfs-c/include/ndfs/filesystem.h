@@ -185,6 +185,49 @@ ndfs_error_t ndfs_clear_user_password(ndfs_filesystem_t *fs, const char *name);
 ndfs_error_t ndfs_clear_user_password_by_index(ndfs_filesystem_t *fs,
                                                uint8_t index);
 
+/* ── Friends ─────────────────────────────────────────────────────────
+ *
+ * A user has 0..NDFS_MAX_FRIENDS friends, stored in that user's own entry.
+ * A friend grants a specific other user a set of rights (RWACD) to this
+ * user's files. The owner and friend may be given by name OR by a decimal
+ * user index (0-255); a numeric string is treated as an index. */
+
+/** One entry returned by ndfs_list_friends. */
+typedef struct {
+    uint8_t  index;                  /* friend's user index */
+    char     name[NDFS_NAME_MAX + 1];/* friend's user name, or "" if no such user */
+    uint16_t bits;                   /* raw 16-bit friend entry */
+    char     perms[6];               /* "RWACD" / "-----" */
+} ndfs_friend_info_t;
+
+/**
+ * List a user's friends. *out_friends is a malloc'd array of *out_count
+ * entries (free with ndfs_free_friends); both are set to NULL/0 if the user
+ * has no friends. Returns NDFS_ERR_NOT_FOUND if the user does not exist.
+ */
+ndfs_error_t ndfs_list_friends(const ndfs_filesystem_t *fs, const char *user_ref,
+                               ndfs_friend_info_t **out_friends, size_t *out_count);
+
+/** Free the array returned by ndfs_list_friends. */
+void ndfs_free_friends(ndfs_friend_info_t *friends);
+
+/**
+ * Add a friend to a user with the given permission letters (e.g. "RWA";
+ * NULL/empty defaults to "RWA"). Errors: NDFS_ERR_NOT_FOUND (owner/friend
+ * unknown), NDFS_ERR_ALREADY_EXISTS (already a friend), NDFS_ERR_NO_SLOTS
+ * (all 8 slots used), NDFS_ERR_INVALID_ARG (bad permission letters).
+ * Persists by writing only the owner's user page.
+ */
+ndfs_error_t ndfs_add_friend(ndfs_filesystem_t *fs, const char *user_ref,
+                             const char *friend_ref, const char *perms);
+
+/**
+ * Remove a friend from a user. Returns NDFS_ERR_NOT_FOUND if the owner does
+ * not exist or the friend is not in the list. Persists the owner's page.
+ */
+ndfs_error_t ndfs_remove_friend(ndfs_filesystem_t *fs, const char *user_ref,
+                                const char *friend_ref);
+
 /* ── Read operations (extended) ──────────────────────────────────── */
 
 /**

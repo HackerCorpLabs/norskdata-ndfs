@@ -12,7 +12,7 @@ HackerCorp Labs - https://github.com/HackerCorpLabs
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, NamedTuple, Optional, Tuple, Union
 
 from ndfs.constants import (
     NDFS_PAGE_SIZE,
@@ -32,11 +32,20 @@ from ndfs.bit_file import BitFile
 from ndfs.user_file import UserFile
 from ndfs.object_file import ObjectFile
 from ndfs.user_entry import UserEntry
+from ndfs.user_friend import UserFriend
 from ndfs.object_entry import ObjectEntry, ACCESS_DEFAULT, FT_INDEXED
 from ndfs.types import PointerType, FileEntry, ImageCreationOptions, BootFormat, BootCode
 from ndfs.xat import object_entry_to_xat, xat_to_object_entry
 
 _BufType = Union[bytes, bytearray, memoryview]
+
+
+class FriendInfo(NamedTuple):
+    """One entry returned by NdfsFileSystem.list_friends."""
+    index: int       # friend's user index
+    name: str        # friend's user name, or "" if no such user
+    bits: int        # raw 16-bit friend entry
+    perms: str       # "RWACD" / "-----"
 
 
 class NdfsFileSystem:
@@ -377,6 +386,87 @@ class NdfsFileSystem:
         user.password = 0
         self._write_user_page(user.user_index)
         return True
+
+    # -- Friends -----------------------------------------------------------
+
+    def _resolve_user_ref(self, ref: Union[int, str]) -> Optional[UserEntry]:
+        """Resolve a user reference (name or index) to a UserEntry, or None.
+        A pure-digit string or int is treated as a user index."""
+        if isinstance(ref, int):
+            return self._user_file.get_user(ref)
+        if ref.isdigit():
+            v = int(ref)
+            if 0 <= v <= 255:
+                return self._user_file.get_user(v)
+            return None
+        return self._user_file.find_user(ref)
+
+    def _resolve_friend_index(self, ref: Union[int, str]) -> int:
+        """Resolve a friend reference to a user index. A numeric ref is taken
+        literally (need not be a named user); a name must resolve to a user.
+        Raises ValueError/KeyError on a bad/unknown reference."""
+        if isinstance(ref, int):
+            if not (0 <= ref <= 255):
+                raise ValueError(f"User index out of range: {ref}")
+            return ref
+        if ref.isdigit():
+            v = int(ref)
+            if not (0 <= v <= 255):
+                raise ValueError(f"User index out of range: {ref}")
+            return v
+        u = self._user_file.find_user(ref)
+        if u is None:
+            raise KeyError(f"No such user: {ref}")
+        return u.user_index
+
+    def list_friends(self, user_ref: Union[int, str]) -> List["FriendInfo"]:
+        """List a user's friends. Raises KeyError if the user does not exist."""
+        owner = self._resolve_user_ref(user_ref)
+        if owner is None:
+            raise KeyError(f"No such user: {user_ref}")
+        out: List[FriendInfo] = []
+        for f in owner.friends:
+            if not f.entry_used:
+                continue
+            idx = f.friend_user_index
+            fu = self._user_file.get_user(idx)
+            out.append(FriendInfo(
+                index=idx,
+                name=fu.user_name if fu is not None else "",
+                bits=f.bits,
+                perms=f.get_permission_string(),
+            ))
+        return out
+
+    def add_friend(self, user_ref: Union[int, str], friend_ref: Union[int, str],
+                   perms: Optional[str] = "RWA") -> None:
+        """Add a friend to a user with the given permission letters (default
+        'RWA'). Persists the owner's user page. Raises KeyError (owner/friend
+        unknown), ValueError (already a friend, list full, or bad letters)."""
+        self._ensure_writable()
+        owner = self._resolve_user_ref(user_ref)
+        if owner is None:
+            raise KeyError(f"No such user: {user_ref}")
+        friend_index = self._resolve_friend_index(friend_ref)
+        perm_bits = UserFriend.parse_permissions(perms if perms else "RWA")
+        if owner.is_friend(friend_index):
+            raise ValueError(f"Already a friend: {friend_ref}")
+        if not owner.add_friend(friend_index, perm_bits):
+            raise ValueError("Friend list is full (max 8)")
+        self._write_user_page(owner.user_index)
+
+    def remove_friend(self, user_ref: Union[int, str],
+                      friend_ref: Union[int, str]) -> None:
+        """Remove a friend from a user. Persists the owner's page. Raises
+        KeyError if the owner does not exist or the friend is not present."""
+        self._ensure_writable()
+        owner = self._resolve_user_ref(user_ref)
+        if owner is None:
+            raise KeyError(f"No such user: {user_ref}")
+        friend_index = self._resolve_friend_index(friend_ref)
+        if not owner.remove_friend(friend_index):
+            raise KeyError(f"Not a friend: {friend_ref}")
+        self._write_user_page(owner.user_index)
 
     # -- Bitmap queries ----------------------------------------------------
 

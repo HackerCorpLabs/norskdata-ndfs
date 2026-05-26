@@ -85,3 +85,23 @@ class TestUserFriendGetPermissionString:
     def test_returns_R_for_read_only(self):
         f = UserFriend.create(0, read=True)
         assert f.get_permission_string() == "R----"
+
+
+class TestUserFriendParsePermissions:
+    def test_rwa(self):
+        assert UserFriend.parse_permissions("RWA") == 0x07
+
+    def test_all(self):
+        assert UserFriend.parse_permissions("rwacd") == 0x1F
+
+    def test_empty_and_none(self):
+        assert UserFriend.parse_permissions("") == 0
+        assert UserFriend.parse_permissions(None) == 0
+
+    def test_directory_only(self):
+        assert UserFriend.parse_permissions("D") == 0x10
+
+    def test_invalid_letter_raises(self):
+        import pytest
+        with pytest.raises(ValueError):
+            UserFriend.parse_permissions("RWX")

@@ -89,4 +89,24 @@ describe('UserFriend', () => {
       expect(f.getPermissionString()).toBe('R----');
     });
   });
+
+  describe('parsePermissions', () => {
+    it('parses RWA', () => {
+      expect(UserFriend.parsePermissions('RWA')).toBe(0x07);
+    });
+    it('parses all (case-insensitive)', () => {
+      expect(UserFriend.parsePermissions('rwacd')).toBe(0x1f);
+    });
+    it('empty / null / undefined -> 0', () => {
+      expect(UserFriend.parsePermissions('')).toBe(0);
+      expect(UserFriend.parsePermissions(null)).toBe(0);
+      expect(UserFriend.parsePermissions(undefined)).toBe(0);
+    });
+    it('D maps to directory only', () => {
+      expect(UserFriend.parsePermissions('D')).toBe(0x10);
+    });
+    it('throws on an unknown letter', () => {
+      expect(() => UserFriend.parsePermissions('RWX')).toThrow();
+    });
+  });
 });

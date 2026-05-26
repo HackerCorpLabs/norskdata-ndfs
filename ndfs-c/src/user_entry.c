@@ -90,3 +90,54 @@ void ndfs_ue_to_bytes(const ndfs_user_entry_t *entry, uint8_t *buf)
         ndfs_uf_to_bytes(&entry->friends[i], buf, 48 + (size_t)i * 2);
     }
 }
+
+bool ndfs_ue_is_friend(const ndfs_user_entry_t *entry, uint8_t friend_index)
+{
+    size_t i;
+    for (i = 0; i < NDFS_MAX_FRIENDS; i++) {
+        if (ndfs_uf_is_active(&entry->friends[i]) &&
+            ndfs_uf_friend_index(&entry->friends[i]) == friend_index) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ndfs_ue_add_friend(ndfs_user_entry_t *entry, uint8_t friend_index,
+                        uint8_t permissions)
+{
+    size_t i;
+    for (i = 0; i < NDFS_MAX_FRIENDS; i++) {
+        if (!ndfs_uf_is_active(&entry->friends[i])) {
+            ndfs_uf_set_friend(&entry->friends[i], friend_index, permissions);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ndfs_ue_remove_friend(ndfs_user_entry_t *entry, uint8_t friend_index)
+{
+    size_t i;
+    for (i = 0; i < NDFS_MAX_FRIENDS; i++) {
+        if (ndfs_uf_is_active(&entry->friends[i]) &&
+            ndfs_uf_friend_index(&entry->friends[i]) == friend_index) {
+            ndfs_uf_clear(&entry->friends[i]);
+            return true;
+        }
+    }
+    return false;
+}
+
+const ndfs_user_friend_t *ndfs_ue_get_friend(const ndfs_user_entry_t *entry,
+                                             uint8_t friend_index)
+{
+    size_t i;
+    for (i = 0; i < NDFS_MAX_FRIENDS; i++) {
+        if (ndfs_uf_is_active(&entry->friends[i]) &&
+            ndfs_uf_friend_index(&entry->friends[i]) == friend_index) {
+            return &entry->friends[i];
+        }
+    }
+    return NULL;
+}

@@ -28,6 +28,7 @@ import { BitFile } from './bit-file.js';
 import { UserFile } from './user-file.js';
 import { ObjectFile } from './object-file.js';
 import { UserEntry } from './user-entry.js';
+import { UserFriend } from './user-friend.js';
 import {
   ObjectEntry,
   ACCESS_DEFAULT,
@@ -42,6 +43,14 @@ import { stripParity, setParity } from './parity.js';
 /** Parity mode for read/write operations. */
 export type ParityMode = 'none' | 'strip' | 'set';
 import { XatProperties, objectEntryToXat, xatToObjectEntry } from './xat.js';
+
+/** One entry returned by NdfsFileSystem.listFriends. */
+export interface FriendInfo {
+  index: number; // friend's user index
+  name: string; // friend's user name, or '' if no such user
+  bits: number; // raw 16-bit friend entry
+  perms: string; // 'RWACD' / '-----'
+}
 
 export class NdfsFileSystem {
   private data: Uint8Array;
@@ -390,6 +399,82 @@ export class NdfsFileSystem {
     user.password = 0;
     this.writeUserPage(user.userIndex);
     return true;
+  }
+
+  // ── Friends ────────────────────────────────────────────────────────
+  //
+  // A user has 0..8 friends in its own entry; a friend grants another user
+  // RWACD rights to this user's files. Owner/friend may be a name or a
+  // decimal index (0-255). Persists only the owner's user page.
+
+  /** Resolve a user ref (name or index 0-255) to a UserEntry, or null. */
+  private resolveUserRef(ref: number | string): UserEntry | null {
+    if (typeof ref === 'number') return this.userFile.getUser(ref);
+    if (/^\d+$/.test(ref)) {
+      const v = parseInt(ref, 10);
+      return v >= 0 && v <= 255 ? this.userFile.getUser(v) : null;
+    }
+    return this.userFile.findUser(ref);
+  }
+
+  /** Resolve a friend ref to a user index (numeric = literal index). */
+  private resolveFriendIndex(ref: number | string): number {
+    if (typeof ref === 'number') {
+      if (ref < 0 || ref > 255) throw new Error(`User index out of range: ${ref}`);
+      return ref;
+    }
+    if (/^\d+$/.test(ref)) {
+      const v = parseInt(ref, 10);
+      if (v < 0 || v > 255) throw new Error(`User index out of range: ${ref}`);
+      return v;
+    }
+    const u = this.userFile.findUser(ref);
+    if (!u) throw new Error(`No such user: ${ref}`);
+    return u.userIndex;
+  }
+
+  /** List a user's friends. Throws if the user does not exist. */
+  listFriends(userRef: number | string): FriendInfo[] {
+    const owner = this.resolveUserRef(userRef);
+    if (!owner) throw new Error(`No such user: ${userRef}`);
+    const out: FriendInfo[] = [];
+    for (const f of owner.friends) {
+      if (!f.entryUsed) continue;
+      const idx = f.friendUserIndex;
+      const fu = this.userFile.getUser(idx);
+      out.push({
+        index: idx,
+        name: fu ? fu.userName : '',
+        bits: f.bits,
+        perms: f.getPermissionString(),
+      });
+    }
+    return out;
+  }
+
+  /**
+   * Add a friend to a user with the given permission letters (default 'RWA').
+   * Throws if owner/friend unknown, already a friend, or the list is full.
+   */
+  addFriend(userRef: number | string, friendRef: number | string, perms: string = 'RWA'): void {
+    this.ensureWritable();
+    const owner = this.resolveUserRef(userRef);
+    if (!owner) throw new Error(`No such user: ${userRef}`);
+    const friendIndex = this.resolveFriendIndex(friendRef);
+    const permBits = UserFriend.parsePermissions(perms ? perms : 'RWA');
+    if (owner.isFriend(friendIndex)) throw new Error(`Already a friend: ${friendRef}`);
+    if (!owner.addFriend(friendIndex, permBits)) throw new Error('Friend list is full (max 8)');
+    this.writeUserPage(owner.userIndex);
+  }
+
+  /** Remove a friend from a user. Throws if owner unknown or not a friend. */
+  removeFriend(userRef: number | string, friendRef: number | string): void {
+    this.ensureWritable();
+    const owner = this.resolveUserRef(userRef);
+    if (!owner) throw new Error(`No such user: ${userRef}`);
+    const friendIndex = this.resolveFriendIndex(friendRef);
+    if (!owner.removeFriend(friendIndex)) throw new Error(`Not a friend: ${friendRef}`);
+    this.writeUserPage(owner.userIndex);
   }
 
   // ── Bitmap queries ─────────────────────────────────────────────────
