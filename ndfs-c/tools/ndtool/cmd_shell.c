@@ -55,15 +55,35 @@ static void shell_help(void)
     printf("  quit / exit          Exit shell\n");
 }
 
-static void shell_ls(ndtool_ctx_t *ctx, const char *user)
+static void shell_ls(ndtool_ctx_t *ctx, const char *arg)
 {
-    ndfs_file_entry_t *entries = NULL;
-    size_t count = 0;
     size_t i;
     ndfs_error_t err;
+    char user_buf[NDFS_NAME_MAX + 1];
+    const char *user_name = NULL;
+    const char *file_pat = NULL;
 
-    if (!user) {
-        /* List users with file count summary */
+    /* Parse arg: no arg = list users.
+     * "USER" or "USER/" = list all files for user.
+     * "USER/PATTERN" = list matching files.  Pattern supports * and ?.
+     * A leading ':' in pattern is shorthand for '*:TYPE', e.g. ":MODE" -> "*:MODE". */
+    if (arg) {
+        const char *slash = strchr(arg, '/');
+        if (slash) {
+            size_t ulen = (size_t)(slash - arg);
+            if (ulen > NDFS_NAME_MAX) ulen = NDFS_NAME_MAX;
+            memcpy(user_buf, arg, ulen);
+            user_buf[ulen] = '\0';
+            user_name = user_buf;
+            file_pat = slash + 1;
+            if (file_pat[0] == '\0') file_pat = NULL; /* trailing slash only */
+        } else {
+            user_name = arg;
+        }
+    }
+
+    if (!user_name) {
+        /* List users with file count + octal user index */
         ndfs_user_entry_t *users = NULL;
         size_t user_count = 0;
 
@@ -77,8 +97,8 @@ static void shell_ls(ndtool_ctx_t *ctx, const char *user)
             ndfs_file_entry_t *files = NULL;
             size_t file_count = 0;
             ndfs_list_directory(ctx->fs, users[i].user_name, &files, &file_count);
-            printf("  %-16s  %3zu files  Reserved: %5u  Used: %5u\n",
-                   users[i].user_name, file_count,
+            printf("  [%03o]  %-16s  %3zu files  Reserved: %5u  Used: %5u\n",
+                   users[i].user_index, users[i].user_name, file_count,
                    users[i].pages_reserved, users[i].pages_used);
             ndfs_free_entries(files);
         }
@@ -87,18 +107,39 @@ static void shell_ls(ndtool_ctx_t *ctx, const char *user)
         return;
     }
 
-    err = ndfs_list_directory(ctx->fs, user, &entries, &count);
-    if (err != NDFS_OK) {
-        fprintf(stderr, "Error: %s\n", ndfs_strerror(err));
-        return;
-    }
+    /* List files for a user, with optional wildcard filter */
+    {
+        ndfs_object_entry_t *objs = NULL;
+        size_t obj_count = 0;
+        /* Expand bare ":TYPE" to "*:TYPE" for convenience */
+        char pat_buf[NDFS_NAME_MAX + NDFS_TYPE_MAX + 4];
+        if (file_pat && file_pat[0] == ':') {
+            snprintf(pat_buf, sizeof(pat_buf), "*%s", file_pat);
+            file_pat = pat_buf;
+        }
 
-    for (i = 0; i < count; i++) {
-        printf("  %-24s %8u bytes  %4u pages\n",
-               entries[i].full_name, entries[i].size, entries[i].pages);
-    }
+        err = ndfs_get_object_entries(ctx->fs, &objs, &obj_count);
+        if (err != NDFS_OK) {
+            fprintf(stderr, "Error: %s\n", ndfs_strerror(err));
+            return;
+        }
 
-    ndfs_free_entries(entries);
+        for (i = 0; i < obj_count; i++) {
+            const ndfs_object_entry_t *e = &objs[i];
+            char full[NDFS_NAME_MAX + NDFS_TYPE_MAX + 2];
+            char datebuf[24];
+            if (strcmp(e->user_name, user_name) != 0) continue;
+            ndfs_oe_full_name(e, full, sizeof(full));
+            if (file_pat && !ndfs_wildmatch(file_pat, full, true)) continue;
+            ndtool_format_nd_date(e->date_created, datebuf, sizeof(datebuf));
+            printf("  [%04o]  %s  (%s)%-24s %10u bytes  %5u pages\n",
+                   e->disk_object_index, datebuf,
+                   e->user_name, full,
+                   e->bytes_in_file, e->pages_in_file);
+        }
+
+        ndfs_free_object_entries(objs);
+    }
 }
 
 static void shell_cat(ndtool_ctx_t *ctx, const char *path)
