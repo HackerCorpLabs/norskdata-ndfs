@@ -113,10 +113,16 @@ Offset  Size  Field              Format
 32      4     Pages Used         uint32 big-endian
 36      1     Directory Index    Multi-directory support
 37      1     User Index         0-255
-38      2     Default File Access uint16 big-endian (default: 0x04FF)
-40      16    Friends            8 x 2-byte entries, big-endian
-56      8     Reserved
+38      2     Reserved
+40      2     Default File Access uint16 big-endian (default: 0x04FF)
+42      6     Reserved / tracking (byte 47 = mxobl/acobl nibbles)
+48      16    Friends            8 x 2-byte entries, big-endian
 ```
+
+**Verified against real images** (`DefaultFileAccess`@40 reads 0x04FF/0x03FF;
+friends@48). Loaders identify the owning user by the stored **User Index byte
+(offset 37)**, not by physical position; users are placed at physical slot
+`userIndex % 32` in page `userIndex / 32` (8 pages × 32 = 256 users max).
 
 ### User Flags
 
@@ -141,21 +147,38 @@ Bits 7-0:   Friend user index (0-255)
 
 ```
 Offset  Size  Field              Format
-0       1     Header             Bit 7 set = in use (0x80)
-1       1     Reserved
-2       16    Object Name        ASCII, terminated by 0x27
+0       2     Header             word; bit15 in use, bit14 write-open, bit12 modified
+2       16    Object Name        ASCII, terminated by 0x27 then NULs
 18      4     Type               ASCII (max 4 chars), terminated by 0x27
-22      10    Reserved
+22      2     Next Version       uint16 BE (object index of next version)
+24      2     Prev Version       uint16 BE (object index of previous version)
+26      2     Access Bits        uint16 BE (15-bit, see Access Permissions)
+28      2     File Type Flags    uint16 BE: T P S I C A M L (Indexed=0x08, etc.)
+30      2     Device Number      uint16 BE
 32      1     File Type Code     0=DATA, 1=PROG, 2=SYMB, 3=TEXT
-33      1     Reserved
-34      1     User Index         Owner's user index
-35      17    Reserved / tracking
-52      4     Pages in File      uint32 big-endian
+34      2     Object Index       uint16 BE = (UserIndex << 8) | fileEntry
+                                 (byte 34 = owning user index; byte 35 = slot)
+36      2     Current Open Count uint16 BE
+38      2     Total Open Count   uint16 BE
+40      4     Date Created       ND timestamp, uint32 BE
+44      4     Last Date Read     ND timestamp, uint32 BE
+48      4     Last Date Written  ND timestamp, uint32 BE
+52      4     Pages in File      uint32 big-endian (data pages; excludes index)
 56      4     Bytes in File - 1  uint32 big-endian (actual bytes = stored + 1)
 60      4     File Pointer       BlockPointer, big-endian
 ```
 
-**Important**: The bytes-in-file field stores `actual_size - 1`. When reading, add 1 to get the real file size.
+**Important**:
+- Bytes-in-file stores `actual_size - 1`; add 1 when reading.
+- A single-version file is **self-referential**: Next = Prev = its own Object
+  Index. Zeroed version pointers make SINTRAN report a broken chain (`;2`).
+- **Object Index encodes ownership and physical position**: the high byte is
+  the owning user, and the object file is partitioned so user *U* owns object
+  slots `U*256 .. U*256+255` (index-block pointer slots `U*8 .. U*8+7`). SINTRAN
+  derives the owner from the slot's physical position; a file must be written
+  into its owner's region, not the first free global slot. Max 256 files/user.
+- Name/Type fields use a **single** `0x27` terminator followed by NULs (not a
+  field padded with terminators).
 
 ## Bit File (Allocation Bitmap)
 
@@ -232,6 +255,15 @@ The Object File Pointer points to an **indexed** or **sub-indexed** structure:
 Indexed:     Index Block -> up to 512 data pages (16,384 files max)
 Sub-Indexed: Sub-Index -> up to 512 index blocks -> 262,144 data pages
 ```
+
+**Per-user partition (critical):** the object file is partitioned by user.
+User *U* owns the **8 consecutive index-block pointer slots** `U*8 .. U*8+7`,
+i.e. 8 data pages × 32 entries = **256 object slots per user**, spanning object
+indices `U*256 .. U*256+255`. A file's Object Index (offset 34) therefore
+encodes `(U << 8) | fileEntry`, and a new file MUST be placed in a free slot of
+its owner's region (allocating/linking that user's directory page on demand) —
+not the first free global slot. Writing to a global slot puts the file in the
+wrong user's region as far as SINTRAN is concerned.
 
 ## Path Format
 

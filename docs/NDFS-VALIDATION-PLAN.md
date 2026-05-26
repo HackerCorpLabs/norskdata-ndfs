@@ -221,31 +221,57 @@ For each divergence the matrix surfaces:
 - RC and RFS: xUnit/NUnit projects producing the golden vectors and asserting
   RFS parity. C: extend the in-repo framework. TS: vitest. PY: pytest.
 
-## Status of issues already found (seeds for the matrix)
+## Status of issues found
 
+### Fixed (with regression tests), verified against RetroCore / a real disk
 - ✅ ObjectEntry fields 22–51 (versioning/access/flags/device/open/dates) —
-  were dropped in C/TS/PY/RFS; fixed + parser tests.
+  were dropped in C/TS/PY/RFS; fixed + parser + golden byte-vector tests.
 - ✅ User `DefaultFileAccess`@40 / friends@48 — ports read @38/@40 (wrong);
-  fixed + regression test (verified vs real image + `ndfs`).
-- ✅ New-file **version chain** + object index — were 0 (SINTRAN `;2`,
-  unopenable); now self-referential `user<<8|slot` in C/TS/PY; RFS pending
-  verification.
-- ✅ `--rm` not deleting + deleted files reappearing — fixed (C).
-- ✅ `--dest` ignored with a bare name — fixed (C).
-- ☐ RFS `UserEntry`/`UserFile` offset audit — not yet checked.
-- ☐ TS/PY new-file flags for contiguous vs indexed — confirm matches RC.
-- ☐ Multi-version create/read — **VERY LOW PRIORITY**. The `;N` version ordinal
-  is exact for single-version files (self-referential chain → `;1`, the
-  universal real-world case); the chained-version ordinal in `ndtool -t` is
-  best-effort and unvalidated. Needs a disk with genuine multiple versions of a
-  file to validate/fix, and creating extra versions isn't implemented in any
-  port. Defer unless a real multi-version use case appears.
-- ☐ **Object-file slot allocation on create** — when the next free object slot
-  falls in an object-file page that is not yet allocated/linked in the index
-  block, `persist` silently skips writing the entry (the file would vanish on
-  reload). Currently latent because populated disks have room in existing
-  pages. Fix: grow the object file (allocate + link a new data page, extend
-  index/sub-index) when the chosen slot's page is absent. Mirror to C/TS/PY/RFS
-  and validate against RC + a near-full disk.
-- ☐ Write a real ND creation **date** on new files (currently 0 → shows
-  `1950-01-01`); add an ND-timestamp encoder to libndfs (C lacks one).
+  fixed (verified vs real image + `ndfs`).
+- ✅ **Name field encoding** — wrote a field full of `0x27`; SINTRAN expects one
+  terminator + NULs, so copied-in files were invisible in SINTRAN. Fixed in
+  C/TS/PY (+ golden round-trip). Proven via `ndfs` on a real SMD image.
+- ✅ **Per-user object-file partition** — files for non-SYSTEM users landed in
+  SYSTEM's region (flat slot). Now `findFreeUserSlot` + `ensureObjectDirPage`
+  place them at `user<<8|fileEntry` and grow the user's directory page on
+  demand, in C/TS/PY. Proven: a file put to BUILD is listed under BUILD by
+  `ndfs`. (Supersedes the old "object-file slot allocation on create" item.)
+- ✅ New-file **version chain** + object index — were 0 (SINTRAN `;2`); now
+  self-referential `user<<8|slot` in C/TS/PY.
+- ✅ `--rm`/delete: dispatch (`-f`), slot clearing, and **whole-emptied page
+  zeroing** — deleted files no longer reappear, in C/TS/PY.
+- ✅ `--dest` honored with a bare name (C).
+- ✅ **>512-page files** rejected in C/PY (were corrupting the adjacent block);
+  TS uses sub-indexed.
+- ✅ Object header word preserved on rewrite (used/modified bits).
+
+### Verified NOT a bug (audit claim debunked against a real disk)
+- ✓ **Bit-file bit ordering** — the flat byte layout (`block/8`, `bit%8`) is
+  correct: every reserved/structural block reads `used` on a real SINTRAN
+  disk. An audit suggested a 16-bit-word byte-swap; that would corrupt real
+  disks. **No change** to `bit_file`.
+- ✓ **User-entry slot mapping** — `page*32+slot` is correct: on a real 57-user
+  disk, user index 32 sits at page 1/slot 0. RetroCore's `user-(user/32)*8`
+  formula is the latent bug (impossible slot ≥32). **Ports unchanged.**
+
+### Open (tracked, lower priority)
+- ☐ **Master-block free count** (`unreserved_pages`@0x1C) not rewritten on
+  mutation in any port → stale free count after add/delete (SINTRAN reads it).
+  Fix: update + write the master-block directory word on persist (NOT the
+  extended-info checksum — RetroCore never rewrites that). C/TS/PY (+RFS).
+- ☐ **On-demand user-file page growth** — adding a user whose user-file page is
+  not yet allocated silently drops it (edge: >32 users). Mirror
+  `ensureObjectDirPage` as `ensureUserDirPage` in C/TS/PY.
+- ☐ **Sparse-file accounting** — ports set `pages_in_file`/`pages_used` to the
+  logical page count incl. holes + the index block; RetroCore counts only
+  allocated data pages and excludes the index block from user quota. Diverges
+  only for sparse files.
+- ☐ **RFS C#** — apply the per-user partition, version chain, name-terminator,
+  delete-clear, and >512 guards to RetroFS too; audit its `UserEntry`/`UserFile`.
+- ☐ **RetroCore** `UserFile.cs:240` `*8` user-slot formula is latently buggy
+  for ≥32 users (report upstream; ports already correct).
+- ☐ Sub-indexed file **creation** in C/PY (currently rejected >512 pages).
+- ☐ Real ND creation **date** on new files (currently 0 → `1950-01-01`); needs
+  an ND-timestamp encoder in libndfs.
+- ☐ Multi-version create/read — **VERY LOW PRIORITY** (single-version `;1` is
+  exact; chained-version ordinal best-effort/unvalidated).

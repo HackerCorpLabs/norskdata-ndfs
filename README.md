@@ -10,12 +10,12 @@ Three standalone libraries with identical APIs, plus a CLI tool:
 
 | Library | Language | Tests | Install |
 |---------|----------|-------|---------|
-| [ndfs-ts](ndfs-ts/) | TypeScript | 280 | `npm install norskdata-ndfs` |
-| [ndfs-py](ndfs-py/) | Python | 320 | `pip install norskdata-ndfs` |
-| [ndfs-c](ndfs-c/) | C99 | 159 | `cmake .. && make` |
+| [ndfs-ts](ndfs-ts/) | TypeScript | 288 | `npm install norskdata-ndfs` |
+| [ndfs-py](ndfs-py/) | Python | 328 | `pip install norskdata-ndfs` |
+| [ndfs-c](ndfs-c/) | C99 | 166 | `cmake .. && make` |
 | [ndtool](ndfs-c/tools/ndtool/README.md) | CLI (C) | -- | Built with libndfs |
 
-**Total: 759 tests. No external dependencies in any library.**
+**Total: 782 tests. No external dependencies in any library.**
 
 ## What It Does
 
