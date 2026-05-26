@@ -58,6 +58,7 @@ set(TEST_SOURCES
     tests/test_xat_copy.c
     tests/test_parity.c
     tests/test_wildmatch.c
+    tests/test_golden.c
 )
 
 add_executable(ndfs_tests ${TEST_SOURCES})

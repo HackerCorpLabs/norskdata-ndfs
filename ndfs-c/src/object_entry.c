@@ -108,8 +108,12 @@ ndfs_error_t ndfs_oe_to_bytes(const ndfs_object_entry_t *entry,
         memset(buffer + offset, 0, NDFS_ENTRY_SIZE);
     }
 
-    /* Header (0x80 = in use) */
-    buffer[offset] = NDFS_OBJECT_IN_USE;
+    /* Header: a loaded entry keeps its original header word (used / write-open
+     * / modified / terminal bits) via the raw copy; a freshly-built entry just
+     * gets the in-use bit. */
+    if (!entry->has_raw) {
+        buffer[offset] = NDFS_OBJECT_IN_USE;
+    }
 
     /* Object name */
     ndfs_write_name(buffer, offset + 2, entry->object_name, NDFS_NAME_MAX);
