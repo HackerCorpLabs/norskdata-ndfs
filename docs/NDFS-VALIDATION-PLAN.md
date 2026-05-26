@@ -235,3 +235,12 @@ For each divergence the matrix surfaces:
 - ☐ RFS `UserEntry`/`UserFile` offset audit — not yet checked.
 - ☐ TS/PY new-file flags for contiguous vs indexed — confirm matches RC.
 - ☐ Multi-version create/read — not yet implemented/validated in any port.
+- ☐ **Object-file slot allocation on create** — when the next free object slot
+  falls in an object-file page that is not yet allocated/linked in the index
+  block, `persist` silently skips writing the entry (the file would vanish on
+  reload). Currently latent because populated disks have room in existing
+  pages. Fix: grow the object file (allocate + link a new data page, extend
+  index/sub-index) when the chosen slot's page is absent. Mirror to C/TS/PY/RFS
+  and validate against RC + a near-full disk.
+- ☐ Write a real ND creation **date** on new files (currently 0 → shows
+  `1950-01-01`); add an ND-timestamp encoder to libndfs (C lacks one).

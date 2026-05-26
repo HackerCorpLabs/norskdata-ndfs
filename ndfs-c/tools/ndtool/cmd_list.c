@@ -123,7 +123,9 @@ int cmd_users(ndtool_ctx_t *ctx)
     printf("Users: %zu\n", count);
     for (i = 0; i < count; i++) {
         int32_t free_pages = ndfs_ue_free_pages(&users[i]);
-        printf("  [%3u]  %-16s  Reserved: %5u  Used: %5u  Free: %5d\n",
+        /* User index shown in 3-digit octal, matching SINTRAN's
+         * file-system-investigator (LIST-USERS) e.g. "011 BUILD". */
+        printf("  %03o  %-16s  Reserved: %5u  Used: %5u  Free: %5d\n",
                users[i].user_index,
                users[i].user_name,
                users[i].pages_reserved,
