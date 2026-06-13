@@ -212,6 +212,24 @@ int main(int argc, char **argv)
             return 1;
         }
 
+        size_t rem = img_size % 2048;
+        if (rem != 0) {
+            if (needs_write) {
+                fprintf(stderr,
+                        "Error: cannot write to '%s': image size %zu bytes is not a "
+                        "multiple of the 2048-byte page size; pad it up to the next "
+                        "boundary first.\n",
+                        ctx.image_path, img_size);
+                free(img_data);
+                return 1;
+            }
+            fprintf(stderr,
+                    "Warning: image size %zu bytes is not a multiple of the 2048-byte "
+                    "page size (%zu trailing bytes / partial last page); proceeding "
+                    "anyway. Zero-pad to the next 2048-byte boundary to silence this.\n",
+                    img_size, rem);
+        }
+
         bool read_only = !needs_write;
         ndfs_error_t err = ndfs_open_buffer_copy(img_data, img_size, read_only, &ctx.fs);
         free(img_data);

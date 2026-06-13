@@ -526,13 +526,73 @@ static int test_open_too_small(void)
     return 0;
 }
 
-static int test_open_not_aligned(void)
+/* An image whose byte length is not a whole multiple of the page size must
+   still open: the trailing partial page is dropped (floored), matching the
+   reference ndfs.  Unaligned images are forced read-only. */
+static int test_open_unaligned_over(void)
 {
-    uint8_t buf[NDFS_PAGE_SIZE + 100];
+    /* A valid image plus 1024 trailing bytes (half a page over a boundary). */
+    uint8_t *base = create_test_image();
+    size_t   over = TEST_IMAGE_SIZE + 1024;
+    uint8_t *img;
     ndfs_filesystem_t *fs = NULL;
-    memset(buf, 0, sizeof(buf));
-    TEST_ASSERT_EQUAL(NDFS_ERR_NOT_ALIGNED,
-                      ndfs_open_buffer_copy(buf, sizeof(buf), true, &fs));
+    char dir[NDFS_NAME_MAX + 1] = {0};
+
+    TEST_ASSERT_NOT_NULL(base);
+    img = (uint8_t *)calloc(over, 1);
+    TEST_ASSERT_NOT_NULL(img);
+    memcpy(img, base, TEST_IMAGE_SIZE);
+    free(base);
+
+    TEST_ASSERT_OK(ndfs_open_buffer_copy(img, over, false, &fs));
+    TEST_ASSERT_NOT_NULL(fs);
+    TEST_ASSERT(ndfs_is_unaligned(fs));
+    /* Master block / metadata still readable from whole pages. */
+    TEST_ASSERT_OK(ndfs_get_directory_name(fs, dir, sizeof(dir)));
+    /* Forced read-only: a write must be refused even though opened read-write. */
+    TEST_ASSERT_EQUAL(NDFS_ERR_READ_ONLY, ndfs_delete_file(fs, "/NONEXISTENT"));
+
+    ndfs_close(fs);
+    free(img);
+    return 0;
+}
+
+static int test_open_unaligned_under(void)
+{
+    /* One whole page short of TEST_IMAGE_SIZE, then 1024 extra bytes:
+       (TEST_TOTAL_PAGES-1) full pages + 1024 = floors to TEST_TOTAL_PAGES-1. */
+    uint8_t *base = create_test_image();
+    size_t   under = (TEST_IMAGE_SIZE - NDFS_PAGE_SIZE) + 1024;
+    uint8_t *img;
+    ndfs_filesystem_t *fs = NULL;
+
+    TEST_ASSERT_NOT_NULL(base);
+    img = (uint8_t *)calloc(under, 1);
+    TEST_ASSERT_NOT_NULL(img);
+    memcpy(img, base, under);   /* copy only what fits */
+    free(base);
+
+    TEST_ASSERT_OK(ndfs_open_buffer_copy(img, under, true, &fs));
+    TEST_ASSERT_NOT_NULL(fs);
+    TEST_ASSERT(ndfs_is_unaligned(fs));
+
+    ndfs_close(fs);
+    free(img);
+    return 0;
+}
+
+static int test_open_aligned_not_unaligned(void)
+{
+    uint8_t *img = create_test_image();
+    ndfs_filesystem_t *fs = NULL;
+
+    TEST_ASSERT_NOT_NULL(img);
+    TEST_ASSERT_OK(ndfs_open_buffer_copy(img, TEST_IMAGE_SIZE, true, &fs));
+    TEST_ASSERT_NOT_NULL(fs);
+    TEST_ASSERT(!ndfs_is_unaligned(fs));
+
+    ndfs_close(fs);
+    free(img);
     return 0;
 }
 
@@ -907,7 +967,9 @@ void run_filesystem_tests(void)
     RUN_TEST(test_to_buffer);
     RUN_TEST(test_strerror);
     RUN_TEST(test_open_too_small);
-    RUN_TEST(test_open_not_aligned);
+    RUN_TEST(test_open_unaligned_over);
+    RUN_TEST(test_open_unaligned_under);
+    RUN_TEST(test_open_aligned_not_unaligned);
     RUN_TEST(test_close_null);
     RUN_TEST(test_free_null);
     RUN_TEST(test_overwrite_file);

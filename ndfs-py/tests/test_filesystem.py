@@ -25,9 +25,28 @@ class TestNdfsFileSystemConstructor:
         with pytest.raises(ValueError):
             NdfsFileSystem(bytearray(100))
 
-    def test_throws_on_non_page_aligned_size(self):
-        with pytest.raises(ValueError):
-            NdfsFileSystem(bytearray(3000))
+    def test_opens_unaligned_over_boundary(self):
+        # A valid image plus 1024 trailing bytes (half a page over a boundary)
+        # must still open: the partial page is dropped (floored).
+        image = create_test_image()
+        unaligned = bytearray(image) + bytearray(1024)
+        ndfs = NdfsFileSystem(unaligned)
+        assert ndfs.unaligned is True
+        assert ndfs.get_directory_name() == "TESTDISK"
+        # Forced read-only: writes are refused even though opened read-write.
+        with pytest.raises(IOError):
+            ndfs.delete_file("/NONEXISTENT")
+
+    def test_opens_unaligned_under_boundary(self):
+        # One whole page short, then 1024 extra bytes -> floors down a page.
+        image = create_test_image()
+        unaligned = bytearray(image[: len(image) - NDFS_PAGE_SIZE]) + bytearray(1024)
+        ndfs = NdfsFileSystem(unaligned)
+        assert ndfs.unaligned is True
+
+    def test_aligned_image_not_unaligned(self):
+        ndfs = NdfsFileSystem(create_test_image())
+        assert ndfs.unaligned is False
 
 
 class TestNdfsFileSystemListDirectory:

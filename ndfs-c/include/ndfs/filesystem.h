@@ -280,6 +280,13 @@ ndfs_error_t ndfs_set_file_access(ndfs_filesystem_t *fs, const char *path,
 
 bool ndfs_is_block_used(const ndfs_filesystem_t *fs, uint32_t block_id);
 
+/**
+ * True if the image opened with a byte length that was not a whole multiple of
+ * NDFS_PAGE_SIZE.  The trailing partial page was dropped and the filesystem was
+ * forced read-only.  False for cleanly page-aligned images.
+ */
+bool ndfs_is_unaligned(const ndfs_filesystem_t *fs);
+
 ndfs_error_t ndfs_get_free_pages(const ndfs_filesystem_t *fs, uint32_t *out);
 
 /**

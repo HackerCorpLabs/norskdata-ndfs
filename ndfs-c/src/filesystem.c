@@ -25,6 +25,7 @@ struct ndfs_filesystem {
     size_t              size;
     bool                read_only;
     bool                owns_buffer;
+    bool                unaligned;   /* image size was not a whole multiple of NDFS_PAGE_SIZE */
 
     ndfs_master_block_t master_block;
     ndfs_bit_file_t     bit_file;
@@ -1015,16 +1016,25 @@ static ndfs_error_t open_internal(uint8_t *data, size_t size,
     const uint8_t *page0;
     ndfs_error_t err;
 
+    size_t pages;
+
     if (!data || !out_fs) return NDFS_ERR_NULL_PTR;
     if (size < NDFS_PAGE_SIZE) return NDFS_ERR_TOO_SMALL;
-    if (size % NDFS_PAGE_SIZE != 0) return NDFS_ERR_NOT_ALIGNED;
+
+    /* Tolerate images that aren't a whole multiple of the page size (a common
+       dump artefact): work on whole pages only and drop the trailing partial
+       page, exactly as the reference ndfs does (floor(size / pagesize)). */
+    pages = size / NDFS_PAGE_SIZE;
 
     fs = (struct ndfs_filesystem *)calloc(1, sizeof(*fs));
     if (!fs) return NDFS_ERR_ALLOC;
 
     fs->data        = data;
-    fs->size        = size;
-    fs->read_only   = read_only;
+    fs->size        = pages * NDFS_PAGE_SIZE;   /* working size: whole pages only */
+    fs->unaligned   = (size % NDFS_PAGE_SIZE != 0);
+    /* Refuse mutation of an unaligned image: writing whole pages would not
+       round-trip the dropped tail.  Reads always work. */
+    fs->read_only   = read_only || fs->unaligned;
     fs->owns_buffer = owns_buffer;
 
     /* Parse master block */
@@ -1036,7 +1046,7 @@ static ndfs_error_t open_internal(uint8_t *data, size_t size,
         free(fs);
         return NDFS_ERR_INVALID_IMAGE;
     }
-    fs->master_block.image_size = (uint32_t)(size / NDFS_PAGE_SIZE);
+    fs->master_block.image_size = (uint32_t)pages;
 
     /* Load structures */
     err = load_structures(fs);
@@ -1895,6 +1905,12 @@ bool ndfs_is_block_used(const ndfs_filesystem_t *fs, uint32_t block_id)
 {
     if (!fs) return false;
     return ndfs_bf_is_used(&fs->bit_file, block_id);
+}
+
+bool ndfs_is_unaligned(const ndfs_filesystem_t *fs)
+{
+    if (!fs) return false;
+    return fs->unaligned;
 }
 
 ndfs_error_t ndfs_get_free_pages(const ndfs_filesystem_t *fs, uint32_t *out)

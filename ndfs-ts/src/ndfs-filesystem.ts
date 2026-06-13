@@ -55,6 +55,7 @@ export interface FriendInfo {
 export class NdfsFileSystem {
   private data: Uint8Array;
   private readOnly: boolean;
+  private _unaligned: boolean = false;
   private masterBlock: MasterBlock;
   private bitFile: BitFile = new BitFile();
   private userFile: UserFile = new UserFile();
@@ -62,7 +63,8 @@ export class NdfsFileSystem {
 
   /**
    * Open an NDFS disk image from a buffer.
-   * @param data - The raw disk image bytes (must be a multiple of 2048).
+   * @param data - The raw disk image bytes. A trailing partial page (size not a
+   *   whole multiple of 2048) is dropped and the image opens read-only.
    * @param readOnly - If true, write operations will throw.
    */
   constructor(data: Uint8Array | ArrayBuffer, readOnly: boolean = false) {
@@ -78,8 +80,16 @@ export class NdfsFileSystem {
     if (this.data.length < NDFS_PAGE_SIZE) {
       throw new Error('Image too small: must be at least one NDFS page (2048 bytes)');
     }
-    if (this.data.length % NDFS_PAGE_SIZE !== 0) {
-      throw new Error('Image size must be a multiple of NDFS page size (2048 bytes)');
+
+    // Tolerate images whose byte length is not a whole multiple of the page
+    // size (a common dump artefact): work on whole pages only and drop the
+    // trailing partial page, exactly as the reference ndfs does. Such images
+    // are forced read-only so writing whole pages cannot lose the dropped tail.
+    this._unaligned = this.data.length % NDFS_PAGE_SIZE !== 0;
+    const pages = Math.floor(this.data.length / NDFS_PAGE_SIZE);
+    if (this._unaligned) {
+      this.data = this.data.subarray(0, pages * NDFS_PAGE_SIZE);
+      this.readOnly = true;
     }
 
     // Parse master block
@@ -88,7 +98,7 @@ export class NdfsFileSystem {
     if (!this.masterBlock.isValid()) {
       throw new Error('Invalid NDFS master block');
     }
-    this.masterBlock.imageSize = this.data.length / NDFS_PAGE_SIZE;
+    this.masterBlock.imageSize = pages;
 
     // Load filesystem structures
     this.loadStructures();
@@ -481,6 +491,15 @@ export class NdfsFileSystem {
 
   isBlockUsed(blockId: number): boolean {
     return this.bitFile.isBlockUsed(blockId);
+  }
+
+  /**
+   * True if the image size was not a whole multiple of the page size. The
+   * trailing partial page was dropped and the filesystem forced read-only.
+   * False for cleanly page-aligned images.
+   */
+  get unaligned(): boolean {
+    return this._unaligned;
   }
 
   getFreePages(): number {

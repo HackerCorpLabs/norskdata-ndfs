@@ -92,8 +92,30 @@ describe('NdfsFileSystem', () => {
       expect(() => new NdfsFileSystem(new Uint8Array(100))).toThrow();
     });
 
-    it('throws on non-page-aligned size', () => {
-      expect(() => new NdfsFileSystem(new Uint8Array(3000))).toThrow();
+    it('opens unaligned image (over a boundary) and drops the partial page', () => {
+      // A valid image plus 1024 trailing bytes (half a page over a boundary).
+      const image = createTestImage();
+      const unaligned = new Uint8Array(image.length + 1024);
+      unaligned.set(image);
+      const ndfs = new NdfsFileSystem(unaligned);
+      expect(ndfs.unaligned).toBe(true);
+      expect(ndfs.getDirectoryName()).toBe('TESTDISK');
+      // Forced read-only: writes refused even though opened read-write.
+      expect(() => ndfs.deleteFile('/NONEXISTENT')).toThrow();
+    });
+
+    it('opens unaligned image (under a boundary)', () => {
+      const image = createTestImage();
+      const trimmed = image.subarray(0, image.length - NDFS_PAGE_SIZE);
+      const unaligned = new Uint8Array(trimmed.length + 1024);
+      unaligned.set(trimmed);
+      const ndfs = new NdfsFileSystem(unaligned);
+      expect(ndfs.unaligned).toBe(true);
+    });
+
+    it('aligned image is not flagged unaligned', () => {
+      const ndfs = new NdfsFileSystem(createTestImage());
+      expect(ndfs.unaligned).toBe(false);
     });
   });
 

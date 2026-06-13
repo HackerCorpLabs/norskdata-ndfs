@@ -52,7 +52,8 @@ class NdfsFileSystem:
     """Main class for reading and writing NDFS disk images.
 
     Args:
-        data: The raw disk image bytes (must be a multiple of 2048).
+        data: The raw disk image bytes. A trailing partial page (size not a
+            whole multiple of 2048) is dropped and the image opens read-only.
         read_only: If True, write operations will raise an error.
     """
 
@@ -67,15 +68,23 @@ class NdfsFileSystem:
 
         if len(self._data) < NDFS_PAGE_SIZE:
             raise ValueError("Image too small: must be at least one NDFS page (2048 bytes)")
-        if len(self._data) % NDFS_PAGE_SIZE != 0:
-            raise ValueError("Image size must be a multiple of NDFS page size (2048 bytes)")
+
+        # Tolerate images whose byte length is not a whole multiple of the page
+        # size (a common dump artefact): work on whole pages only and drop the
+        # trailing partial page, exactly as the reference ndfs does. Such images
+        # are forced read-only so writing whole pages cannot lose the dropped tail.
+        self._unaligned: bool = len(self._data) % NDFS_PAGE_SIZE != 0
+        pages = len(self._data) // NDFS_PAGE_SIZE
+        if self._unaligned:
+            self._data = self._data[: pages * NDFS_PAGE_SIZE]
+            self._read_only = True
 
         # Parse master block
         page0 = self._read_page(0)
         self._master_block: MasterBlock = MasterBlock.from_bytes(page0)
         if not self._master_block.is_valid():
             raise ValueError("Invalid NDFS master block")
-        self._master_block.image_size = len(self._data) // NDFS_PAGE_SIZE
+        self._master_block.image_size = pages
 
         self._bit_file: BitFile = BitFile()
         self._user_file: UserFile = UserFile()
@@ -472,6 +481,15 @@ class NdfsFileSystem:
 
     def is_block_used(self, block_id: int) -> bool:
         return self._bit_file.is_block_used(block_id)
+
+    @property
+    def unaligned(self) -> bool:
+        """True if the image size was not a whole multiple of the page size.
+
+        The trailing partial page was dropped and the filesystem forced
+        read-only. False for cleanly page-aligned images.
+        """
+        return self._unaligned
 
     def get_free_pages(self) -> int:
         return self._bit_file.get_free_pages()
