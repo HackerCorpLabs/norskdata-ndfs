@@ -13,6 +13,7 @@ int tf_tests_failed = 0;
 
 /* Suite declarations */
 extern void run_endian_tests(void);
+extern void run_nd_time_tests(void);
 extern void run_block_pointer_tests(void);
 extern void run_master_block_tests(void);
 extern void run_bit_file_tests(void);
@@ -34,6 +35,7 @@ int main(void)
     printf("========================================\n");
 
     run_endian_tests();
+    run_nd_time_tests();
     run_block_pointer_tests();
     run_master_block_tests();
     run_bit_file_tests();

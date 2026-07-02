@@ -10,6 +10,7 @@
 #define NDFS_H
 
 #include "types.h"
+#include "nd_time.h"
 #include "block_pointer.h"
 #include "master_block.h"
 #include "bit_file.h"

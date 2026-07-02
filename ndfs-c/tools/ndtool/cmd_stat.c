@@ -22,22 +22,14 @@ static int ci_equal(const char *a, const char *b)
     return *a == *b;
 }
 
-/* Format an ND-100 packed timestamp (32-bit) as "YYYY-MM-DD HH:MM:SS".
- *   bits 31-26 year (+1950), 25-22 month, 21-17 day,
- *   bits 16-12 hour, 11-6 minute, 5-0 second.
- * A zero value renders as the 1950 epoch (matching the reference ndfs tool). */
+/* Format an ND-100 packed timestamp (32-bit) as "YYYY-MM-DD HH:MM:SS", or
+ * "(not set)" for a raw value of 0. Thin wrapper over the library's
+ * ndfs_nd_time_format (ndfs/nd_time.h) — the actual bit-layout decode lives
+ * there in exactly one place, shared with the RetroFS.NDFS (C#) and
+ * ndfs-py/ndfs-ts ports of this same format. */
 void ndtool_format_nd_date(uint32_t v, char *out, size_t len)
 {
-    unsigned year  = 1950 + ((v >> 26) & 0x3F);
-    unsigned month = (v >> 22) & 0x0F;
-    unsigned day   = (v >> 17) & 0x1F;
-    unsigned hour  = (v >> 12) & 0x1F;
-    unsigned min   = (v >> 6) & 0x3F;
-    unsigned sec   = v & 0x3F;
-    if (month == 0) month = 1;
-    if (day == 0) day = 1;
-    snprintf(out, len, "%04u-%02u-%02u %02u:%02u:%02u",
-             year, month, day, hour, min, sec);
+    ndfs_nd_time_format(v, out, len);
 }
 
 /* Decode one 5-bit access tier into a human list, e.g. "READ, WRITE". */

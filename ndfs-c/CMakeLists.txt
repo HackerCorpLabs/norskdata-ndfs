@@ -9,6 +9,7 @@ set(CMAKE_C_EXTENSIONS OFF)
 
 set(NDFS_SOURCES
     src/endian_util.c
+    src/nd_time.c
     src/ndfs_name.c
     src/block_pointer.c
     src/master_block.c
@@ -45,6 +46,7 @@ enable_testing()
 set(TEST_SOURCES
     tests/test_main.c
     tests/test_endian.c
+    tests/test_nd_time.c
     tests/test_block_pointer.c
     tests/test_master_block.c
     tests/test_bit_file.c
