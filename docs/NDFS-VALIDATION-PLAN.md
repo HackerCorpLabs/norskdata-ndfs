@@ -241,8 +241,19 @@ For each divergence the matrix surfaces:
 - ✅ `--rm`/delete: dispatch (`-f`), slot clearing, and **whole-emptied page
   zeroing** — deleted files no longer reappear, in C/TS/PY.
 - ✅ `--dest` honored with a bare name (C).
-- ✅ **>512-page files** rejected in C/PY (were corrupting the adjacent block);
-  TS uses sub-indexed.
+- ✅ **>512-page files** now use a real sub-indexed layout in C/PY (previously
+  rejected outright — a genuine ~1MB write-size cap, not a stub). Ported from
+  TS's already-working `allocateAndWriteData` (sub-index block → one group
+  index block per 512-page group → up to 512 data pages each). Also fixed a
+  related quota-accounting bug found while porting: `update_existing_file`/
+  `_update_existing_file` used a flat "1 structural page" cost, which
+  undercounts (and leaks) free space when overwriting a file that is itself
+  sub-indexed — now scales with the number of group index blocks. New tests
+  in C (`test_write_comprehensive.c`) and PY (`test_subindexed_files.py`)
+  cover the 512/513-page boundary, multi-group round-trips, sparse holes
+  inside a sub-indexed file, delete freeing every structural block, and
+  overwrite not leaking the old structure. Supersedes the old "Sub-indexed
+  file creation in C/PY" open item below.
 - ✅ Object header word preserved on rewrite (used/modified bits).
 - ✅ **Friend management** — list/add/remove a user's friends (the 8 x 2-byte
   RWACD entries at user-entry offset 48). Added `ndfs_list_friends` /
@@ -293,7 +304,6 @@ For each divergence the matrix surfaces:
   delete-clear, and >512 guards to RetroFS too; audit its `UserEntry`/`UserFile`.
 - ☐ **RetroCore** `UserFile.cs:240` `*8` user-slot formula is latently buggy
   for ≥32 users (report upstream; ports already correct).
-- ☐ Sub-indexed file **creation** in C/PY (currently rejected >512 pages).
 - ☐ Real ND creation **date** on new files (currently 0 → `1950-01-01`); needs
   an ND-timestamp encoder in libndfs.
 - ☐ Multi-version create/read — **VERY LOW PRIORITY** (single-version `;1` is

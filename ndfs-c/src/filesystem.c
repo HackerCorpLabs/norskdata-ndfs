@@ -20,6 +20,13 @@
 #define MAX_INTERNAL_USERS   NDFS_MAX_USERS
 #define MAX_INTERNAL_OBJECTS 16384
 
+/* SubIndexed ceiling: 512 group index blocks x 512 data-page pointers each
+ * (NDFS-FORMAT.md "Sub-Indexed (Type 10)"). A sub-index block itself only
+ * has 512 pointer slots, so a file needing more than this many data pages
+ * genuinely cannot be represented and must be rejected. */
+#define NDFS_MAX_OBJECT_FILE_PAGES \
+    ((uint32_t)NDFS_MAX_OBJECT_FILE_PTRS * (uint32_t)NDFS_MAX_OBJECT_FILE_PTRS)
+
 struct ndfs_filesystem {
     uint8_t            *data;
     size_t              size;
@@ -69,6 +76,12 @@ static ndfs_error_t create_new_file(struct ndfs_filesystem *fs,
 static ndfs_error_t update_existing_file(struct ndfs_filesystem *fs,
                                          int obj_idx, int user_idx,
                                          const uint8_t *file_data, size_t file_size);
+static ndfs_error_t allocate_and_write_data(struct ndfs_filesystem *fs,
+                                            const uint8_t *file_data, size_t file_size,
+                                            uint32_t data_pages,
+                                            uint32_t *out_top_block_id,
+                                            ndfs_pointer_type_t *out_pointer_type,
+                                            uint32_t *out_struct_pages);
 static void add_object(struct ndfs_filesystem *fs, const ndfs_object_entry_t *obj);
 static size_t objects_for_user_by_index(const struct ndfs_filesystem *fs, uint8_t idx);
 
@@ -659,25 +672,190 @@ static uint32_t ensure_object_dir_page(struct ndfs_filesystem *fs,
     return blk;
 }
 
+/* Write one data page (sparse-aware) and store its BlockPointer at slot
+ * `slot_in_index` of `index_page_buf` (an already-mapped 2048-byte index
+ * page). A page that is entirely zero and fully within the file is left as
+ * a sparse hole (BlockPointer 0) rather than allocating a real disk block —
+ * this is the exact sparse-hole rule the plain Indexed path already used,
+ * factored out so the SubIndexed path (which needs it per-group) stays in
+ * sync with it instead of duplicating and possibly drifting. */
+static ndfs_error_t write_data_page_to_index(struct ndfs_filesystem *fs,
+                                             const uint8_t *file_data, size_t file_size,
+                                             uint32_t data_page_index,
+                                             uint8_t *index_page_buf,
+                                             uint32_t slot_in_index)
+{
+    size_t page_offset = (size_t)data_page_index * NDFS_PAGE_SIZE;
+    size_t page_end = page_offset + NDFS_PAGE_SIZE;
+    size_t slice_len;
+    bool all_zeros = true;
+    size_t b;
+
+    if (page_end > file_size) page_end = file_size;
+    slice_len = page_end > page_offset ? page_end - page_offset : 0;
+
+    for (b = 0; b < slice_len; b++) {
+        if (file_data[page_offset + b] != 0) {
+            all_zeros = false;
+            break;
+        }
+    }
+
+    if (all_zeros && slice_len == NDFS_PAGE_SIZE) {
+        /* Sparse hole: BlockPointer 0, no disk space consumed. */
+        ndfs_write_u32be(index_page_buf, slot_in_index * 4, 0);
+    } else {
+        uint32_t data_block_id;
+        uint8_t *data_page_buf;
+        ndfs_block_pointer_t data_ptr;
+        ndfs_error_t err;
+
+        err = ndfs_bf_find_free(&fs->bit_file, &data_block_id);
+        if (err != NDFS_OK) return NDFS_ERR_NO_SPACE;
+        ndfs_bf_mark_used(&fs->bit_file, data_block_id);
+
+        data_page_buf = write_page_ptr(fs, data_block_id);
+        if (!data_page_buf) return NDFS_ERR_CORRUPT;
+        memset(data_page_buf, 0, NDFS_PAGE_SIZE);
+        if (slice_len > 0) memcpy(data_page_buf, file_data + page_offset, slice_len);
+
+        data_ptr.block_id = data_block_id;
+        data_ptr.type = NDFS_PTR_CONTIGUOUS;
+        ndfs_bp_to_bytes(&data_ptr, index_page_buf, slot_in_index * 4);
+    }
+    return NDFS_OK;
+}
+
+/* Allocate and write the data-block structure for a file of `data_pages`
+ * pages, choosing between the plain Indexed layout (<=512 pages: one index
+ * block with up to 512 data-page pointers) and the SubIndexed layout (up to
+ * 262,144 pages: a top-level sub-index block pointing at up to 512 group
+ * index blocks, each holding up to 512 data-page pointers) per
+ * NDFS-FORMAT.md "Sub-Indexed (Type 10)". This mirrors the already-audited
+ * TS port's allocateAndWriteData()/writeDataPageToIndex() algorithm shape.
+ *
+ * On success, *out_top_block_id/*out_pointer_type are what the caller must
+ * store as the object entry's file_pointer, and *out_struct_pages is the
+ * number of structural (non-data) pages consumed -- 1 for Indexed, or
+ * 1 + ceil(data_pages/512) for SubIndexed (the sub-index block plus one
+ * group index block per 512-page group) -- which the caller must add to
+ * data_pages for quota/pages_used accounting. */
+static ndfs_error_t allocate_and_write_data(struct ndfs_filesystem *fs,
+                                            const uint8_t *file_data, size_t file_size,
+                                            uint32_t data_pages,
+                                            uint32_t *out_top_block_id,
+                                            ndfs_pointer_type_t *out_pointer_type,
+                                            uint32_t *out_struct_pages)
+{
+    ndfs_error_t err;
+    uint32_t i;
+
+    if (data_pages > NDFS_MAX_OBJECT_FILE_PAGES) return NDFS_ERR_NO_SPACE;
+
+    if (data_pages <= NDFS_MAX_OBJECT_FILE_PTRS) {
+        /* Plain Indexed: a single index block holds all data-page pointers. */
+        uint32_t index_block_id;
+        uint8_t *index_page_buf;
+
+        err = ndfs_bf_find_free(&fs->bit_file, &index_block_id);
+        if (err != NDFS_OK) return NDFS_ERR_NO_SPACE;
+        ndfs_bf_mark_used(&fs->bit_file, index_block_id);
+
+        index_page_buf = write_page_ptr(fs, index_block_id);
+        if (!index_page_buf) return NDFS_ERR_CORRUPT;
+        memset(index_page_buf, 0, NDFS_PAGE_SIZE);
+
+        for (i = 0; i < data_pages; i++) {
+            err = write_data_page_to_index(fs, file_data, file_size, i,
+                                           index_page_buf, i);
+            if (err != NDFS_OK) return err;
+        }
+
+        *out_top_block_id = index_block_id;
+        *out_pointer_type = NDFS_PTR_INDEXED;
+        *out_struct_pages = 1;
+        return NDFS_OK;
+    }
+
+    /* SubIndexed: sub-index block -> ceil(data_pages/512) group index
+     * blocks -> up to 512 data pages each. */
+    {
+        uint32_t sub_index_block_id;
+        uint8_t *sub_index_buf;
+        uint32_t num_index_blocks =
+            (data_pages + NDFS_MAX_OBJECT_FILE_PTRS - 1) / NDFS_MAX_OBJECT_FILE_PTRS;
+        uint32_t struct_pages = 1; /* the sub-index block itself */
+        uint32_t si;
+
+        err = ndfs_bf_find_free(&fs->bit_file, &sub_index_block_id);
+        if (err != NDFS_OK) return NDFS_ERR_NO_SPACE;
+        ndfs_bf_mark_used(&fs->bit_file, sub_index_block_id);
+
+        /* write_page_ptr() returns a pointer straight into fs->data, which is
+         * a fixed-size buffer for the lifetime of the filesystem (never
+         * reallocated), so this pointer stays valid across the allocations
+         * below -- no need to re-fetch it after allocating group blocks. */
+        sub_index_buf = write_page_ptr(fs, sub_index_block_id);
+        if (!sub_index_buf) return NDFS_ERR_CORRUPT;
+        memset(sub_index_buf, 0, NDFS_PAGE_SIZE);
+
+        for (si = 0; si < num_index_blocks; si++) {
+            uint32_t idx_block_id;
+            uint8_t *idx_page_buf;
+            ndfs_block_pointer_t idx_ptr;
+            uint32_t start_page = si * NDFS_MAX_OBJECT_FILE_PTRS;
+            uint32_t end_page = start_page + NDFS_MAX_OBJECT_FILE_PTRS;
+            uint32_t p;
+
+            if (end_page > data_pages) end_page = data_pages;
+
+            err = ndfs_bf_find_free(&fs->bit_file, &idx_block_id);
+            if (err != NDFS_OK) return NDFS_ERR_NO_SPACE;
+            ndfs_bf_mark_used(&fs->bit_file, idx_block_id);
+            struct_pages++;
+
+            idx_ptr.block_id = idx_block_id;
+            idx_ptr.type = NDFS_PTR_CONTIGUOUS;
+            ndfs_bp_to_bytes(&idx_ptr, sub_index_buf, si * 4);
+
+            idx_page_buf = write_page_ptr(fs, idx_block_id);
+            if (!idx_page_buf) return NDFS_ERR_CORRUPT;
+            memset(idx_page_buf, 0, NDFS_PAGE_SIZE);
+
+            for (p = start_page; p < end_page; p++) {
+                err = write_data_page_to_index(fs, file_data, file_size, p,
+                                               idx_page_buf, p - start_page);
+                if (err != NDFS_OK) return err;
+            }
+        }
+
+        *out_top_block_id = sub_index_block_id;
+        *out_pointer_type = NDFS_PTR_SUBINDEXED;
+        *out_struct_pages = struct_pages;
+        return NDFS_OK;
+    }
+}
+
 static ndfs_error_t create_new_file(struct ndfs_filesystem *fs,
                                     const char *obj_name, const char *file_type,
                                     int user_slot,
                                     const uint8_t *file_data, size_t file_size)
 {
     uint32_t data_pages = (uint32_t)((file_size + NDFS_PAGE_SIZE - 1) / NDFS_PAGE_SIZE);
-    uint32_t index_block_id;
-    uint8_t *index_page_buf;
-    uint32_t i;
+    uint32_t top_block_id;
+    ndfs_pointer_type_t pointer_type;
+    uint32_t struct_pages;
     uint32_t obj_index;
     int slot;
     ndfs_object_entry_t entry;
     ndfs_error_t err;
 
     if (data_pages == 0) data_pages = 1;
-    /* A single indexed block holds 512 data-page pointers; larger files need a
-     * sub-indexed layout (not yet implemented here). Reject rather than write
-     * pointers past the index page and corrupt the adjacent block. */
-    if (data_pages > NDFS_MAX_OBJECT_FILE_PTRS) return NDFS_ERR_NO_SPACE;
+    /* NDFS_MAX_OBJECT_FILE_PAGES (262,144) is the true ceiling: a SubIndexed
+     * sub-index block only has 512 pointer slots, so beyond that the file
+     * genuinely cannot be represented. allocate_and_write_data() also checks
+     * this, but bail out early before touching the object table. */
+    if (data_pages > NDFS_MAX_OBJECT_FILE_PAGES) return NDFS_ERR_NO_SPACE;
 
     /* Choose the object slot inside the OWNING USER's region (SINTRAN
      * partitions the object file: user U owns slots U*256..U*256+255 and the
@@ -688,55 +866,12 @@ static ndfs_error_t create_new_file(struct ndfs_filesystem *fs,
     obj_index = (uint32_t)slot;
     if (ensure_object_dir_page(fs, obj_index) == 0) return NDFS_ERR_NO_SPACE;
 
-    /* Allocate index block */
-    err = ndfs_bf_find_free(&fs->bit_file, &index_block_id);
-    if (err != NDFS_OK) return NDFS_ERR_NO_SPACE;
-    ndfs_bf_mark_used(&fs->bit_file, index_block_id);
-
-    /* Write index + data blocks */
-    index_page_buf = write_page_ptr(fs, index_block_id);
-    if (!index_page_buf) return NDFS_ERR_CORRUPT;
-    memset(index_page_buf, 0, NDFS_PAGE_SIZE);
-
-    for (i = 0; i < data_pages; i++) {
-        size_t page_offset = (size_t)i * NDFS_PAGE_SIZE;
-        size_t page_end = page_offset + NDFS_PAGE_SIZE;
-        size_t slice_len;
-        bool all_zeros = true;
-        size_t b;
-        uint32_t data_block_id;
-        uint8_t *data_page_buf;
-        ndfs_block_pointer_t data_ptr;
-
-        if (page_end > file_size) page_end = file_size;
-        slice_len = page_end > page_offset ? page_end - page_offset : 0;
-
-        /* Check for sparse (all zeros) */
-        for (b = 0; b < slice_len; b++) {
-            if (file_data[page_offset + b] != 0) {
-                all_zeros = false;
-                break;
-            }
-        }
-
-        if (all_zeros && slice_len == NDFS_PAGE_SIZE) {
-            /* Sparse hole */
-            ndfs_write_u32be(index_page_buf, i * 4, 0);
-        } else {
-            err = ndfs_bf_find_free(&fs->bit_file, &data_block_id);
-            if (err != NDFS_OK) return NDFS_ERR_NO_SPACE;
-            ndfs_bf_mark_used(&fs->bit_file, data_block_id);
-
-            data_page_buf = write_page_ptr(fs, data_block_id);
-            if (!data_page_buf) return NDFS_ERR_CORRUPT;
-            memset(data_page_buf, 0, NDFS_PAGE_SIZE);
-            if (slice_len > 0) memcpy(data_page_buf, file_data + page_offset, slice_len);
-
-            data_ptr.block_id = data_block_id;
-            data_ptr.type = NDFS_PTR_CONTIGUOUS;
-            ndfs_bp_to_bytes(&data_ptr, index_page_buf, i * 4);
-        }
-    }
+    /* Allocate + write the data-block structure: plain Indexed for
+     * <=512 pages, or SubIndexed (sub-index -> group index blocks -> data
+     * pages) for larger files. */
+    err = allocate_and_write_data(fs, file_data, file_size, data_pages,
+                                  &top_block_id, &pointer_type, &struct_pages);
+    if (err != NDFS_OK) return err;
 
     /* Create object entry */
     ndfs_oe_init(&entry);
@@ -759,11 +894,11 @@ static ndfs_error_t create_new_file(struct ndfs_filesystem *fs,
     memcpy(entry.user_name, fs->users[user_slot].user_name, NDFS_NAME_MAX + 1);
     entry.pages_in_file = data_pages;
     entry.bytes_in_file = file_size > 0 ? (uint32_t)file_size : 1;
-    entry.file_pointer.block_id = index_block_id;
-    entry.file_pointer.type = NDFS_PTR_INDEXED;
+    entry.file_pointer.block_id = top_block_id;
+    entry.file_pointer.type = pointer_type;
     /* Sensible defaults for a freshly-created file: owner (and friends) get
-     * full rights, and the allocation type flag reflects the indexed layout
-     * used here. */
+     * full rights. No separate SubIndexed file-type-flag bit exists (mirrors
+     * the TS port), so FT_INDEXED covers both Indexed and SubIndexed layouts. */
     entry.access_bits = NDFS_ACCESS_DEFAULT;
     entry.file_type_flags = NDFS_FT_INDEXED;
     /* object_index already encodes [user|fileEntry] (it was chosen inside the
@@ -775,8 +910,8 @@ static ndfs_error_t create_new_file(struct ndfs_filesystem *fs,
 
     add_object(fs, &entry);
 
-    /* Update user pages used */
-    fs->users[user_slot].pages_used += data_pages + 1;
+    /* Update user pages used (data pages + structural index/sub-index pages) */
+    fs->users[user_slot].pages_used += data_pages + struct_pages;
 
     /* Surgical writes: the new object's directory page, the owner's user page,
      * and the allocation bitmap. Index/data blocks were written above. */
@@ -792,10 +927,32 @@ static ndfs_error_t update_existing_file(struct ndfs_filesystem *fs,
                                          const uint8_t *file_data, size_t file_size)
 {
     ndfs_object_entry_t *existing = &fs->objects[obj_idx];
-    uint32_t old_total = existing->pages_in_file + 1;
-    uint32_t data_pages, index_block_id, i;
-    uint8_t *index_page_buf;
+    /* The old structural cost is 1 page (a plain index block) UNLESS the
+     * existing file is itself SubIndexed, in which case it is the sub-index
+     * block plus one group index block per already-allocated 512-page group.
+     * Undercounting this (as a flat "+1" would) understates freed pages on
+     * overwrite and leaks quota/free-space across repeated writes to a large
+     * file -- the exact leak class already found and fixed in the C# port's
+     * AllocateFileBlocksSparse. */
+    uint32_t old_struct_pages = 1;
+    uint32_t old_total;
+    uint32_t data_pages;
+    uint32_t top_block_id;
+    ndfs_pointer_type_t pointer_type;
+    uint32_t struct_pages;
     ndfs_error_t err;
+
+    if (existing->file_pointer.type == NDFS_PTR_SUBINDEXED) {
+        old_struct_pages = 1 +
+            (existing->pages_in_file + NDFS_MAX_OBJECT_FILE_PTRS - 1) / NDFS_MAX_OBJECT_FILE_PTRS;
+    }
+    old_total = existing->pages_in_file + old_struct_pages;
+
+    /* Validate the new size BEFORE freeing the old blocks, so a rejected
+     * write leaves the existing file (and its accounting) untouched. */
+    data_pages = (uint32_t)((file_size + NDFS_PAGE_SIZE - 1) / NDFS_PAGE_SIZE);
+    if (data_pages == 0) data_pages = 1;
+    if (data_pages > NDFS_MAX_OBJECT_FILE_PAGES) return NDFS_ERR_NO_SPACE;
 
     /* Free old blocks */
     free_file_blocks(fs, existing);
@@ -803,71 +960,23 @@ static ndfs_error_t update_existing_file(struct ndfs_filesystem *fs,
         fs->users[user_slot].pages_used >= old_total
             ? fs->users[user_slot].pages_used - old_total : 0;
 
-    /* Allocate new */
-    data_pages = (uint32_t)((file_size + NDFS_PAGE_SIZE - 1) / NDFS_PAGE_SIZE);
-    if (data_pages == 0) data_pages = 1;
-    /* A single indexed block holds 512 data-page pointers; larger files need a
-     * sub-indexed layout (not yet implemented here). Reject rather than write
-     * pointers past the index page and corrupt the adjacent block. */
-    if (data_pages > NDFS_MAX_OBJECT_FILE_PTRS) return NDFS_ERR_NO_SPACE;
-
-    err = ndfs_bf_find_free(&fs->bit_file, &index_block_id);
-    if (err != NDFS_OK) return NDFS_ERR_NO_SPACE;
-    ndfs_bf_mark_used(&fs->bit_file, index_block_id);
-
-    index_page_buf = write_page_ptr(fs, index_block_id);
-    if (!index_page_buf) return NDFS_ERR_CORRUPT;
-    memset(index_page_buf, 0, NDFS_PAGE_SIZE);
-
-    for (i = 0; i < data_pages; i++) {
-        size_t page_offset = (size_t)i * NDFS_PAGE_SIZE;
-        size_t page_end = page_offset + NDFS_PAGE_SIZE;
-        size_t slice_len;
-        bool all_zeros = true;
-        size_t b;
-
-        if (page_end > file_size) page_end = file_size;
-        slice_len = page_end > page_offset ? page_end - page_offset : 0;
-
-        for (b = 0; b < slice_len; b++) {
-            if (file_data[page_offset + b] != 0) {
-                all_zeros = false;
-                break;
-            }
-        }
-
-        if (all_zeros && slice_len == NDFS_PAGE_SIZE) {
-            ndfs_write_u32be(index_page_buf, i * 4, 0);
-        } else {
-            uint32_t data_block_id;
-            uint8_t *data_page_buf;
-            ndfs_block_pointer_t data_ptr;
-
-            err = ndfs_bf_find_free(&fs->bit_file, &data_block_id);
-            if (err != NDFS_OK) return NDFS_ERR_NO_SPACE;
-            ndfs_bf_mark_used(&fs->bit_file, data_block_id);
-
-            data_page_buf = write_page_ptr(fs, data_block_id);
-            if (!data_page_buf) return NDFS_ERR_CORRUPT;
-            memset(data_page_buf, 0, NDFS_PAGE_SIZE);
-            if (slice_len > 0) memcpy(data_page_buf, file_data + page_offset, slice_len);
-
-            data_ptr.block_id = data_block_id;
-            data_ptr.type = NDFS_PTR_CONTIGUOUS;
-            ndfs_bp_to_bytes(&data_ptr, index_page_buf, i * 4);
-        }
-    }
+    /* Allocate + write the new data-block structure: plain Indexed for
+     * <=512 pages, or SubIndexed for larger files. */
+    err = allocate_and_write_data(fs, file_data, file_size, data_pages,
+                                  &top_block_id, &pointer_type, &struct_pages);
+    if (err != NDFS_OK) return err;
 
     /* Update existing entry */
     existing->pages_in_file = data_pages;
     existing->bytes_in_file = file_size > 0 ? (uint32_t)file_size : 1;
-    existing->file_pointer.block_id = index_block_id;
-    existing->file_pointer.type = NDFS_PTR_INDEXED;
-    /* Rewritten as an indexed file; keep the allocation flag consistent.
-     * Access bits, dates and versioning are intentionally preserved. */
+    existing->file_pointer.block_id = top_block_id;
+    existing->file_pointer.type = pointer_type;
+    /* No separate SubIndexed file-type-flag bit exists (mirrors the TS port,
+     * which also uses FT_INDEXED for any non-contiguous layout); access bits,
+     * dates and versioning are intentionally preserved. */
     existing->file_type_flags = NDFS_FT_INDEXED;
 
-    fs->users[user_slot].pages_used += data_pages + 1;
+    fs->users[user_slot].pages_used += data_pages + struct_pages;
 
     /* Surgical writes: the file's object page, the owner's user page, and the
      * allocation bitmap (old blocks freed + new blocks allocated above). */
@@ -1323,17 +1432,30 @@ ndfs_error_t ndfs_write_file(ndfs_filesystem_t *fs,
     if (user_slot < 0) return NDFS_ERR_NOT_FOUND;
     user = &fs->users[user_slot];
 
-    /* Calculate required pages */
+    /* Calculate required pages (data pages + structural index/sub-index
+     * pages). A file needing more than one index block's worth of pointers
+     * (>512 pages) will be laid out SubIndexed: 1 sub-index block plus one
+     * group index block per 512-page group -- mirrors the TS port's
+     * writeFile() quota pre-check (indexBlocks calculation). */
     data_pages = (uint32_t)((file_size + NDFS_PAGE_SIZE - 1) / NDFS_PAGE_SIZE);
     if (data_pages == 0) data_pages = 1;
-    total_required = data_pages + 1;
+    {
+        uint32_t struct_pages_needed = data_pages > NDFS_MAX_OBJECT_FILE_PTRS
+            ? 1 + (data_pages + NDFS_MAX_OBJECT_FILE_PTRS - 1) / NDFS_MAX_OBJECT_FILE_PTRS
+            : 1;
+        total_required = data_pages + struct_pages_needed;
+    }
 
     /* Check for existing file */
     existing_idx = find_object(fs, path);
     additional_needed = total_required;
 
     if (existing_idx >= 0) {
-        uint32_t existing_total = fs->objects[existing_idx].pages_in_file + 1;
+        const ndfs_object_entry_t *existing = &fs->objects[existing_idx];
+        uint32_t existing_struct_pages = existing->file_pointer.type == NDFS_PTR_SUBINDEXED
+            ? 1 + (existing->pages_in_file + NDFS_MAX_OBJECT_FILE_PTRS - 1) / NDFS_MAX_OBJECT_FILE_PTRS
+            : 1;
+        uint32_t existing_total = existing->pages_in_file + existing_struct_pages;
         additional_needed = total_required > existing_total
             ? total_required - existing_total : 0;
     }
@@ -1382,9 +1504,15 @@ ndfs_error_t ndfs_delete_file(ndfs_filesystem_t *fs, const char *path)
     user_slot = find_user_by_index(fs, obj->user_index);
     if (user_slot >= 0) {
         total_blocks = obj->pages_in_file;
-        if (obj->file_pointer.type == NDFS_PTR_INDEXED ||
-            obj->file_pointer.type == NDFS_PTR_SUBINDEXED) {
+        if (obj->file_pointer.type == NDFS_PTR_INDEXED) {
             total_blocks += 1;
+        } else if (obj->file_pointer.type == NDFS_PTR_SUBINDEXED) {
+            /* Sub-index block + one group index block per already-allocated
+             * 512-page group (mirrors the accounting used when the file was
+             * created/updated) -- a flat "+1" would undercount and leave
+             * pages_used permanently inflated after deleting a large file. */
+            total_blocks += 1 +
+                (obj->pages_in_file + NDFS_MAX_OBJECT_FILE_PTRS - 1) / NDFS_MAX_OBJECT_FILE_PTRS;
         }
         if (fs->users[user_slot].pages_used >= total_blocks)
             fs->users[user_slot].pages_used -= total_blocks;

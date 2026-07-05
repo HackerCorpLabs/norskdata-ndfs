@@ -241,11 +241,13 @@ class NdfsFileSystem:
         if user is None:
             raise ValueError(f"User not found: {user_name or '(default)'}")
 
-        # Calculate required pages (data pages + 1 index block)
+        # Calculate required pages (data pages + structural index/sub-index
+        # pages -- 1 for a plain Indexed file, or numGroups+1 for a
+        # SubIndexed file over 512 pages; see _structural_pages_for).
         data_pages = math.ceil(len(file_data) / NDFS_PAGE_SIZE)
         if data_pages == 0:
             data_pages = 1
-        total_required = data_pages + 1  # +1 for index block
+        total_required = data_pages + self._structural_pages_for(data_pages)
 
         # Check for existing file
         existing = self._object_file.find_object(object_name, user.user_name)
@@ -253,7 +255,7 @@ class NdfsFileSystem:
         # Determine additional pages needed
         additional_needed = total_required
         if existing is not None:
-            existing_total = existing.pages_in_file + 1
+            existing_total = existing.pages_in_file + self._structural_pages_for(existing.pages_in_file)
             additional_needed = total_required - existing_total if total_required > existing_total else 0
 
         # Check and expand quota if needed
@@ -299,7 +301,9 @@ class NdfsFileSystem:
                     or obj.file_pointer.type == PointerType.SubIndexed
                 )
             ):
-                total_blocks += 1  # index block
+                # Index block (Indexed) or group index blocks + sub-index
+                # block (SubIndexed) -- see _structural_pages_for.
+                total_blocks += self._structural_pages_for(obj.pages_in_file)
             user.pages_used = user.pages_used - total_blocks if user.pages_used >= total_blocks else 0
 
         # Surgical writes: capture index/owner before removal, then rewrite the
@@ -707,6 +711,144 @@ class NdfsFileSystem:
                 bitmap_data[i * NDFS_PAGE_SIZE:(i + 1) * NDFS_PAGE_SIZE] = page
             self._bit_file.load_bitmap(bitmap_data[:bitmap_bytes])
 
+    def _structural_pages_for(self, data_pages: int) -> int:
+        """Return the number of *structural* (non-data) pages a file's block
+        pointer tree costs, for quota/pages_used accounting.
+
+        - Plain Indexed layout (<=512 data pages): 1 page (the single index
+          block).
+        - SubIndexed layout (>512 data pages): one group index block per
+          512-page group, plus one top-level sub-index block pointing at
+          those group index blocks. E.g. 1000 pages -> ceil(1000/512) = 2
+          group index blocks + 1 sub-index block = 3 structural pages.
+        """
+        if data_pages <= MAX_OBJECT_FILE_POINTERS:
+            return 1
+        num_index_blocks = math.ceil(data_pages / MAX_OBJECT_FILE_POINTERS)
+        return num_index_blocks + 1  # + top-level sub-index block
+
+    def _write_data_page_to_index(
+        self,
+        file_data: Union[bytes, bytearray, memoryview],
+        data_page_index: int,
+        index_page: bytearray,
+        slot_in_index: int,
+    ) -> None:
+        """Write one data page (sparse-aware) and record its pointer in
+        `index_page` at `slot_in_index`. Shared by both the plain Indexed
+        allocation loop and each group's index block under a SubIndexed
+        layout, so sparse-hole handling is identical in both layouts."""
+        page_offset = data_page_index * NDFS_PAGE_SIZE
+        page_end = min(page_offset + NDFS_PAGE_SIZE, len(file_data))
+        page_slice = file_data[page_offset:page_end]
+
+        # Check if page is all zeros (sparse)
+        all_zeros = True
+        for b in range(len(page_slice)):
+            if page_slice[b] != 0:
+                all_zeros = False
+                break
+
+        if all_zeros and len(page_slice) == NDFS_PAGE_SIZE:
+            # Sparse hole: write block_id=0 to index (no disk block allocated)
+            write_uint32_be(index_page, slot_in_index * 4, 0)
+        else:
+            # Allocate data block
+            data_block_id = self._bit_file.find_first_free_block()
+            if data_block_id < 0:
+                raise IOError("No free blocks for data")
+            self._bit_file.mark_block_used(data_block_id)
+
+            # Write data to page
+            data_page = bytearray(NDFS_PAGE_SIZE)
+            data_page[:len(page_slice)] = page_slice
+            self._write_page(data_block_id, data_page)
+
+            # Write pointer to index block
+            data_ptr = BlockPointer(data_block_id, PointerType.Contiguous)
+            data_ptr.to_bytes(index_page, slot_in_index * 4)
+
+    def _allocate_and_write_data(
+        self, file_data: Union[bytes, bytearray, memoryview], data_pages: int
+    ) -> Tuple[int, "PointerType", int]:
+        """Allocate blocks and write file data to disk.
+
+        Returns (top_block_id, pointer_type, structural_pages_used):
+        - top_block_id: block id of the top-level index or sub-index block
+          (this becomes the object entry's file_pointer.block_id).
+        - pointer_type: PointerType.Indexed or PointerType.SubIndexed,
+          depending on whether the file fits in a single 512-pointer index
+          block.
+        - structural_pages_used: number of non-data pages consumed (1 for
+          Indexed; numIndexBlocks+1 for SubIndexed) -- matches
+          `_structural_pages_for(data_pages)` and is used by callers for
+          pages_used accounting.
+
+        Files up to MAX_OBJECT_FILE_POINTERS (512) data pages use a single
+        Indexed index block (as before). Larger files (up to
+        512*512 = 262144 data pages, ~512MB) use a SubIndexed layout: a
+        top-level sub-index block holding up to 512 pointers to *group*
+        index blocks, each of which holds up to 512 data-block pointers --
+        i.e. exactly the Indexed layout, repeated per 512-page group.
+        """
+        use_sub_indexed = data_pages > MAX_OBJECT_FILE_POINTERS
+
+        if not use_sub_indexed:
+            # Simple indexed allocation (unchanged from before).
+            index_block_id = self._bit_file.find_first_free_block()
+            if index_block_id < 0:
+                raise IOError("No free blocks for index block")
+            self._bit_file.mark_block_used(index_block_id)
+
+            index_page = bytearray(NDFS_PAGE_SIZE)
+            for i in range(data_pages):
+                self._write_data_page_to_index(file_data, i, index_page, i)
+
+            self._write_page(index_block_id, index_page)
+            return index_block_id, PointerType.Indexed, 1
+
+        # SubIndexed allocation: sub-index block -> group index blocks -> data blocks.
+        if data_pages > MAX_OBJECT_FILE_POINTERS * MAX_OBJECT_FILE_POINTERS:
+            raise IOError(
+                "File too large for a sub-indexed object file "
+                f"(>{MAX_OBJECT_FILE_POINTERS * MAX_OBJECT_FILE_POINTERS} pages)"
+            )
+
+        sub_index_block_id = self._bit_file.find_first_free_block()
+        if sub_index_block_id < 0:
+            raise IOError("No free blocks for sub-index block")
+        self._bit_file.mark_block_used(sub_index_block_id)
+
+        sub_index_page = bytearray(NDFS_PAGE_SIZE)
+        # Each group covers up to 512 data pages; the last group may be partial.
+        num_index_blocks = math.ceil(data_pages / MAX_OBJECT_FILE_POINTERS)
+        structural_pages_used = 1  # count the sub-index block itself
+
+        for si in range(num_index_blocks):
+            idx_block_id = self._bit_file.find_first_free_block()
+            if idx_block_id < 0:
+                raise IOError("No free blocks for index block")
+            self._bit_file.mark_block_used(idx_block_id)
+            structural_pages_used += 1
+
+            # Record this group's index block in the top-level sub-index block.
+            idx_ptr = BlockPointer(idx_block_id, PointerType.Contiguous)
+            idx_ptr.to_bytes(sub_index_page, si * 4)
+
+            # Build this group's own index block, covering data pages
+            # [start_page, end_page) of the overall file.
+            index_page = bytearray(NDFS_PAGE_SIZE)
+            start_page = si * MAX_OBJECT_FILE_POINTERS
+            end_page = min(start_page + MAX_OBJECT_FILE_POINTERS, data_pages)
+
+            for i in range(start_page, end_page):
+                self._write_data_page_to_index(file_data, i, index_page, i - start_page)
+
+            self._write_page(idx_block_id, index_page)
+
+        self._write_page(sub_index_block_id, sub_index_page)
+        return sub_index_block_id, PointerType.SubIndexed, structural_pages_used
+
     def _read_object_data(self, obj: ObjectEntry) -> bytearray:
         """Read all data bytes for an object entry."""
         if obj.file_pointer is None or obj.file_pointer.block_id == 0:
@@ -840,10 +982,15 @@ class NdfsFileSystem:
         if data_pages == 0:
             data_pages = 1
         # A single indexed block holds 512 data-page pointers; larger files
-        # need a sub-indexed layout (not implemented here). Reject rather than
-        # write pointers past the index page and corrupt the adjacent block.
-        if data_pages > MAX_OBJECT_FILE_POINTERS:
-            raise IOError("File too large for an indexed object file (>512 pages)")
+        # (up to 512*512 = 262144 pages, ~512MB) use a SubIndexed layout --
+        # see _allocate_and_write_data. Files beyond that ceiling still raise
+        # (a real hardware limit: a sub-index block can only address 512
+        # group index blocks).
+        if data_pages > MAX_OBJECT_FILE_POINTERS * MAX_OBJECT_FILE_POINTERS:
+            raise IOError(
+                "File too large for a sub-indexed object file "
+                f"(>{MAX_OBJECT_FILE_POINTERS * MAX_OBJECT_FILE_POINTERS} pages)"
+            )
 
         # Choose the object slot inside the OWNING USER's region (SINTRAN
         # partitions the object file: user U owns slots U*256..U*256+255 and
@@ -854,48 +1001,11 @@ class NdfsFileSystem:
             raise IOError("User object table is full")
         self._ensure_object_dir_page(obj_index)
 
-        # Allocate index block
-        index_block_id = self._bit_file.find_first_free_block()
-        if index_block_id < 0:
-            raise IOError("No free blocks for index block")
-        self._bit_file.mark_block_used(index_block_id)
-
-        # Allocate data blocks and write data (sparse-aware)
-        index_page = bytearray(NDFS_PAGE_SIZE)
-
-        for i in range(data_pages):
-            page_offset = i * NDFS_PAGE_SIZE
-            page_end = min(page_offset + NDFS_PAGE_SIZE, len(file_data))
-            page_slice = file_data[page_offset:page_end]
-
-            # Check if page is all zeros (sparse)
-            all_zeros = True
-            for b in range(len(page_slice)):
-                if page_slice[b] != 0:
-                    all_zeros = False
-                    break
-
-            if all_zeros and len(page_slice) == NDFS_PAGE_SIZE:
-                # Sparse hole: write block_id=0 to index
-                write_uint32_be(index_page, i * 4, 0)
-            else:
-                # Allocate data block
-                data_block_id = self._bit_file.find_first_free_block()
-                if data_block_id < 0:
-                    raise IOError("No free blocks for data")
-                self._bit_file.mark_block_used(data_block_id)
-
-                # Write data to page
-                data_page = bytearray(NDFS_PAGE_SIZE)
-                data_page[:len(page_slice)] = page_slice
-                self._write_page(data_block_id, data_page)
-
-                # Write pointer to index block
-                data_ptr = BlockPointer(data_block_id, PointerType.Contiguous)
-                data_ptr.to_bytes(index_page, i * 4)
-
-        # Write index block to disk
-        self._write_page(index_block_id, index_page)
+        # Allocate index/sub-index block(s) and write data (sparse-aware).
+        # Picks Indexed (<=512 pages) or SubIndexed (>512 pages) automatically.
+        top_block_id, top_pointer_type, structural_pages = self._allocate_and_write_data(
+            file_data, data_pages
+        )
 
         # Create object entry
         entry = ObjectEntry()
@@ -906,8 +1016,11 @@ class NdfsFileSystem:
         entry.user_name = user.user_name
         entry.pages_in_file = data_pages
         entry.bytes_in_file = len(file_data) if len(file_data) > 0 else 1
-        entry.file_pointer = BlockPointer(index_block_id, PointerType.Indexed)
-        # New-file defaults: owner+friend full rights; indexed allocation flag.
+        entry.file_pointer = BlockPointer(top_block_id, top_pointer_type)
+        # New-file defaults: owner+friend full rights; indexed allocation flag
+        # (SINTRAN uses the same FT_INDEXED flag for both Indexed and
+        # SubIndexed layouts -- the actual layout is carried by the
+        # BlockPointer's own type field, not by a separate flag bit).
         entry.access_bits = ACCESS_DEFAULT
         entry.file_type_flags = FT_INDEXED
         # object_index already encodes [user|fileEntry]; the object-index word
@@ -917,8 +1030,8 @@ class NdfsFileSystem:
         entry.prev_version = obj_index
         self._object_file.add_object(entry)
 
-        # Update user pages used
-        user.pages_used += data_pages + 1  # data pages + index block
+        # Update user pages used: data pages + structural (index/sub-index) pages.
+        user.pages_used += data_pages + structural_pages
 
         # Surgical writes: new object's page, owner's user page, bitmap.
         self._write_object_page(entry.object_index)
@@ -932,62 +1045,38 @@ class NdfsFileSystem:
         file_data: Union[bytes, bytearray, memoryview],
     ) -> None:
         """Update an existing file with new data."""
-        # Free old blocks
-        old_total = existing.pages_in_file + 1  # data + index
+        # Free old blocks (data blocks, plus index/sub-index structural
+        # block(s) -- _free_file_blocks already handles both Indexed and
+        # SubIndexed layouts via obj.file_pointer.type).
+        old_total = existing.pages_in_file + self._structural_pages_for(existing.pages_in_file)
         self._free_file_blocks(existing)
 
         # Subtract old usage
         user.pages_used = user.pages_used - old_total if user.pages_used >= old_total else 0
 
-        # Create new allocation
+        # Create new allocation. Files up to 512 pages use a single Indexed
+        # index block; larger files (up to 262144 pages) use a SubIndexed
+        # layout -- _allocate_and_write_data raises past that hard ceiling.
         data_pages = math.ceil(len(file_data) / NDFS_PAGE_SIZE)
         if data_pages == 0:
             data_pages = 1
-        if data_pages > MAX_OBJECT_FILE_POINTERS:
-            raise IOError("File too large for an indexed object file (>512 pages)")
+        if data_pages > MAX_OBJECT_FILE_POINTERS * MAX_OBJECT_FILE_POINTERS:
+            raise IOError(
+                "File too large for a sub-indexed object file "
+                f"(>{MAX_OBJECT_FILE_POINTERS * MAX_OBJECT_FILE_POINTERS} pages)"
+            )
 
-        index_block_id = self._bit_file.find_first_free_block()
-        if index_block_id < 0:
-            raise IOError("No free blocks for index block")
-        self._bit_file.mark_block_used(index_block_id)
-
-        index_page = bytearray(NDFS_PAGE_SIZE)
-
-        for i in range(data_pages):
-            page_offset = i * NDFS_PAGE_SIZE
-            page_end = min(page_offset + NDFS_PAGE_SIZE, len(file_data))
-            page_slice = file_data[page_offset:page_end]
-
-            all_zeros = True
-            for b in range(len(page_slice)):
-                if page_slice[b] != 0:
-                    all_zeros = False
-                    break
-
-            if all_zeros and len(page_slice) == NDFS_PAGE_SIZE:
-                write_uint32_be(index_page, i * 4, 0)
-            else:
-                data_block_id = self._bit_file.find_first_free_block()
-                if data_block_id < 0:
-                    raise IOError("No free blocks for data")
-                self._bit_file.mark_block_used(data_block_id)
-
-                data_page = bytearray(NDFS_PAGE_SIZE)
-                data_page[:len(page_slice)] = page_slice
-                self._write_page(data_block_id, data_page)
-
-                data_ptr = BlockPointer(data_block_id, PointerType.Contiguous)
-                data_ptr.to_bytes(index_page, i * 4)
-
-        self._write_page(index_block_id, index_page)
+        top_block_id, top_pointer_type, structural_pages = self._allocate_and_write_data(
+            file_data, data_pages
+        )
 
         # Update existing entry
         existing.pages_in_file = data_pages
         existing.bytes_in_file = len(file_data) if len(file_data) > 0 else 1
-        existing.file_pointer = BlockPointer(index_block_id, PointerType.Indexed)
+        existing.file_pointer = BlockPointer(top_block_id, top_pointer_type)
 
-        # Update user pages used
-        user.pages_used += data_pages + 1
+        # Update user pages used: data pages + structural (index/sub-index) pages.
+        user.pages_used += data_pages + structural_pages
 
         # Surgical writes: the file's object page, owner's user page, bitmap.
         self._write_object_page(existing.object_index)

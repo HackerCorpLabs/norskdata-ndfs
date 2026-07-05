@@ -648,6 +648,284 @@ static int test_friends_add_list_remove(void)
     return 0;
 }
 
+/* ---- SubIndexed (large file, >512 pages) write support ----
+ *
+ * NDFS-FORMAT.md "Sub-Indexed (Type 10)": a top-level sub-index block holds
+ * up to 512 pointers to group index blocks, each holding up to 512 data-page
+ * pointers, covering files up to 512*512 = 262,144 pages. These tests pin
+ * the 512-page boundary and exercise the SubIndexed write path added to
+ * create_new_file()/update_existing_file()/allocate_and_write_data() in
+ * src/filesystem.c. */
+
+/* Fill `buf` with a pattern that is never a zero byte, so no page in the
+ * file is a sparse hole -- this lets tests reason exactly about the
+ * structural (index/sub-index) page cost via free-page deltas. */
+static void fill_nonzero_pattern(uint8_t *buf, size_t len, uint8_t seed)
+{
+    size_t i;
+    for (i = 0; i < len; i++) {
+        buf[i] = (uint8_t)(((i * 7 + seed) % 251) + 1); /* 1..251, never 0 */
+    }
+}
+
+/* Find a user's current pages_used by name (SYSTEM by default). */
+static uint32_t get_user_pages_used(ndfs_filesystem_t *fs, const char *name)
+{
+    ndfs_user_entry_t *users = NULL;
+    size_t count = 0, i;
+    uint32_t result = 0xFFFFFFFFu;
+
+    if (ndfs_get_users(fs, &users, &count) != NDFS_OK) return result;
+    for (i = 0; i < count; i++) {
+        if (strcmp(users[i].user_name, name) == 0) {
+            result = users[i].pages_used;
+            break;
+        }
+    }
+    ndfs_free_users(users);
+    return result;
+}
+
+/* Pin the 512-page boundary: a file of EXACTLY 512 non-sparse pages must
+ * still use the plain Indexed layout (structural cost = 1 index block),
+ * not SubIndexed. Verified via the free-page delta: 512 data pages + 1
+ * index block = 513 pages consumed. */
+static int test_indexed_boundary_stays_indexed(void)
+{
+    ndfs_filesystem_t *fs = create_writable(NDFS_TMPL_SMD_75MB, "IDXBND");
+    size_t size = (size_t)NDFS_MAX_OBJECT_FILE_PTRS * NDFS_PAGE_SIZE; /* 512 pages */
+    uint8_t *data = (uint8_t *)malloc(size);
+    uint8_t *read_data = NULL;
+    size_t read_size = 0;
+    uint32_t free_before, free_after;
+
+    TEST_ASSERT_NOT_NULL(fs);
+    TEST_ASSERT_NOT_NULL(data);
+    fill_nonzero_pattern(data, size, 1);
+
+    ndfs_get_free_pages(fs, &free_before);
+    TEST_ASSERT_OK(ndfs_write_file(fs, "SYSTEM/ATBND:DATA", data, size));
+    ndfs_get_free_pages(fs, &free_after);
+
+    /* 512 data pages + exactly 1 structural (index) page. If this were
+     * mistakenly promoted to SubIndexed it would cost 512 + 1 + 1 = 514. */
+    TEST_ASSERT_EQUAL(NDFS_MAX_OBJECT_FILE_PTRS + 1, free_before - free_after);
+
+    TEST_ASSERT_OK(ndfs_read_file(fs, "SYSTEM/ATBND:DATA", &read_data, &read_size));
+    TEST_ASSERT_EQUAL(size, read_size);
+    TEST_ASSERT(memcmp(read_data, data, size) == 0);
+
+    ndfs_free_data(read_data);
+    free(data);
+    ndfs_close(fs);
+    return 0;
+}
+
+/* A file one page over the boundary (513 pages) must round-trip
+ * byte-identically via the new SubIndexed path, and its structural cost
+ * must be 1 sub-index block + 2 group index blocks (ceil(513/512) = 2). */
+static int test_subindexed_just_over_boundary(void)
+{
+    ndfs_filesystem_t *fs = create_writable(NDFS_TMPL_SMD_75MB, "SUBOVER");
+    size_t size = (size_t)(NDFS_MAX_OBJECT_FILE_PTRS + 1) * NDFS_PAGE_SIZE; /* 513 pages */
+    uint8_t *data = (uint8_t *)malloc(size);
+    uint8_t *read_data = NULL;
+    size_t read_size = 0;
+    uint32_t free_before, free_after;
+
+    TEST_ASSERT_NOT_NULL(fs);
+    TEST_ASSERT_NOT_NULL(data);
+    fill_nonzero_pattern(data, size, 2);
+
+    ndfs_get_free_pages(fs, &free_before);
+    TEST_ASSERT_OK(ndfs_write_file(fs, "SYSTEM/OVER:DATA", data, size));
+    ndfs_get_free_pages(fs, &free_after);
+
+    /* 513 data pages + 1 sub-index block + 2 group index blocks = 516. */
+    TEST_ASSERT_EQUAL(NDFS_MAX_OBJECT_FILE_PTRS + 1 + 3, free_before - free_after);
+
+    TEST_ASSERT_OK(ndfs_read_file(fs, "SYSTEM/OVER:DATA", &read_data, &read_size));
+    TEST_ASSERT_EQUAL(size, read_size);
+    TEST_ASSERT(memcmp(read_data, data, size) == 0);
+
+    ndfs_free_data(read_data);
+    free(data);
+    ndfs_close(fs);
+    return 0;
+}
+
+/* A file spanning multiple full 512-page groups (1000+ pages) must
+ * round-trip byte-identically -- this is the test that would catch content
+ * corruption at a group boundary (e.g. an off-by-one in start_page/end_page
+ * or writing past a group's own 512-pointer index page). */
+static int test_subindexed_multi_group_roundtrip(void)
+{
+    ndfs_filesystem_t *fs = create_writable(NDFS_TMPL_SMD_75MB, "SUBMULTI");
+    uint32_t data_pages = 1000; /* crosses the 512-page group boundary once */
+    size_t size = (size_t)data_pages * NDFS_PAGE_SIZE;
+    uint8_t *data = (uint8_t *)malloc(size);
+    uint8_t *read_data = NULL;
+    size_t read_size = 0;
+
+    TEST_ASSERT_NOT_NULL(fs);
+    TEST_ASSERT_NOT_NULL(data);
+    fill_nonzero_pattern(data, size, 3);
+
+    TEST_ASSERT_OK(ndfs_write_file(fs, "SYSTEM/MULTI:DATA", data, size));
+    TEST_ASSERT_OK(ndfs_read_file(fs, "SYSTEM/MULTI:DATA", &read_data, &read_size));
+    TEST_ASSERT_EQUAL(size, read_size);
+
+    /* Byte-by-byte so a group-boundary corruption reports where it starts,
+     * not just "mismatch somewhere". */
+    {
+        size_t i;
+        for (i = 0; i < size; i++) {
+            if (read_data[i] != data[i]) {
+                printf("  FAIL: mismatch at byte %zu (page %zu): expected %d, got %d\n",
+                       i, i / NDFS_PAGE_SIZE, data[i], read_data[i]);
+                ndfs_free_data(read_data);
+                free(data);
+                ndfs_close(fs);
+                return 1;
+            }
+        }
+    }
+
+    ndfs_free_data(read_data);
+    free(data);
+    ndfs_close(fs);
+    return 0;
+}
+
+/* A SubIndexed file with zero-filled (sparse) holes must round-trip
+ * correctly, and must not allocate real disk blocks for the holes. */
+static int test_subindexed_sparse_holes(void)
+{
+    ndfs_filesystem_t *fs = create_writable(NDFS_TMPL_SMD_75MB, "SUBSPARS");
+    uint32_t data_pages = 1000;
+    size_t size = (size_t)data_pages * NDFS_PAGE_SIZE;
+    uint8_t *data = (uint8_t *)calloc(size, 1); /* all sparse to start */
+    uint8_t *read_data = NULL;
+    size_t read_size = 0;
+    uint32_t free_before, free_after;
+    uint32_t num_index_blocks = (data_pages + NDFS_MAX_OBJECT_FILE_PTRS - 1)
+                               / NDFS_MAX_OBJECT_FILE_PTRS;
+    uint32_t non_sparse_pages = 3;
+
+    TEST_ASSERT_NOT_NULL(fs);
+    TEST_ASSERT_NOT_NULL(data);
+
+    /* Only 3 pages carry real data: one in group 0, one straddling the
+     * group boundary (page 511/512), one deep in group 1. Everything else
+     * stays a zero-filled sparse hole. */
+    fill_nonzero_pattern(data + (size_t)10 * NDFS_PAGE_SIZE, NDFS_PAGE_SIZE, 5);
+    fill_nonzero_pattern(data + (size_t)511 * NDFS_PAGE_SIZE, NDFS_PAGE_SIZE, 6);
+    fill_nonzero_pattern(data + (size_t)700 * NDFS_PAGE_SIZE, NDFS_PAGE_SIZE, 7);
+
+    ndfs_get_free_pages(fs, &free_before);
+    TEST_ASSERT_OK(ndfs_write_file(fs, "SYSTEM/SPARSBIG:DATA", data, size));
+    ndfs_get_free_pages(fs, &free_after);
+
+    /* Structural pages (1 sub-index + num_index_blocks group index blocks)
+     * plus only the non-sparse data pages -- NOT all 1000 data pages. */
+    TEST_ASSERT_EQUAL(1 + num_index_blocks + non_sparse_pages,
+                      free_before - free_after);
+
+    TEST_ASSERT_OK(ndfs_read_file(fs, "SYSTEM/SPARSBIG:DATA", &read_data, &read_size));
+    TEST_ASSERT_EQUAL(size, read_size);
+    TEST_ASSERT(memcmp(read_data, data, size) == 0);
+
+    ndfs_free_data(read_data);
+    free(data);
+    ndfs_close(fs);
+    return 0;
+}
+
+/* Deleting a SubIndexed file must free every block it owns: data blocks,
+ * every group's own index block, AND the top-level sub-index block. */
+static int test_subindexed_delete_frees_all_blocks(void)
+{
+    ndfs_filesystem_t *fs = create_writable(NDFS_TMPL_SMD_75MB, "SUBDEL");
+    uint32_t data_pages = 1000;
+    size_t size = (size_t)data_pages * NDFS_PAGE_SIZE;
+    uint8_t *data = (uint8_t *)malloc(size);
+    uint32_t free_before, free_after_write, free_after_delete;
+
+    TEST_ASSERT_NOT_NULL(fs);
+    TEST_ASSERT_NOT_NULL(data);
+    fill_nonzero_pattern(data, size, 8);
+
+    ndfs_get_free_pages(fs, &free_before);
+    TEST_ASSERT_OK(ndfs_write_file(fs, "SYSTEM/DELBIG:DATA", data, size));
+    ndfs_get_free_pages(fs, &free_after_write);
+    TEST_ASSERT(free_after_write < free_before);
+
+    TEST_ASSERT_OK(ndfs_delete_file(fs, "SYSTEM/DELBIG:DATA"));
+    ndfs_get_free_pages(fs, &free_after_delete);
+
+    /* Every data block, every group index block, and the sub-index block
+     * itself must come back -- not just the data blocks. */
+    TEST_ASSERT_EQUAL(free_before, free_after_delete);
+
+    free(data);
+    ndfs_close(fs);
+    return 0;
+}
+
+/* Overwriting an existing SubIndexed file must not leak the OLD structural
+ * blocks (sub-index + group index blocks). This mirrors a real leak class
+ * already found and fixed in the C# port's AllocateFileBlocksSparse: if the
+ * "old total pages" calculation on overwrite assumes a flat "+1" structural
+ * cost instead of accounting for however many group index blocks a large
+ * file actually used, the quota/page bookkeeping never fully reclaims the
+ * old file's structural pages, and it silently grows on every overwrite. */
+static int test_subindexed_overwrite_no_leak(void)
+{
+    ndfs_filesystem_t *fs = create_writable(NDFS_TMPL_SMD_75MB, "SUBLEAK");
+    uint32_t data_pages = 1000;
+    size_t size = (size_t)data_pages * NDFS_PAGE_SIZE;
+    uint8_t *v1 = (uint8_t *)malloc(size);
+    uint8_t *v2 = (uint8_t *)malloc(size);
+    uint32_t used_baseline, used_after_write1, used_after_write2, used_after_delete;
+    uint32_t free_baseline, free_after_delete;
+
+    TEST_ASSERT_NOT_NULL(fs);
+    TEST_ASSERT_NOT_NULL(v1);
+    TEST_ASSERT_NOT_NULL(v2);
+    fill_nonzero_pattern(v1, size, 9);
+    fill_nonzero_pattern(v2, size, 42); /* different content, same size */
+
+    used_baseline = get_user_pages_used(fs, "SYSTEM");
+    ndfs_get_free_pages(fs, &free_baseline);
+
+    /* Create as SubIndexed. */
+    TEST_ASSERT_OK(ndfs_write_file(fs, "SYSTEM/LEAKBIG:DATA", v1, size));
+    used_after_write1 = get_user_pages_used(fs, "SYSTEM");
+
+    /* Overwrite (same size, still SubIndexed) via update_existing_file(). */
+    TEST_ASSERT_OK(ndfs_write_file(fs, "SYSTEM/LEAKBIG:DATA", v2, size));
+    used_after_write2 = get_user_pages_used(fs, "SYSTEM");
+
+    /* Same data+structural page count both times -- overwrite must not
+     * accumulate extra "used" pages for the old file's structure. */
+    TEST_ASSERT_EQUAL(used_after_write1, used_after_write2);
+
+    TEST_ASSERT_OK(ndfs_delete_file(fs, "SYSTEM/LEAKBIG:DATA"));
+    used_after_delete = get_user_pages_used(fs, "SYSTEM");
+    ndfs_get_free_pages(fs, &free_after_delete);
+
+    /* Back to exactly the pre-write baseline: no leaked quota pages, and
+     * every block (data + both overwrite's worth of structural pages)
+     * reclaimed on disk. */
+    TEST_ASSERT_EQUAL(used_baseline, used_after_delete);
+    TEST_ASSERT_EQUAL(free_baseline, free_after_delete);
+
+    free(v1);
+    free(v2);
+    ndfs_close(fs);
+    return 0;
+}
+
 void run_write_comprehensive_tests(void)
 {
     TEST_SUITE_BEGIN("Write Comprehensive Tests");
@@ -669,4 +947,10 @@ void run_write_comprehensive_tests(void)
     RUN_TEST(test_list_multiple_files);
     RUN_TEST(test_write_empty_file);
     RUN_TEST(test_write_delete_cycle);
+    RUN_TEST(test_indexed_boundary_stays_indexed);
+    RUN_TEST(test_subindexed_just_over_boundary);
+    RUN_TEST(test_subindexed_multi_group_roundtrip);
+    RUN_TEST(test_subindexed_sparse_holes);
+    RUN_TEST(test_subindexed_delete_frees_all_blocks);
+    RUN_TEST(test_subindexed_overwrite_no_leak);
 }
