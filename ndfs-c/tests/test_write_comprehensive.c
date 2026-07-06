@@ -297,6 +297,66 @@ static int test_add_multiple_users(void)
     return 0;
 }
 
+/* Regression test for the "add_user beyond first UserFile page silently
+ * dropped on remount" bug: image_creator.c only pre-allocates the FIRST
+ * UserFile data page (32 entries incl. SYSTEM), so any user landing in
+ * slot >= 32 needs a second page allocated on demand by
+ * ensure_user_dir_page() (filesystem.c). Before that fix,
+ * write_user_page() silently no-op'd when the page's index-block pointer
+ * was unset, so the user lived only in memory and vanished after a
+ * to_buffer/open_buffer_copy round trip -- exactly what this test drives. */
+static int test_add_users_beyond_first_page(void)
+{
+    ndfs_filesystem_t *fs = create_writable(NDFS_TMPL_FLOPPY_12MB, "MANYUSR");
+    ndfs_filesystem_t *fs2 = NULL;
+    uint8_t *exported = NULL;
+    size_t exported_size = 0;
+    ndfs_user_entry_t *users = NULL;
+    size_t count = 0;
+    char uname[NDFS_NAME_MAX + 1];
+    int u;
+    const int num_users = 40; /* SYSTEM (slot 0) + 40 => slots 1..40, spilling into page 2 (slots 32-63) */
+
+    TEST_ASSERT_NOT_NULL(fs);
+
+    for (u = 0; u < num_users; u++) {
+        snprintf(uname, sizeof(uname), "USER%03d", u);
+        TEST_ASSERT_OK(ndfs_add_user(fs, uname, (uint32_t)(u + 1)));
+    }
+
+    /* In-memory state alone would hide the bug (it lives in fs->users[]
+     * regardless of on-disk persistence), so round-trip through an actual
+     * export/reimport before checking anything. */
+    TEST_ASSERT_OK(ndfs_to_buffer(fs, &exported, &exported_size));
+    ndfs_close(fs);
+    TEST_ASSERT_OK(ndfs_open_buffer_copy(exported, exported_size, true, &fs2));
+    free(exported);
+
+    TEST_ASSERT_OK(ndfs_get_users(fs2, &users, &count));
+    TEST_ASSERT_EQUAL(num_users + 1, count); /* +1 for SYSTEM */
+
+    /* Spot-check a user whose slot (>= 32) only exists in the newly
+     * allocated second UserFile page: confirm the name and reserved-page
+     * count survived the round trip intact, not just "the count matches". */
+    {
+        int found = 0;
+        size_t i;
+        for (i = 0; i < count; i++) {
+            if (strcmp(users[i].user_name, "USER039") == 0) {
+                found = 1;
+                TEST_ASSERT_EQUAL(40, users[i].pages_reserved);
+                TEST_ASSERT(users[i].user_index >= NDFS_ENTRIES_PER_PAGE);
+                break;
+            }
+        }
+        TEST_ASSERT(found);
+    }
+
+    ndfs_free_users(users);
+    ndfs_close(fs2);
+    return 0;
+}
+
 static int test_write_file_per_user(void)
 {
     ndfs_filesystem_t *fs = create_writable(NDFS_TMPL_FLOPPY_360KB, "PERUSER");
@@ -1086,6 +1146,7 @@ void run_write_comprehensive_tests(void)
     RUN_TEST(test_write_persistence);
     RUN_TEST(test_sparse_file);
     RUN_TEST(test_add_multiple_users);
+    RUN_TEST(test_add_users_beyond_first_page);
     RUN_TEST(test_write_file_per_user);
     RUN_TEST(test_remove_user_with_no_files);
     RUN_TEST(test_update_quota);

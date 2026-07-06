@@ -672,6 +672,56 @@ static uint32_t ensure_object_dir_page(struct ndfs_filesystem *fs,
     return blk;
 }
 
+/* Ensure the UserFile data page that holds user `user_index` exists,
+ * allocating and linking it (mirrors ensure_object_dir_page above) if the
+ * index pointer is null. Unlike the object file, the UserFile index block
+ * is always plain NDFS_PTR_INDEXED -- 256 users max fits in a single
+ * 512-pointer index page (see docs/NDFS-FORMAT.md, "User File | Indexed
+ * (01)"), so there is no SubIndexed case to handle here. Returns the
+ * on-disk data block id backing the page, or 0 on failure.
+ *
+ * Without this, ndfs_add_user() for a user whose page (user_index >= 32 on
+ * an image only pre-allocated with its first UserFile page) was never
+ * allocated would call write_user_page(), which silently no-ops when the
+ * index slot is unset -- the new user lives only in fs->users[]/
+ * fs->user_valid[] for the rest of this session and vanishes on the next
+ * mount. */
+static uint32_t ensure_user_dir_page(struct ndfs_filesystem *fs, uint32_t user_index)
+{
+    ndfs_master_block_t *mb = &fs->master_block;
+    uint32_t page_idx = user_index / NDFS_ENTRIES_PER_PAGE;
+    uint8_t *index_page;
+    ndfs_block_pointer_t ptr;
+    uint32_t blk;
+    uint8_t *dp;
+    ndfs_block_pointer_t newp;
+
+    if (!ndfs_bp_is_valid(&mb->user_file_ptr)) return 0;
+    if (page_idx >= NDFS_MAX_USER_FILE_PTRS) return 0;
+
+    index_page = write_page_ptr(fs, mb->user_file_ptr.block_id);
+    if (!index_page) return 0;
+    ptr = ndfs_bp_from_bytes(index_page, page_idx * 4);
+    if (ndfs_bp_is_valid(&ptr)) return ptr.block_id;
+
+    /* Page not yet allocated -- grab a free block from the bitmap, zero it,
+     * and link it into the UserFile index block at this page's slot. */
+    if (ndfs_bf_find_free(&fs->bit_file, &blk) != NDFS_OK) return 0;
+    ndfs_bf_mark_used(&fs->bit_file, blk);
+    dp = write_page_ptr(fs, blk);
+    if (!dp) return 0;
+    memset(dp, 0, NDFS_PAGE_SIZE);
+    newp.block_id = blk;
+    newp.type = NDFS_PTR_CONTIGUOUS;
+    /* Re-fetch the index page pointer before writing the link, matching
+     * ensure_object_dir_page's style (both point into the same fs->data
+     * buffer, but re-fetching keeps this robust if that ever changes). */
+    index_page = write_page_ptr(fs, mb->user_file_ptr.block_id);
+    if (!index_page) return 0;
+    ndfs_bp_to_bytes(&newp, index_page, page_idx * 4);
+    return blk;
+}
+
 /* Write one data page (sparse-aware) and store its BlockPointer at slot
  * `slot_in_index` of `index_page_buf` (an already-mapped 2048-byte index
  * page). A page that is entirely zero and fully within the file is left as
@@ -1692,8 +1742,19 @@ ndfs_error_t ndfs_add_user(ndfs_filesystem_t *fs,
     fs->user_valid[slot] = true;
     fs->user_count++;
 
-    /* Add-user touches only the UserFile page holding this new user. */
-    return write_user_page(fs, (uint32_t)slot);
+    /* Guarantee the UserFile data page for this slot exists on disk before
+     * writing it -- a fresh/small image may only have its first UserFile
+     * page pre-allocated, and write_user_page() silently no-ops if the
+     * page's index-block pointer is unset (see write_user_page's comment).
+     * ensure_user_dir_page() may allocate a bitmap block, so persist the
+     * updated bitmap/master-block free-page count afterwards too, exactly
+     * like create_new_file()/update_file_data() do after
+     * ensure_object_dir_page(). */
+    ensure_user_dir_page(fs, (uint32_t)slot);
+    write_user_page(fs, (uint32_t)slot);
+    write_bit_file(fs);
+
+    return NDFS_OK;
 }
 
 ndfs_error_t ndfs_remove_user(ndfs_filesystem_t *fs, uint8_t index)

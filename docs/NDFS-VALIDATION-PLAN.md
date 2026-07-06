@@ -301,6 +301,18 @@ For each divergence the matrix surfaces:
   (TS)/`image_creator.c` (C) seed `unreserved_pages` with a template
   placeholder rather than the true free count at *creation* time — this fix
   only targets keeping it correct after mutations, not the initial value.
+- ✅ **On-demand user-file page growth** — adding a user whose user-file page
+  wasn't yet allocated silently no-op'd in `write_user_page`/`_write_user_page`/
+  `writeUserPage` (page-not-linked-yet guard returned OK without allocating),
+  so the user existed only in memory and vanished on next mount. RetroFS.NDFS
+  already had this fixed (`EnsureUserFilePageAllocated`, predates this fix).
+  Added `ensure_user_dir_page`/`_ensure_user_dir_page`/`ensureUserDirPage` to
+  C/TS/PY, mirroring `ensureObjectDirPage`'s plain-Indexed case (the user file
+  never needs Sub-Indexed — max 256 users fits in one 512-pointer index
+  block). Called from `add_user`/`addUser`/`ndfs_add_user` before the write.
+  Tests add 40 users (forcing a second page) and round-trip through a real
+  close+reopen, not just in-memory state. c: 194/194 (+1). py: 351/5 (+1).
+  ts: 307/0 (+1).
 
 ### Open (tracked, lower priority)
 - ☐ **Image-creation-time `unreserved_pages` placeholder** — `image-creator.ts`
@@ -310,9 +322,6 @@ For each divergence the matrix surfaces:
   the fix above), so this only matters for a freshly-created, never-mutated
   image read by something that trusts the field verbatim. C/TS (PY/RFS not
   yet checked).
-- ☐ **On-demand user-file page growth** — adding a user whose user-file page is
-  not yet allocated silently drops it (edge: >32 users). Mirror
-  `ensureObjectDirPage` as `ensureUserDirPage` in C/TS/PY.
 - ☐ **Sparse-file accounting** — ports set `pages_in_file`/`pages_used` to the
   logical page count incl. holes + the index block; RetroCore counts only
   allocated data pages and excludes the index block from user quota. Diverges

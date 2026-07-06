@@ -154,3 +154,47 @@ class TestUserPersistence:
         assert "SYSTEM" in names
         assert "ALICE" in names
         assert "BOB" in names
+
+    def test_users_beyond_first_page_survive_reopen(self):
+        # SYSTEM (index 0) already occupies UserFile page 0 (indices 0-31).
+        # Adding 40 more users pushes user_index past 31, forcing a second
+        # UserFile data page (page 1, indices 32-63) that a fresh/small
+        # image does NOT pre-allocate. Before the fix, `add_user` would set
+        # the new user in memory and then silently no-op the on-disk write
+        # for any user landing in that unallocated page -- the user would
+        # exist for the rest of the session but vanish on the next mount.
+        # This test only catches that if it round-trips through a real
+        # export/reopen (in-memory-only state would hide the bug).
+        ndfs1 = _make_fs(pages=1000)
+        expected_names = []
+        for i in range(40):
+            name = f"USER{i:03d}"
+            result = ndfs1.add_user(name, 10 + i)
+            assert result is True
+            expected_names.append(name)
+
+        # Sanity check before the round-trip: all 41 users (SYSTEM + 40).
+        assert len(ndfs1.get_users()) == 41
+
+        exported = ndfs1.to_buffer()
+        ndfs2 = NdfsFileSystem(exported)
+
+        users = ndfs2.get_users()
+        assert len(users) == 41
+
+        by_name = {}
+        for i in range(len(users)):
+            by_name[users[i].user_name] = users[i]
+
+        assert "SYSTEM" in by_name
+        for i in range(40):
+            assert expected_names[i] in by_name
+
+        # Spot-check a user whose slot only exists in the newly-allocated
+        # second UserFile page (user_index 32 == USER031, since SYSTEM
+        # takes index 0 and USER000..USER039 take indices 1..40): confirm
+        # more than just presence -- the actual field values must have
+        # survived the round-trip through disk, not just the name.
+        second_page_user = by_name["USER031"]
+        assert second_page_user.user_index == 32
+        assert second_page_user.pages_reserved == 10 + 31

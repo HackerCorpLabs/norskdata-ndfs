@@ -359,8 +359,18 @@ class NdfsFileSystem:
         user.user_index = idx
         user.pages_reserved = reserved_pages
         self._user_file.add_user(user)
+        # Ensure the UserFile data page for this slot is allocated on disk
+        # before writing to it -- a fresh/small image may only have its
+        # first user-file page pre-allocated, and without this the write
+        # below silently no-ops for user_index >= ENTRIES_PER_PAGE, leaving
+        # the new user in memory only (it vanishes on the next remount).
+        self._ensure_user_dir_page(user.user_index)
         # Add-user touches only the UserFile page holding this new user.
         self._write_user_page(user.user_index)
+        # _ensure_user_dir_page may have allocated a fresh bitmap page;
+        # persist the bitmap and the master block's cached free-page count.
+        self._write_bit_file()
+        self._persist_master_block()
         return True
 
     def remove_user(self, index: int) -> bool:
@@ -970,6 +980,36 @@ class NdfsFileSystem:
             blk = alloc_page()
             BlockPointer(blk, PointerType.Contiguous).to_bytes(inner_page, inner_idx * 4)
             self._write_page(sub_ptr.block_id, inner_page)
+
+    def _ensure_user_dir_page(self, user_index: int) -> None:
+        """Ensure the UserFile data page holding *user_index* exists,
+        allocating and linking it on demand.
+
+        The UserFile is always a plain Indexed structure (max 256 users
+        fits in the MAX_USER_FILE_POINTERS-slot index block -- see
+        docs\\NDFS-FORMAT.md's "User File | Indexed (01)" entry), so unlike
+        `_ensure_object_dir_page` there is no SubIndexed case to handle
+        here: this mirrors only that method's single-level-index branch.
+        """
+        mb = self._master_block
+        if mb.user_file_pointer is None or not mb.user_file_pointer.is_valid():
+            return
+        page_idx = user_index // ENTRIES_PER_PAGE
+        if page_idx >= MAX_USER_FILE_POINTERS:
+            return
+
+        index_page = bytearray(self._read_page(mb.user_file_pointer.block_id))
+        ptr = BlockPointer.from_bytes(index_page, page_idx * 4)
+        if ptr.is_valid():
+            return
+
+        blk = self._bit_file.find_first_free_block()
+        if blk < 0:
+            raise IOError("No free blocks for user directory page")
+        self._bit_file.mark_block_used(blk)
+        self._write_page(blk, bytearray(NDFS_PAGE_SIZE))
+        BlockPointer(blk, PointerType.Contiguous).to_bytes(index_page, page_idx * 4)
+        self._write_page(mb.user_file_pointer.block_id, index_page)
 
     def _create_new_file(
         self,

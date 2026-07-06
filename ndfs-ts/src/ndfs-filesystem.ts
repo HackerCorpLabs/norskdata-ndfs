@@ -368,8 +368,17 @@ export class NdfsFileSystem {
     user.userIndex = idx;
     user.pagesReserved = reservedPages;
     this.userFile.addUser(user);
+    // The new user's slot may land in a UserFile directory page that has
+    // never been allocated on disk (e.g. a freshly created small image only
+    // pre-allocates the first page). Without this, writeUserPage() below
+    // silently no-ops when the page pointer is invalid, so the user would
+    // exist only in memory and vanish on the next mount.
+    this.ensureUserDirPage(user.userIndex);
     // Add-user touches only the UserFile page holding this new user.
     this.writeUserPage(user.userIndex);
+    // Flush the bitmap (and the master block's cached free-page count) in
+    // case ensureUserDirPage() above allocated a fresh directory page.
+    this.writeBitFile();
     return true;
   }
 
@@ -938,6 +947,32 @@ export class NdfsFileSystem {
       new BlockPointer(blk, PointerType.Contiguous).toBytes(innerPage, innerIdx * 4);
       this.writePage(subPtr.blockId, innerPage);
     }
+  }
+
+  /**
+   * Ensure the UserFile directory data page holding `userIndex` exists,
+   * allocating and linking it on demand. Mirrors ensureObjectDirPage()'s
+   * Indexed-branch logic, but the UserFile index block is always a plain
+   * Indexed structure (max 256 users fits in a single 512-pointer index
+   * block, per docs\NDFS-FORMAT.md's "User File | Indexed (01)" table), so
+   * there is no SubIndexed case to handle here.
+   */
+  private ensureUserDirPage(userIndex: number): void {
+    const mb = this.masterBlock;
+    if (!mb.userFilePointer || !mb.userFilePointer.isValid()) return;
+    const pageIdx = Math.floor(userIndex / ENTRIES_PER_PAGE);
+    if (pageIdx >= MAX_USER_FILE_POINTERS) return;
+
+    const indexPage = this.readPage(mb.userFilePointer.blockId);
+    const ptr = BlockPointer.fromBytes(indexPage, pageIdx * 4);
+    if (ptr.isValid()) return; // page already allocated on disk
+
+    const blk = this.bitFile.findFirstFreeBlock();
+    if (blk < 0) throw new Error('No free blocks for user directory page');
+    this.bitFile.markBlockUsed(blk);
+    this.writePage(blk, new Uint8Array(NDFS_PAGE_SIZE));
+    new BlockPointer(blk, PointerType.Contiguous).toBytes(indexPage, pageIdx * 4);
+    this.writePage(mb.userFilePointer.blockId, indexPage);
   }
 
   private createNewFile(
