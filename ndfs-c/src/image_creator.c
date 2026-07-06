@@ -62,12 +62,28 @@ static void build_custom_spec(uint32_t pages, ndfs_template_spec_t *out)
     out->has_flomon  = false;
     out->ext_valid   = (pages > 1000);
 
-    /* Layout: object file ~50%, user file = obj+2, bit file = obj-1 or near end */
+    /* Layout: object file ~50%, user file after it, bit file (BitFile
+     * bitmap) before both -- or near the end for small disks. */
     if (pages > 1000) {
+        /* The BitFile bitmap is 1 bit per page, so it needs
+         * ceil(ceil(pages/8)/NDFS_PAGE_SIZE) contiguous pages -- for small
+         * page counts that is always 1, but for large custom images (tens
+         * of thousands of pages, e.g. a 30,000+ file stress image) it can
+         * span several pages. The object-file and user-file index blocks
+         * used to be placed at a fixed bf_block+2/+4 offset, which only
+         * left room for a 1-page bitmap; on any custom image needing more
+         * than that, the bitmap's own later pages silently overlapped and
+         * overwrote the object/user file index blocks the very first time
+         * write_bit_file() ran, corrupting the object directory. Compute
+         * the real bitmap page span here and place object/user file blocks
+         * strictly after it. */
+        uint32_t bitmap_bytes = (pages + 7) / 8;
+        uint32_t bitmap_pages = (bitmap_bytes + NDFS_PAGE_SIZE - 1) / NDFS_PAGE_SIZE;
+
         bf_block = pages / 2;
         out->bit_file_block    = bf_block;
-        out->object_file_block = bf_block + 2;
-        out->user_file_block   = bf_block + 4;
+        out->object_file_block = bf_block + bitmap_pages;     /* +index +data page */
+        out->user_file_block   = out->object_file_block + 2;  /* +index +data page */
     } else {
         /* Small disks: put system structures near end */
         out->object_file_block = pages - 5;

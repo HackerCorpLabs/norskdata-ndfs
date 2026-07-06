@@ -89,6 +89,7 @@ static ndfs_error_t allocate_and_write_data(struct ndfs_filesystem *fs,
                                             uint32_t *out_struct_pages);
 static void add_object(struct ndfs_filesystem *fs, const ndfs_object_entry_t *obj);
 static size_t objects_for_user_by_index(const struct ndfs_filesystem *fs, uint8_t idx);
+static void persist_master_block(struct ndfs_filesystem *fs);
 
 /* ── Helpers ─────────────────────────────────────────────────────── */
 
@@ -682,6 +683,47 @@ static uint32_t ensure_object_dir_page(struct ndfs_filesystem *fs,
     ndfs_block_pointer_t newp;
 
     if (!ndfs_bp_is_valid(&mb->object_file_ptr)) return 0;
+
+    if (mb->object_file_ptr.type == NDFS_PTR_INDEXED && page_idx >= NDFS_MAX_OBJECT_FILE_PTRS) {
+        /* One-time conversion: a plain Indexed object file caps out at 512
+         * directory pages (16,384 files across all users combined -- 64
+         * users' worth at 8 reserved index-pointer slots each). Once a page
+         * beyond that is needed, wrap the EXISTING Indexed block as group 0
+         * of a new SubIndexed structure (sub-index block -> up to 512 group
+         * index blocks -> up to 512 directory pages each) -- exactly like a
+         * single file's own data grows past 512 pages. No directory data is
+         * copied or moved: the old block's directory-page pointers for
+         * pageIdx 0-511 stay exactly where they are; only a new level of
+         * indirection is added above it. Mirrors EnsureObjectDirPage in the
+         * C# reference implementation (RetroFS.NDFS/FileSystems/NdfsFileSystem.cs). */
+        uint32_t old_index_block_id = mb->object_file_ptr.block_id;
+        uint32_t sub_blk;
+        uint8_t *sub_page;
+        ndfs_block_pointer_t group0;
+
+        if (ndfs_bf_find_free(&fs->bit_file, &sub_blk) != NDFS_OK) return 0;
+        ndfs_bf_mark_used(&fs->bit_file, sub_blk);
+        sub_page = write_page_ptr(fs, sub_blk);
+        if (!sub_page) return 0;
+        memset(sub_page, 0, NDFS_PAGE_SIZE);
+
+        /* Slot 0 of the new sub-index reuses the existing Indexed block
+         * verbatim -- its Type stays Indexed, so the existing SubIndexed
+         * read/write paths below (which expect each sub-index slot to point
+         * at a plain Indexed group block) resolve it exactly as they would
+         * any other group. */
+        group0.block_id = old_index_block_id;
+        group0.type = NDFS_PTR_INDEXED;
+        ndfs_bp_to_bytes(&group0, sub_page, 0);
+
+        /* Re-point the master block's object-file pointer at the new
+         * sub-index block and persist it immediately, before falling through
+         * into the (already-correct) SubIndexed handling below for the page
+         * actually being requested. */
+        mb->object_file_ptr.block_id = sub_blk;
+        mb->object_file_ptr.type = NDFS_PTR_SUBINDEXED;
+        persist_master_block(fs);
+    }
 
     if (mb->object_file_ptr.type == NDFS_PTR_INDEXED) {
         if (page_idx >= NDFS_MAX_OBJECT_FILE_PTRS) return 0;

@@ -905,39 +905,66 @@ export class NdfsFileSystem {
     if (!mb.objectFilePointer || !mb.objectFilePointer.isValid()) return;
     const pageIdx = Math.floor(objectIndex / ENTRIES_PER_PAGE);
 
-    const allocPage = (): number => {
-      const blk = this.bitFile.findFirstFreeBlock();
-      if (blk < 0) throw new Error('No free blocks for object directory page');
-      this.bitFile.markBlockUsed(blk);
-      this.writePage(blk, new Uint8Array(NDFS_PAGE_SIZE));
-      return blk;
-    };
+    if (mb.objectFilePointer.type === PointerType.Indexed && pageIdx < MAX_OBJECT_FILE_POINTERS) {
+      // Fits in the existing single-level index -- original behavior, unchanged.
+      this.ensureObjectDirPageInGroup(mb.objectFilePointer.blockId, pageIdx);
+      return;
+    }
 
     if (mb.objectFilePointer.type === PointerType.Indexed) {
-      const indexPage = this.readPage(mb.objectFilePointer.blockId);
-      const ptr = BlockPointer.fromBytes(indexPage, pageIdx * 4);
-      if (ptr.isValid()) return;
-      const blk = allocPage();
-      new BlockPointer(blk, PointerType.Contiguous).toBytes(indexPage, pageIdx * 4);
-      this.writePage(mb.objectFilePointer.blockId, indexPage);
-    } else if (mb.objectFilePointer.type === PointerType.SubIndexed) {
-      const subIdx = Math.floor(pageIdx / MAX_OBJECT_FILE_POINTERS);
-      const innerIdx = pageIdx % MAX_OBJECT_FILE_POINTERS;
-      const subPage = this.readPage(mb.objectFilePointer.blockId);
-      let subPtr = BlockPointer.fromBytes(subPage, subIdx * 4);
-      if (!subPtr.isValid()) {
-        const ib = allocPage();
-        new BlockPointer(ib, PointerType.Contiguous).toBytes(subPage, subIdx * 4);
-        this.writePage(mb.objectFilePointer.blockId, subPage);
-        subPtr = new BlockPointer(ib, PointerType.Contiguous);
-      }
-      const innerPage = this.readPage(subPtr.blockId);
-      const ptr = BlockPointer.fromBytes(innerPage, innerIdx * 4);
-      if (ptr.isValid()) return;
-      const blk = allocPage();
-      new BlockPointer(blk, PointerType.Contiguous).toBytes(innerPage, innerIdx * 4);
-      this.writePage(subPtr.blockId, innerPage);
+      // One-time conversion: the object file has grown past MAX_OBJECT_FILE_POINTERS
+      // (512) directory pages, so a plain Indexed structure can no longer address
+      // `pageIdx`. Wrap the existing Indexed block as group 0 of a new SubIndexed
+      // structure. No data migration -- the old block's directory-page pointers for
+      // pageIdx 0..511 stay exactly where they are; we only add a level of
+      // indirection above it (mirrors AllocateAndWriteData's own SubIndexed growth).
+      const oldIndexBlockId = mb.objectFilePointer.blockId;
+
+      const subIndexBlock = this.bitFile.findFirstFreeBlock();
+      if (subIndexBlock < 0) throw new Error('No free block for object-file sub-index conversion');
+      this.bitFile.markBlockUsed(subIndexBlock);
+
+      const subIndexBuffer = new Uint8Array(NDFS_PAGE_SIZE);
+      new BlockPointer(oldIndexBlockId, PointerType.Contiguous).toBytes(subIndexBuffer, 0);
+      this.writePage(subIndexBlock, subIndexBuffer);
+
+      mb.objectFilePointer = new BlockPointer(subIndexBlock, PointerType.SubIndexed);
+      this.persistMasterBlock();
     }
+
+    // SubIndexed case (either already was, or was just converted above).
+    const subIdx = Math.floor(pageIdx / MAX_OBJECT_FILE_POINTERS);
+    const innerIdx = pageIdx % MAX_OBJECT_FILE_POINTERS;
+    const subPage = this.readPage(mb.objectFilePointer.blockId);
+    let subPtr = BlockPointer.fromBytes(subPage, subIdx * 4);
+    if (!subPtr.isValid()) {
+      const ib = this.bitFile.findFirstFreeBlock();
+      if (ib < 0) throw new Error('No free block for object-file group index page');
+      this.bitFile.markBlockUsed(ib);
+      this.writePage(ib, new Uint8Array(NDFS_PAGE_SIZE));
+      new BlockPointer(ib, PointerType.Contiguous).toBytes(subPage, subIdx * 4);
+      this.writePage(mb.objectFilePointer.blockId, subPage);
+      subPtr = new BlockPointer(ib, PointerType.Contiguous);
+    }
+    this.ensureObjectDirPageInGroup(subPtr.blockId, innerIdx);
+  }
+
+  /**
+   * Ensure the directory data page at `pageIdx` within a single Indexed block
+   * (either the object file's top-level block, or one SubIndexed group's own
+   * index block) exists, allocating and linking it on demand.
+   */
+  private ensureObjectDirPageInGroup(indexBlockId: number, pageIdx: number): void {
+    const indexPage = this.readPage(indexBlockId);
+    const ptr = BlockPointer.fromBytes(indexPage, pageIdx * 4);
+    if (ptr.isValid()) return; // already allocated and linked
+
+    const blk = this.bitFile.findFirstFreeBlock();
+    if (blk < 0) throw new Error('No free blocks for object directory page');
+    this.bitFile.markBlockUsed(blk);
+    this.writePage(blk, new Uint8Array(NDFS_PAGE_SIZE));
+    new BlockPointer(blk, PointerType.Contiguous).toBytes(indexPage, pageIdx * 4);
+    this.writePage(indexBlockId, indexPage);
   }
 
   /**

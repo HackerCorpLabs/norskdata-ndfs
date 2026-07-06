@@ -1023,6 +1023,12 @@ class NdfsFileSystem:
         allocating and linking it on demand (each user's region grows as
         needed). Page index in the object-file index block is object_index/32;
         for user U that maps to index-pointer slots U*8..U*8+7.
+
+        If the object file is still a plain Indexed structure and growth
+        requires a page_idx past MAX_OBJECT_FILE_POINTERS (512 -- i.e. past
+        user #63's slots), it is converted to SubIndexed in place first (see
+        the one-time-conversion block below) before falling through to the
+        SubIndexed handling for the actual requested page.
         """
         mb = self._master_block
         if mb.object_file_pointer is None or not mb.object_file_pointer.is_valid():
@@ -1036,6 +1042,26 @@ class NdfsFileSystem:
             self._bit_file.mark_block_used(blk)
             self._write_page(blk, bytearray(NDFS_PAGE_SIZE))
             return blk
+
+        if mb.object_file_pointer.type == PointerType.Indexed and page_idx >= MAX_OBJECT_FILE_POINTERS:
+            # The object file (volume-wide directory listing every file across
+            # every user) has outgrown a single Indexed index block: 512
+            # directory-page slots is only 512*32 = 16384 objects, i.e. 64
+            # users at 8 reserved index-pointer slots each. Perform a
+            # one-time conversion to SubIndexed: allocate a fresh sub-index
+            # block, install the EXISTING Indexed block as its slot-0 entry
+            # (no data migration -- that block's directory-page pointers for
+            # page_idx 0..511 stay exactly where they are), then repoint the
+            # master block's object_file_pointer at the new sub-index block
+            # as SubIndexed and persist it. This mirrors the fix already
+            # applied to the C# NdfsFileSystem.EnsureObjectDirPage.
+            old_index_block = mb.object_file_pointer.block_id
+            new_sub_index_block = alloc_page()
+            sub_page = bytearray(NDFS_PAGE_SIZE)
+            BlockPointer(old_index_block, PointerType.Indexed).to_bytes(sub_page, 0)
+            self._write_page(new_sub_index_block, sub_page)
+            mb.object_file_pointer = BlockPointer(new_sub_index_block, PointerType.SubIndexed)
+            self._persist_master_block()
 
         if mb.object_file_pointer.type == PointerType.Indexed:
             index_page = bytearray(self._read_page(mb.object_file_pointer.block_id))

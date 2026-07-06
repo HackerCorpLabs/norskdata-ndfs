@@ -1019,6 +1019,246 @@ static int test_subindexed_overwrite_no_leak(void)
     return 0;
 }
 
+/* ---- Object-file Indexed -> SubIndexed conversion (the actual growth bug) ----
+ *
+ * A plain Indexed object file (the volume-wide directory listing every file
+ * across every user) caps out at 512 directory pages: object_index/32 gives
+ * the page index, and each user owns 8 consecutive pages (256 slots / 32
+ * entries-per-page), so 512 pages / 8 pages-per-user = 64 users. Past that,
+ * ensure_object_dir_page() used to just `return 0` (silent NDFS_ERR_NO_SPACE)
+ * instead of converting to SubIndexed, so user #64 onward could never get a
+ * file created. This test creates 80 users (well past the old 64-user
+ * ceiling) and confirms every one of them, including #64 upward, can create
+ * a file without error. */
+static int test_object_dir_converts_past_64_users(void)
+{
+    ndfs_filesystem_t *fs = create_writable(NDFS_TMPL_FLOPPY_12MB, "OBJGROW");
+    char uname[NDFS_NAME_MAX + 1];
+    char path[64];
+    int u;
+    const int num_users = 80;
+
+    TEST_ASSERT_NOT_NULL(fs);
+
+    for (u = 0; u < num_users; u++) {
+        snprintf(uname, sizeof(uname), "OU%03d", u);
+        TEST_ASSERT_OK(ndfs_add_user(fs, uname, 10));
+    }
+
+    /* One file per user, including every user from #64 upward -- these are
+     * exactly the ones that used to hit the page_idx >= 512 dead end. */
+    for (u = 0; u < num_users; u++) {
+        ndfs_object_entry_t entry;
+
+        snprintf(uname, sizeof(uname), "OU%03d", u);
+        snprintf(path, sizeof(path), "%s/F:DATA", uname);
+        TEST_ASSERT_OK(ndfs_write_file(fs, path, (const uint8_t *)"x", 1));
+
+        /* Confirm ownership: the object index's high byte must equal the
+         * owning user's index (SINTRAN partitions the object file so user U
+         * owns slots U*256..U*256+255). */
+        TEST_ASSERT_OK(ndfs_get_object_entry(fs, "F:DATA", uname, &entry));
+        TEST_ASSERT_EQUAL(entry.user_index, entry.object_index >> 8);
+    }
+
+    ndfs_close(fs);
+    return 0;
+}
+
+/* ---- The real 30,000-file test: forces the object file into 2+ SubIndexed
+ * groups, then closes and reopens fresh to prove the conversion persisted
+ * correctly on disk (not just in the live in-memory fs->objects[] array). ----
+ *
+ * 120 users x 250 files = 30,000 objects (well under NDFS's 256-user max and
+ * the 256-files-per-user cap). object_index/32 reaches up to roughly
+ * (120*256+249)/32 = 967, which spans TWO SubIndexed groups (group 0 =
+ * pages 0-511, group 1 = pages 512-1023) -- exactly the boundary the bug was
+ * hiding past. This is the single test that would have caught the original
+ * bug: without the conversion, every file for a user past #64 would fail
+ * with NDFS_ERR_NO_SPACE. */
+static int test_object_dir_30000_files_two_groups(void)
+{
+    ndfs_filesystem_t *fs = NULL;
+    ndfs_filesystem_t *fs2 = NULL;
+    ndfs_image_options_t opts;
+    uint8_t *exported = NULL;
+    size_t exported_size = 0;
+    char uname[NDFS_NAME_MAX + 1];
+    char path[64];
+    int u, f;
+    const int num_users = 120;
+    const int files_per_user = 250;
+    long total_written = 0;
+
+    /* Oversize generously: 30,000 files x 1 real page each (an empty file's
+     * own index block -- its zero-length content is a sparse hole and costs
+     * no additional disk space) + ~1000 pages for the object directory
+     * itself (sub-index + group index blocks + up to ~1000 directory data
+     * pages) + bitmap/user-file overhead. 100,000 pages (~195MB image) is
+     * comfortably beyond the ~31,000 actually needed, so a mid-test
+     * NDFS_ERR_NO_SPACE would mean a real regression, not an undersized
+     * fixture. */
+    ndfs_image_options_init(&opts);
+    opts.template_type = NDFS_TMPL_CUSTOM;
+    opts.custom_pages = 100000;
+    strncpy(opts.directory_name, "OBJ30K", NDFS_NAME_MAX);
+    opts.directory_name[NDFS_NAME_MAX] = '\0';
+
+    TEST_ASSERT_OK(ndfs_create_image(&fs, &opts));
+    TEST_ASSERT_NOT_NULL(fs);
+
+    for (u = 0; u < num_users; u++) {
+        snprintf(uname, sizeof(uname), "BU%03d", u);
+        TEST_ASSERT_OK(ndfs_add_user(fs, uname, (uint32_t)(files_per_user + 10)));
+    }
+
+    for (u = 0; u < num_users; u++) {
+        snprintf(uname, sizeof(uname), "BU%03d", u);
+        for (f = 0; f < files_per_user; f++) {
+            snprintf(path, sizeof(path), "%s/F%03d:DATA", uname, f);
+            TEST_ASSERT_OK(ndfs_write_file(fs, path, (const uint8_t *)"x", 1));
+            total_written++;
+        }
+    }
+    TEST_ASSERT_EQUAL(num_users * files_per_user, total_written);
+
+    /* Close and reopen from a fresh export -- proves the conversion (master
+     * block's object_file_ptr now SubIndexed, sub-index block, group index
+     * blocks, and every directory page link) is correctly persisted on disk,
+     * not just live in fs->objects[] from the session that wrote them. */
+    TEST_ASSERT_OK(ndfs_to_buffer(fs, &exported, &exported_size));
+    ndfs_close(fs);
+    fs = NULL;
+    TEST_ASSERT_OK(ndfs_open_buffer_copy(exported, exported_size, true, &fs2));
+    free(exported);
+
+    /* Spot-check ownership at three points: first group (user #0), the
+     * group-0/group-1 boundary (user #63, whose slots still land just under
+     * page_idx 512), and deep in the second group (user #119). */
+    {
+        int check_users[3];
+        size_t ci;
+        check_users[0] = 0;
+        check_users[1] = 63;
+        check_users[2] = 119;
+
+        for (ci = 0; ci < 3; ci++) {
+            ndfs_object_entry_t entry;
+            u = check_users[ci];
+            snprintf(uname, sizeof(uname), "BU%03d", u);
+            for (f = 0; f < files_per_user; f += 49) { /* sample, not every file */
+                snprintf(path, sizeof(path), "F%03d:DATA", f);
+                TEST_ASSERT_OK(ndfs_get_object_entry(fs2, path, uname, &entry));
+                TEST_ASSERT_EQUAL_STRING(uname, entry.user_name);
+                TEST_ASSERT_EQUAL(entry.user_index, entry.object_index >> 8);
+            }
+        }
+    }
+
+    /* Full-count verification: every single one of the 30,000 files must be
+     * present and readable after the fresh reopen -- not just the sampled
+     * spot-checks above. */
+    {
+        long verified = 0;
+        for (u = 0; u < num_users; u++) {
+            snprintf(uname, sizeof(uname), "BU%03d", u);
+            for (f = 0; f < files_per_user; f++) {
+                bool exists = false;
+                snprintf(path, sizeof(path), "%s/F%03d:DATA", uname, f);
+                TEST_ASSERT_OK(ndfs_file_exists(fs2, path, &exists));
+                TEST_ASSERT(exists);
+                verified++;
+            }
+        }
+        TEST_ASSERT_EQUAL(num_users * files_per_user, verified);
+    }
+
+    ndfs_close(fs2);
+    return 0;
+}
+
+/* ---- Delete + recreate a file whose directory page lives in the SECOND
+ * SubIndexed group (user index ~65-70, past the group-0/group-1 boundary at
+ * user #64) -- not just create-only, to prove the delete path's
+ * free_file_blocks()/write_object_page() also correctly resolve a directory
+ * page reached via the (converted) SubIndexed structure. ---- */
+static int test_object_dir_delete_recreate_in_second_group(void)
+{
+    ndfs_filesystem_t *fs = create_writable(NDFS_TMPL_FLOPPY_12MB, "OBJDELRC");
+    char uname[NDFS_NAME_MAX + 1];
+    int u;
+    /* Loop count of users to create before the target -- SYSTEM already
+     * occupies user_index 0, so the Nth user added (0-based loop counter)
+     * actually receives user_index N+1. We create 67 named users so the
+     * LAST one added ("DU066") lands at user_index 67, whose object_index/32
+     * for its first slot is (67*256)/32 = 536 -- inside group 1
+     * (pages 512-1023), past the group-0/group-1 boundary at user #64. The
+     * exact assigned index is looked up via ndfs_get_users() below rather
+     * than assumed, so this test does not silently drift if user-slot
+     * assignment ever changes. */
+    const int num_setup_users = 67;
+    uint8_t target_user_index = 0;
+    ndfs_object_entry_t entry_before, entry_after;
+    uint8_t *read_data = NULL;
+    size_t read_size = 0;
+    char target_uname[NDFS_NAME_MAX + 1];
+    char target_path[64];
+
+    TEST_ASSERT_NOT_NULL(fs);
+
+    for (u = 0; u < num_setup_users; u++) {
+        snprintf(uname, sizeof(uname), "DU%03d", u);
+        TEST_ASSERT_OK(ndfs_add_user(fs, uname, 10));
+    }
+    strncpy(target_uname, uname, sizeof(target_uname) - 1); /* last user added */
+    target_uname[sizeof(target_uname) - 1] = '\0';
+
+    /* Resolve the actual on-disk user_index assigned to the target user
+     * (rather than assuming it equals the loop counter, since SYSTEM's
+     * pre-existing slot 0 shifts every subsequently-added user by one). */
+    {
+        ndfs_user_entry_t *users = NULL;
+        size_t count = 0, i;
+        TEST_ASSERT_OK(ndfs_get_users(fs, &users, &count));
+        for (i = 0; i < count; i++) {
+            if (strcmp(users[i].user_name, target_uname) == 0) {
+                target_user_index = users[i].user_index;
+                break;
+            }
+        }
+        ndfs_free_users(users);
+    }
+    /* Confirm the setup actually reaches past the group-0/group-1 boundary --
+     * otherwise this test would silently degrade into a no-op that never
+     * exercises the SubIndexed conversion at all. */
+    TEST_ASSERT(((uint32_t)target_user_index * 256u) / NDFS_ENTRIES_PER_PAGE
+                >= NDFS_MAX_OBJECT_FILE_PTRS);
+
+    snprintf(target_path, sizeof(target_path), "%s/ONE:DATA", target_uname);
+
+    TEST_ASSERT_OK(ndfs_write_file(fs, target_path, (const uint8_t *)"first", 5));
+    TEST_ASSERT_OK(ndfs_get_object_entry(fs, "ONE:DATA", target_uname, &entry_before));
+    TEST_ASSERT_EQUAL(target_user_index, entry_before.object_index >> 8);
+
+    TEST_ASSERT_OK(ndfs_delete_file(fs, target_path));
+
+    /* Recreate at the same path -- must land back in the same user region
+     * (same high byte), and its content must be the NEW content, not a
+     * leftover of the deleted file's blocks. */
+    TEST_ASSERT_OK(ndfs_write_file(fs, target_path,
+                                   (const uint8_t *)"second-content", 14));
+    TEST_ASSERT_OK(ndfs_get_object_entry(fs, "ONE:DATA", target_uname, &entry_after));
+    TEST_ASSERT_EQUAL(target_user_index, entry_after.object_index >> 8);
+
+    TEST_ASSERT_OK(ndfs_read_file(fs, target_path, &read_data, &read_size));
+    TEST_ASSERT_EQUAL(14, read_size);
+    TEST_ASSERT(memcmp(read_data, "second-content", 14) == 0);
+    ndfs_free_data(read_data);
+
+    ndfs_close(fs);
+    return 0;
+}
+
 /* ---- Master block "Unreserved Pages" stays in sync on file create/delete ----
  *
  * Real SINTRAN reads master_block.unreserved_pages directly to report free
@@ -1420,6 +1660,9 @@ void run_write_comprehensive_tests(void)
     RUN_TEST(test_subindexed_sparse_holes);
     RUN_TEST(test_subindexed_delete_frees_all_blocks);
     RUN_TEST(test_subindexed_overwrite_no_leak);
+    RUN_TEST(test_object_dir_converts_past_64_users);
+    RUN_TEST(test_object_dir_30000_files_two_groups);
+    RUN_TEST(test_object_dir_delete_recreate_in_second_group);
     RUN_TEST(test_quota_fully_sparse_file_charges_zero);
     RUN_TEST(test_quota_mixed_sparse_charges_only_real);
     RUN_TEST(test_quota_fully_real_file_no_index_overhead);
