@@ -211,6 +211,34 @@ class TestSubIndexedOverwriteDoesNotLeak:
         assert free_after_b <= free_after_a
 
 
+class TestSubIndexedSparseQuotaAccounting:
+    def test_mostly_sparse_subindexed_file_charges_only_real_pages(self):
+        # A file large enough to require SubIndexed (>512 pages) with real
+        # data confined to a few pages -- user.pages_used quota must not
+        # charge for the sub-index block or any group index blocks, only
+        # the handful of genuinely non-sparse pages.
+        ndfs = _make_fs(pages=900)
+        num_pages = 600
+        data = bytearray(NDFS_PAGE_SIZE * num_pages)
+        pattern_pages = (2,)
+        for pg in pattern_pages:
+            start = pg * NDFS_PAGE_SIZE
+            for i in range(start, start + NDFS_PAGE_SIZE):
+                data[i] = 0xCC
+        # Second real page, straddling nothing in particular -- just two
+        # real pages total among 598 sparse holes.
+        data[0] = 0xAA
+
+        used_before = ndfs.get_user(0).pages_used
+        ndfs.write_file("SYSTEM/BIGSPARSE:DAT", data)
+        used_after = ndfs.get_user(0).pages_used
+
+        assert used_after - used_before == 2, (
+            "only the 2 real pages count -- none of the sub-index block or "
+            "group index blocks this file needed"
+        )
+
+
 class TestExactBoundaryStillIndexed:
     def test_exactly_512_pages_uses_plain_indexed(self):
         # Pin the boundary: exactly MAX_OBJECT_FILE_POINTERS (512) data

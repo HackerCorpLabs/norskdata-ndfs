@@ -243,27 +243,21 @@ export class NdfsFileSystem {
     const user = this.resolveUser(userName);
     if (!user) throw new Error(`User not found: ${userName || '(default)'}`);
 
-    // Calculate required pages (data pages + index blocks)
-    let dataPages = Math.ceil(fileData.length / NDFS_PAGE_SIZE);
-    if (dataPages === 0) dataPages = 1;
-    const indexBlocks = dataPages > MAX_OBJECT_FILE_POINTERS
-      ? 1 + Math.ceil(dataPages / MAX_OBJECT_FILE_POINTERS)
-      : 1;
-    const totalRequired = dataPages + indexBlocks;
+    // Calculate required pages. Quota tracks only REAL disk consumption:
+    // sparse (all-zero) pages allocate no block (see writeDataPageToIndex's
+    // zero-check, reused by countRealDataPages), and the index/sub-index
+    // structural blocks are filesystem overhead, not user data.
+    const requiredRealPages = this.countRealDataPages(fileData);
 
     // Check for existing file
     const existing = this.objectFile.findObject(objectName, user.userName);
 
-    // Determine additional pages needed
-    let additionalNeeded = totalRequired;
+    // Determine additional pages needed, comparing against the existing
+    // file's real (non-sparse) page count — not its logical page count.
+    let additionalNeeded = requiredRealPages;
     if (existing) {
-      const existingIndexBlocks =
-        existing.filePointer &&
-        existing.filePointer.type === PointerType.SubIndexed
-          ? 1 + Math.ceil(existing.pagesInFile / MAX_OBJECT_FILE_POINTERS)
-          : 1;
-      const existingTotal = existing.pagesInFile + existingIndexBlocks;
-      additionalNeeded = totalRequired > existingTotal ? totalRequired - existingTotal : 0;
+      const existingRealPages = this.countRealDataPagesInList(this.resolveDataPointers(existing));
+      additionalNeeded = requiredRealPages > existingRealPages ? requiredRealPages - existingRealPages : 0;
     }
 
     // Check and expand quota if needed
@@ -295,25 +289,22 @@ export class NdfsFileSystem {
     const obj = this.findObject(path);
     if (!obj) throw new Error(`File not found: ${path}`);
 
+    // Resolve the file's real data-block pointers BEFORE freeing them, so the
+    // quota refund below can count exactly which pages were real vs. sparse.
+    const dataPointers = this.resolveDataPointers(obj);
+
     // Free blocks
     if (obj.filePointer && obj.filePointer.blockId > 0) {
       this.freeFileBlocks(obj);
     }
 
-    // Update user pages used
+    // Update user pages used. Quota tracks only REAL disk consumption: count
+    // actual data blocks freed (sparse holes report blockId===0 in
+    // dataPointers), never the index/sub-index structural block itself.
     const user = this.userFile.getUser(obj.userIndex);
     if (user) {
-      let indexBlocks = 0;
-      if (obj.filePointer) {
-        if (obj.filePointer.type === PointerType.Indexed) {
-          indexBlocks = 1;
-        } else if (obj.filePointer.type === PointerType.SubIndexed) {
-          indexBlocks =
-            1 + Math.ceil(obj.pagesInFile / MAX_OBJECT_FILE_POINTERS);
-        }
-      }
-      const totalBlocks = obj.pagesInFile + indexBlocks;
-      user.pagesUsed = user.pagesUsed >= totalBlocks ? user.pagesUsed - totalBlocks : 0;
+      const realPages = this.countRealDataPagesInList(dataPointers);
+      user.pagesUsed = user.pagesUsed >= realPages ? user.pagesUsed - realPages : 0;
     }
 
     // Surgical writes: capture index/owner before removal, then rewrite the
@@ -990,8 +981,7 @@ export class NdfsFileSystem {
     if (slot < 0) throw new Error(`User ${user.userName} object table is full`);
     this.ensureObjectDirPage(slot);
 
-    const { topBlockId, pointerType, indexBlocksUsed } =
-      this.allocateAndWriteData(fileData, dataPages);
+    const { topBlockId, pointerType } = this.allocateAndWriteData(fileData, dataPages);
 
     // Create object entry
     const entry = new ObjectEntry();
@@ -1015,8 +1005,11 @@ export class NdfsFileSystem {
     entry.prevVersion = entry.objectIndex;
     this.objectFile.addObject(entry);
 
-    // Update user pages used
-    user.pagesUsed += dataPages + indexBlocksUsed;
+    // Update user pages used. Quota tracks only REAL disk consumption: sparse
+    // holes allocate no block (see writeDataPageToIndex's zero-check, reused
+    // by countRealDataPages) and the index/sub-index structural blocks are
+    // filesystem overhead, not charged against the user.
+    user.pagesUsed += this.countRealDataPages(fileData);
 
     // Surgical writes: new object's page, owner's user page, bitmap.
     this.writeObjectPage(entry.objectIndex);
@@ -1029,38 +1022,33 @@ export class NdfsFileSystem {
     user: UserEntry,
     fileData: Uint8Array,
   ): void {
-    // Calculate old total blocks (data + index blocks)
-    let oldIndexBlocks = 1;
-    if (
-      existing.filePointer &&
-      existing.filePointer.type === PointerType.SubIndexed
-    ) {
-      // Sub-indexed: 1 sub-index + ceil(pages/512) index blocks
-      oldIndexBlocks =
-        1 + Math.ceil(existing.pagesInFile / MAX_OBJECT_FILE_POINTERS);
-    }
-    const oldTotal = existing.pagesInFile + oldIndexBlocks;
+    // Resolve the OLD file's real (non-sparse) data-block pointers BEFORE
+    // freeing them, so the refund below counts exactly which old pages were
+    // real vs. sparse (never the index/sub-index structural blocks that
+    // freeFileBlocks() also releases).
+    const oldRealPages = this.countRealDataPagesInList(this.resolveDataPointers(existing));
 
     // Free old blocks
     this.freeFileBlocks(existing);
 
     // Subtract old usage
-    user.pagesUsed = user.pagesUsed >= oldTotal ? user.pagesUsed - oldTotal : 0;
+    user.pagesUsed = user.pagesUsed >= oldRealPages ? user.pagesUsed - oldRealPages : 0;
 
     // Allocate new blocks
     let dataPages = Math.ceil(fileData.length / NDFS_PAGE_SIZE);
     if (dataPages === 0) dataPages = 1;
 
-    const { topBlockId, pointerType, indexBlocksUsed } =
-      this.allocateAndWriteData(fileData, dataPages);
+    const { topBlockId, pointerType } = this.allocateAndWriteData(fileData, dataPages);
 
     // Update existing entry
     existing.pagesInFile = dataPages;
     existing.bytesInFile = fileData.length > 0 ? fileData.length : 1;
     existing.filePointer = new BlockPointer(topBlockId, pointerType);
 
-    // Update user pages used
-    user.pagesUsed += dataPages + indexBlocksUsed;
+    // Update user pages used. Quota tracks only REAL disk consumption: charge
+    // only the new file's real (non-sparse) data pages, never the
+    // index/sub-index structural block overhead.
+    user.pagesUsed += this.countRealDataPages(fileData);
 
     // Surgical writes: the file's object page, owner's user page, bitmap.
     this.writeObjectPage(existing.objectIndex);
@@ -1071,32 +1059,116 @@ export class NdfsFileSystem {
   private freeFileBlocks(obj: ObjectEntry): void {
     if (!obj.filePointer || obj.filePointer.blockId === 0) return;
 
-    if (obj.filePointer.type === PointerType.Indexed) {
-      const indexPage = this.readPage(obj.filePointer.blockId);
-      for (let i = 0; i < MAX_OBJECT_FILE_POINTERS; i++) {
-        const ptr = BlockPointer.fromBytes(indexPage, i * 4);
-        if (ptr.blockId > 0) {
-          this.bitFile.markBlockFree(ptr.blockId);
-        }
+    if (obj.filePointer.type === PointerType.Contiguous) {
+      // Contiguous files have no sparse holes or structural blocks: every
+      // page from blockId..blockId+pagesInFile-1 is a real, directly-freeable block.
+      this.bitFile.freeBlocks(obj.filePointer.blockId, obj.pagesInFile);
+      return;
+    }
+
+    // Free the real (non-sparse) data blocks, resolved the same way
+    // countRealDataPagesInList() counts them for quota accounting.
+    const dataPointers = this.resolveDataPointers(obj);
+    for (let i = 0; i < dataPointers.length; i++) {
+      if (dataPointers[i].blockId > 0) {
+        this.bitFile.markBlockFree(dataPointers[i].blockId);
       }
+    }
+
+    if (obj.filePointer.type === PointerType.Indexed) {
       // Free the index block itself
       this.bitFile.markBlockFree(obj.filePointer.blockId);
-    } else if (obj.filePointer.type === PointerType.Contiguous) {
-      this.bitFile.freeBlocks(obj.filePointer.blockId, obj.pagesInFile);
     } else if (obj.filePointer.type === PointerType.SubIndexed) {
       const subIndexPage = this.readPage(obj.filePointer.blockId);
       for (let si = 0; si < MAX_OBJECT_FILE_POINTERS; si++) {
         const indexPtr = BlockPointer.fromBytes(subIndexPage, si * 4);
         if (!indexPtr.isValid()) continue;
-        const indexPage = this.readPage(indexPtr.blockId);
-        for (let i = 0; i < MAX_OBJECT_FILE_POINTERS; i++) {
-          const dataPtr = BlockPointer.fromBytes(indexPage, i * 4);
-          if (dataPtr.blockId > 0) this.bitFile.markBlockFree(dataPtr.blockId);
-        }
+        // Free each group index block (structural, not user data).
         this.bitFile.markBlockFree(indexPtr.blockId);
       }
+      // Free the top-level sub-index block itself.
       this.bitFile.markBlockFree(obj.filePointer.blockId);
     }
+  }
+
+  /**
+   * Resolve a file's real data-block pointers into a flat list, one entry per
+   * logical data page — excludes the index/sub-index structural blocks
+   * entirely. Sparse holes report blockId===0 (BlockPointer.isValid() false),
+   * matching writeDataPageToIndex()'s sparse encoding. Used both to free real
+   * data blocks (freeFileBlocks) and to count real (non-sparse) pages for
+   * user quota accounting (countRealDataPagesInList).
+   */
+  private resolveDataPointers(obj: ObjectEntry): BlockPointer[] {
+    const pointers: BlockPointer[] = [];
+    if (!obj.filePointer || obj.filePointer.blockId === 0) return pointers;
+
+    if (obj.filePointer.type === PointerType.Contiguous) {
+      // Contiguous files have no sparse holes: every page is a real block.
+      for (let i = 0; i < obj.pagesInFile; i++) {
+        pointers.push(new BlockPointer(obj.filePointer.blockId + i, PointerType.Contiguous));
+      }
+    } else if (obj.filePointer.type === PointerType.Indexed) {
+      const indexPage = this.readPage(obj.filePointer.blockId);
+      for (let i = 0; i < obj.pagesInFile && i < MAX_OBJECT_FILE_POINTERS; i++) {
+        pointers.push(BlockPointer.fromBytes(indexPage, i * 4));
+      }
+    } else if (obj.filePointer.type === PointerType.SubIndexed) {
+      const subIndexPage = this.readPage(obj.filePointer.blockId);
+      let pageCount = 0;
+      for (let si = 0; si < MAX_OBJECT_FILE_POINTERS && pageCount < obj.pagesInFile; si++) {
+        const indexPtr = BlockPointer.fromBytes(subIndexPage, si * 4);
+        if (!indexPtr.isValid()) continue;
+        const indexPage = this.readPage(indexPtr.blockId);
+        for (let i = 0; i < MAX_OBJECT_FILE_POINTERS && pageCount < obj.pagesInFile; i++) {
+          pointers.push(BlockPointer.fromBytes(indexPage, i * 4));
+          pageCount++;
+        }
+      }
+    }
+    return pointers;
+  }
+
+  /**
+   * Count how many of a file's logical pages are NOT sparse holes — i.e. how
+   * many pages writeDataPageToIndex() will actually allocate a real disk
+   * block for. User quota (pagesUsed) must track only real disk consumption:
+   * the logical page count counts sparse holes as if they consumed space,
+   * and the index/sub-index structural blocks are filesystem overhead, not
+   * user data.
+   */
+  private countRealDataPages(data: Uint8Array): number {
+    let filePages = Math.ceil(data.length / NDFS_PAGE_SIZE);
+    if (filePages === 0) filePages = 1;
+
+    let realPages = 0;
+    for (let i = 0; i < filePages; i++) {
+      const pageOffset = i * NDFS_PAGE_SIZE;
+      const pageEnd = Math.min(pageOffset + NDFS_PAGE_SIZE, data.length);
+      const pageSlice = data.subarray(pageOffset, pageEnd);
+
+      // Same all-zero check as writeDataPageToIndex(): a short final page
+      // (pageSlice.length < NDFS_PAGE_SIZE) is never sparse-eligible.
+      let allZeros = pageSlice.length === NDFS_PAGE_SIZE;
+      for (let b = 0; b < pageSlice.length && allZeros; b++) {
+        if (pageSlice[b] !== 0) allZeros = false;
+      }
+      if (!allZeros) realPages++;
+    }
+    return realPages;
+  }
+
+  /**
+   * Count real (non-sparse) data-block pointers in an already-resolved block
+   * list, as returned by resolveDataPointers(). Sparse holes report
+   * blockId===0, matching writeDataPageToIndex()'s sparse encoding.
+   */
+  private countRealDataPagesInList(pointers: BlockPointer[]): number {
+    let count = 0;
+    for (let i = 0; i < pointers.length; i++) {
+      if (pointers[i].blockId > 0) count++;
+    }
+    return count;
   }
 
   /**

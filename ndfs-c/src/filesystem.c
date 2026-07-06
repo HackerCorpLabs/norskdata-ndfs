@@ -69,6 +69,11 @@ static ndfs_error_t read_object_data(const struct ndfs_filesystem *fs,
                                      uint8_t **out_data, size_t *out_size);
 static void free_file_blocks(struct ndfs_filesystem *fs,
                              const ndfs_object_entry_t *obj);
+static uint32_t count_real_data_pages_in_buffer(const uint8_t *file_data,
+                                                size_t file_size,
+                                                uint32_t data_pages);
+static uint32_t count_real_data_pages_in_object(const struct ndfs_filesystem *fs,
+                                                const ndfs_object_entry_t *obj);
 static ndfs_error_t create_new_file(struct ndfs_filesystem *fs,
                                     const char *obj_name, const char *file_type,
                                     int user_idx,
@@ -580,6 +585,65 @@ static void free_file_blocks(struct ndfs_filesystem *fs,
     }
 }
 
+/* Count real (non-sparse) data-block pages currently belonging to `obj`, by
+ * walking its resolved Indexed/SubIndexed/Contiguous block structure exactly
+ * the way free_file_blocks() walks it to free them -- except this counts
+ * non-zero (real) BlockPointers instead of freeing them, and never counts
+ * the index/sub-index structural blocks themselves.
+ *
+ * This is the disk-truth of how many real pages a file occupies. User quota
+ * (pages_used) must be based on this, not on `pages_in_file` (the LOGICAL
+ * page count, which counts sparse holes as if they consumed real disk space
+ * -- they do NOT, per docs/NDFS-FORMAT.md's "No disk space is allocated for
+ * sparse holes") and never plus a flat structural-block estimate (the
+ * index/sub-index blocks are filesystem overhead, not user data, and must
+ * never count against a user's quota).
+ *
+ * Callers computing a REFUND/DECREMENT (delete, or update's old-side charge)
+ * must call this BEFORE any free_file_blocks()/allocate_and_write_data() call
+ * touches the same blocks, since those can overwrite the on-disk bytes this
+ * function reads. */
+static uint32_t count_real_data_pages_in_object(const struct ndfs_filesystem *fs,
+                                                const ndfs_object_entry_t *obj)
+{
+    uint32_t count = 0;
+    size_t i;
+
+    if (!obj->file_pointer.block_id) return 0;
+
+    if (obj->file_pointer.type == NDFS_PTR_CONTIGUOUS) {
+        /* Contiguous files have no sparse holes -- every logical page is a
+         * real, physically-allocated page. */
+        return obj->pages_in_file;
+    } else if (obj->file_pointer.type == NDFS_PTR_INDEXED) {
+        const uint8_t *index_page = read_page(fs, obj->file_pointer.block_id);
+        if (index_page) {
+            for (i = 0; i < NDFS_MAX_OBJECT_FILE_PTRS; i++) {
+                ndfs_block_pointer_t ptr = ndfs_bp_from_bytes(index_page, i * 4);
+                if (ptr.block_id > 0) count++;
+            }
+        }
+    } else if (obj->file_pointer.type == NDFS_PTR_SUBINDEXED) {
+        const uint8_t *sub_page = read_page(fs, obj->file_pointer.block_id);
+        size_t si;
+        if (sub_page) {
+            for (si = 0; si < NDFS_MAX_OBJECT_FILE_PTRS; si++) {
+                ndfs_block_pointer_t idx_ptr = ndfs_bp_from_bytes(sub_page, si * 4);
+                const uint8_t *idx_page;
+                if (!ndfs_bp_is_valid(&idx_ptr)) continue;
+                idx_page = read_page(fs, idx_ptr.block_id);
+                if (idx_page) {
+                    for (i = 0; i < NDFS_MAX_OBJECT_FILE_PTRS; i++) {
+                        ndfs_block_pointer_t dp = ndfs_bp_from_bytes(idx_page, i * 4);
+                        if (dp.block_id > 0) count++;
+                    }
+                }
+            }
+        }
+    }
+    return count;
+}
+
 /* ── File creation/update ────────────────────────────────────────── */
 
 /* Find the next free object slot WITHIN a user's region. SINTRAN partitions
@@ -776,6 +840,56 @@ static ndfs_error_t write_data_page_to_index(struct ndfs_filesystem *fs,
     return NDFS_OK;
 }
 
+/* Count how many of a file's `data_pages` logical pages are NOT sparse holes
+ * -- i.e. how many pages write_data_page_to_index() will actually allocate a
+ * real disk block for, given the exact same (file_data, file_size,
+ * data_page_index) it is called with. Deliberately takes the already-decided
+ * `data_pages` (post "if 0 then 1" clamp, as computed by every call site
+ * before invoking allocate_and_write_data()) rather than recomputing it from
+ * file_size, so this can never silently disagree with what actually gets
+ * allocated -- notably for an empty (0-byte) file, which still allocates
+ * exactly one real page (see write_data_page_to_index's slice_len != full
+ * page case), not zero.
+ *
+ * User quota (pages_used) must be based on this count, never on the LOGICAL
+ * page count (which counts sparse holes as if they consumed real disk space
+ * -- they do NOT, per docs/NDFS-FORMAT.md's "No disk space is allocated for
+ * sparse holes") and never plus a flat structural index/sub-index block
+ * estimate (filesystem overhead, not user data -- never charged to a user's
+ * quota). */
+static uint32_t count_real_data_pages_in_buffer(const uint8_t *file_data,
+                                                size_t file_size,
+                                                uint32_t data_pages)
+{
+    uint32_t real_pages = 0;
+    uint32_t p;
+
+    for (p = 0; p < data_pages; p++) {
+        size_t page_offset = (size_t)p * NDFS_PAGE_SIZE;
+        size_t page_end = page_offset + NDFS_PAGE_SIZE;
+        size_t slice_len;
+        bool all_zeros = true;
+        size_t b;
+
+        if (page_end > file_size) page_end = file_size;
+        slice_len = page_end > page_offset ? page_end - page_offset : 0;
+
+        for (b = 0; b < slice_len; b++) {
+            if (file_data[page_offset + b] != 0) {
+                all_zeros = false;
+                break;
+            }
+        }
+
+        /* Mirrors write_data_page_to_index() exactly: only a FULL (unsliced)
+         * all-zero page becomes a sparse hole. */
+        if (!(all_zeros && slice_len == NDFS_PAGE_SIZE)) {
+            real_pages++;
+        }
+    }
+    return real_pages;
+}
+
 /* Allocate and write the data-block structure for a file of `data_pages`
  * pages, choosing between the plain Indexed layout (<=512 pages: one index
  * block with up to 512 data-page pointers) and the SubIndexed layout (up to
@@ -960,8 +1074,15 @@ static ndfs_error_t create_new_file(struct ndfs_filesystem *fs,
 
     add_object(fs, &entry);
 
-    /* Update user pages used (data pages + structural index/sub-index pages) */
-    fs->users[user_slot].pages_used += data_pages + struct_pages;
+    /* Update user pages used. Quota tracks only REAL disk consumption:
+     * sparse (all-zero) pages allocate no block and the index/sub-index
+     * structural blocks are filesystem overhead, never charged against the
+     * user -- see count_real_data_pages_in_buffer(). struct_pages is still
+     * needed as an out-param of allocate_and_write_data() above, but is no
+     * longer part of the quota charge. */
+    fs->users[user_slot].pages_used +=
+        count_real_data_pages_in_buffer(file_data, file_size, data_pages);
+    (void)struct_pages;
 
     /* Surgical writes: the new object's directory page, the owner's user page,
      * and the allocation bitmap. Index/data blocks were written above. */
@@ -977,26 +1098,21 @@ static ndfs_error_t update_existing_file(struct ndfs_filesystem *fs,
                                          const uint8_t *file_data, size_t file_size)
 {
     ndfs_object_entry_t *existing = &fs->objects[obj_idx];
-    /* The old structural cost is 1 page (a plain index block) UNLESS the
-     * existing file is itself SubIndexed, in which case it is the sub-index
-     * block plus one group index block per already-allocated 512-page group.
-     * Undercounting this (as a flat "+1" would) understates freed pages on
-     * overwrite and leaks quota/free-space across repeated writes to a large
-     * file -- the exact leak class already found and fixed in the C# port's
-     * AllocateFileBlocksSparse. */
-    uint32_t old_struct_pages = 1;
-    uint32_t old_total;
+    /* Real (non-sparse) pages actually charged against quota for the file's
+     * OLD contents -- computed BEFORE anything is freed or reallocated,
+     * since free_file_blocks()/allocate_and_write_data() below can overwrite
+     * the very on-disk bytes count_real_data_pages_in_object() reads. This
+     * replaces the old flat "pages_in_file + structural block(s)" estimate,
+     * which overcounted sparse holes as real usage and always charged for
+     * index/sub-index structural blocks that are filesystem overhead, not
+     * user data -- the exact leak class already found and fixed in the C#
+     * port's AllocateFileBlocksSparse. */
+    uint32_t old_real_pages = count_real_data_pages_in_object(fs, existing);
     uint32_t data_pages;
     uint32_t top_block_id;
     ndfs_pointer_type_t pointer_type;
     uint32_t struct_pages;
     ndfs_error_t err;
-
-    if (existing->file_pointer.type == NDFS_PTR_SUBINDEXED) {
-        old_struct_pages = 1 +
-            (existing->pages_in_file + NDFS_MAX_OBJECT_FILE_PTRS - 1) / NDFS_MAX_OBJECT_FILE_PTRS;
-    }
-    old_total = existing->pages_in_file + old_struct_pages;
 
     /* Validate the new size BEFORE freeing the old blocks, so a rejected
      * write leaves the existing file (and its accounting) untouched. */
@@ -1007,8 +1123,8 @@ static ndfs_error_t update_existing_file(struct ndfs_filesystem *fs,
     /* Free old blocks */
     free_file_blocks(fs, existing);
     fs->users[user_slot].pages_used =
-        fs->users[user_slot].pages_used >= old_total
-            ? fs->users[user_slot].pages_used - old_total : 0;
+        fs->users[user_slot].pages_used >= old_real_pages
+            ? fs->users[user_slot].pages_used - old_real_pages : 0;
 
     /* Allocate + write the new data-block structure: plain Indexed for
      * <=512 pages, or SubIndexed for larger files. */
@@ -1026,7 +1142,13 @@ static ndfs_error_t update_existing_file(struct ndfs_filesystem *fs,
      * dates and versioning are intentionally preserved. */
     existing->file_type_flags = NDFS_FT_INDEXED;
 
-    fs->users[user_slot].pages_used += data_pages + struct_pages;
+    /* Charge only real (non-sparse) pages of the NEW content. struct_pages
+     * is still needed as an out-param of allocate_and_write_data() above,
+     * but is no longer part of the quota charge -- see
+     * count_real_data_pages_in_buffer(). */
+    fs->users[user_slot].pages_used +=
+        count_real_data_pages_in_buffer(file_data, file_size, data_pages);
+    (void)struct_pages;
 
     /* Surgical writes: the file's object page, the owner's user page, and the
      * allocation bitmap (old blocks freed + new blocks allocated above). */
@@ -1486,7 +1608,7 @@ ndfs_error_t ndfs_write_file(ndfs_filesystem_t *fs,
     char file_type[NDFS_TYPE_MAX + 1];
     int user_slot;
     int existing_idx;
-    uint32_t data_pages, total_required, additional_needed;
+    uint32_t data_pages, additional_needed;
     ndfs_user_entry_t *user;
     ndfs_error_t err;
 
@@ -1515,32 +1637,29 @@ ndfs_error_t ndfs_write_file(ndfs_filesystem_t *fs,
     if (user_slot < 0) return NDFS_ERR_NOT_FOUND;
     user = &fs->users[user_slot];
 
-    /* Calculate required pages (data pages + structural index/sub-index
-     * pages). A file needing more than one index block's worth of pointers
-     * (>512 pages) will be laid out SubIndexed: 1 sub-index block plus one
-     * group index block per 512-page group -- mirrors the TS port's
-     * writeFile() quota pre-check (indexBlocks calculation). */
+    /* Calculate real (non-sparse) pages the new content needs. Quota is
+     * charged only for real disk consumption -- sparse (all-zero) pages
+     * allocate no block, and the index/sub-index structural pages a large
+     * file needs are filesystem overhead, never charged to the user. See
+     * count_real_data_pages_in_buffer(). */
     data_pages = (uint32_t)((file_size + NDFS_PAGE_SIZE - 1) / NDFS_PAGE_SIZE);
     if (data_pages == 0) data_pages = 1;
-    {
-        uint32_t struct_pages_needed = data_pages > NDFS_MAX_OBJECT_FILE_PTRS
-            ? 1 + (data_pages + NDFS_MAX_OBJECT_FILE_PTRS - 1) / NDFS_MAX_OBJECT_FILE_PTRS
-            : 1;
-        total_required = data_pages + struct_pages_needed;
-    }
 
     /* Check for existing file */
     existing_idx = find_object(fs, path);
-    additional_needed = total_required;
 
-    if (existing_idx >= 0) {
-        const ndfs_object_entry_t *existing = &fs->objects[existing_idx];
-        uint32_t existing_struct_pages = existing->file_pointer.type == NDFS_PTR_SUBINDEXED
-            ? 1 + (existing->pages_in_file + NDFS_MAX_OBJECT_FILE_PTRS - 1) / NDFS_MAX_OBJECT_FILE_PTRS
-            : 1;
-        uint32_t existing_total = existing->pages_in_file + existing_struct_pages;
-        additional_needed = total_required > existing_total
-            ? total_required - existing_total : 0;
+    {
+        uint32_t new_real_pages =
+            count_real_data_pages_in_buffer(file_data, file_size, data_pages);
+        uint32_t existing_real_pages = 0;
+
+        if (existing_idx >= 0) {
+            existing_real_pages =
+                count_real_data_pages_in_object(fs, &fs->objects[existing_idx]);
+        }
+
+        additional_needed = new_real_pages > existing_real_pages
+            ? new_real_pages - existing_real_pages : 0;
     }
 
     /* Check and expand quota if needed */
@@ -1569,7 +1688,7 @@ ndfs_error_t ndfs_delete_file(ndfs_filesystem_t *fs, const char *path)
 {
     int idx, user_slot;
     ndfs_object_entry_t *obj;
-    uint32_t total_blocks;
+    uint32_t real_pages;
 
     if (!fs || !path) return NDFS_ERR_NULL_PTR;
     if (fs->read_only) return NDFS_ERR_READ_ONLY;
@@ -1577,6 +1696,14 @@ ndfs_error_t ndfs_delete_file(ndfs_filesystem_t *fs, const char *path)
     idx = find_object(fs, path);
     if (idx < 0) return NDFS_ERR_NOT_FOUND;
     obj = &fs->objects[idx];
+
+    /* Real (non-sparse) data pages this file actually occupies on disk right
+     * now, computed BEFORE freeing -- see count_real_data_pages_in_object().
+     * This is the exact refund: sparse holes were never charged against
+     * quota in the first place, and index/sub-index structural blocks are
+     * filesystem overhead, not user data, so they are never refunded either
+     * (mirrors create_new_file/update_existing_file). */
+    real_pages = count_real_data_pages_in_object(fs, obj);
 
     /* Free blocks */
     if (obj->file_pointer.block_id > 0) {
@@ -1586,19 +1713,8 @@ ndfs_error_t ndfs_delete_file(ndfs_filesystem_t *fs, const char *path)
     /* Update user pages used */
     user_slot = find_user_by_index(fs, obj->user_index);
     if (user_slot >= 0) {
-        total_blocks = obj->pages_in_file;
-        if (obj->file_pointer.type == NDFS_PTR_INDEXED) {
-            total_blocks += 1;
-        } else if (obj->file_pointer.type == NDFS_PTR_SUBINDEXED) {
-            /* Sub-index block + one group index block per already-allocated
-             * 512-page group (mirrors the accounting used when the file was
-             * created/updated) -- a flat "+1" would undercount and leave
-             * pages_used permanently inflated after deleting a large file. */
-            total_blocks += 1 +
-                (obj->pages_in_file + NDFS_MAX_OBJECT_FILE_PTRS - 1) / NDFS_MAX_OBJECT_FILE_PTRS;
-        }
-        if (fs->users[user_slot].pages_used >= total_blocks)
-            fs->users[user_slot].pages_used -= total_blocks;
+        if (fs->users[user_slot].pages_used >= real_pages)
+            fs->users[user_slot].pages_used -= real_pages;
         else
             fs->users[user_slot].pages_used = 0;
     }
@@ -2403,16 +2519,18 @@ ndfs_error_t ndfs_fsck(const ndfs_filesystem_t *fs, char **out_report,
         if (!fs->user_valid[i]) continue;
         const ndfs_user_entry_t *user = &fs->users[i];
 
-        /* Count actual pages used by this user's files */
+        /* Count actual (real, non-sparse) pages used by this user's files --
+         * must use the same basis pages_used is now maintained with:
+         * count_real_data_pages_in_object() walks each file's resolved
+         * block structure and counts only non-zero (real) BlockPointers,
+         * never sparse holes and never index/sub-index structural blocks.
+         * Using the old "pages_in_file (+1 for Indexed)" estimate here would
+         * emit a false WARNING for every sparse or SubIndexed file now that
+         * pages_used itself is charged on the real-page basis. */
         uint32_t actual_pages = 0;
         for (j = 0; j < fs->object_count; j++) {
             if (fs->objects[j].user_index == user->user_index) {
-                actual_pages += fs->objects[j].pages_in_file;
-                /* Add index block */
-                if (ndfs_bp_is_valid(&fs->objects[j].file_pointer) &&
-                    fs->objects[j].file_pointer.type == NDFS_PTR_INDEXED) {
-                    actual_pages++;
-                }
+                actual_pages += count_real_data_pages_in_object(fs, &fs->objects[j]);
             }
         }
 

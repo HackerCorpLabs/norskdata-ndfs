@@ -169,6 +169,108 @@ class TestRename:
         assert ndfs.file_exists("SYSTEM/NEW:TEXT") is True
         assert ndfs.read_file("SYSTEM/NEW:TEXT") == b"content"
 
+
+class TestSparseQuotaAccounting:
+    """Regression tests for user.pages_used quota tracking.
+
+    Previously pages_used was charged using the file's LOGICAL page count
+    (which wrongly counts sparse holes as consuming real disk space) plus
+    a flat structural-block estimate (index/sub-index blocks -- filesystem
+    overhead, never real user data). Quota must track only the real,
+    non-sparse data pages actually allocated on disk.
+    """
+
+    def test_fully_sparse_charges_zero_pages_used(self):
+        ndfs = _make_fs()
+        used_before = ndfs.get_user(0).pages_used
+
+        data = bytearray(NDFS_PAGE_SIZE * 5)  # all zero -- fully sparse
+        ndfs.write_file("SYSTEM/ZERO:DAT", data)
+
+        used_after = ndfs.get_user(0).pages_used
+        assert used_after == used_before, (
+            "a fully-sparse file allocates no real data blocks and no "
+            "index block should be charged to quota"
+        )
+
+    def test_mixed_sparse_charges_only_real_pages(self):
+        ndfs = _make_fs()
+        used_before = ndfs.get_user(0).pages_used
+
+        data = bytearray(NDFS_PAGE_SIZE * 10)
+        for i in range(NDFS_PAGE_SIZE * 3):  # pages 0-2: real
+            data[i] = 0xAA
+        # pages 3-9 stay zero (7 sparse holes)
+        ndfs.write_file("SYSTEM/MIXED:DAT", data)
+
+        used_after = ndfs.get_user(0).pages_used
+        assert used_after - used_before == 3, (
+            "only the 3 real (non-zero) pages should count toward quota -- "
+            "not the 7 holes, and not the index block"
+        )
+
+    def test_fully_real_charges_exact_page_count_no_index_overhead(self):
+        ndfs = _make_fs()
+        used_before = ndfs.get_user(0).pages_used
+
+        data = bytearray(NDFS_PAGE_SIZE * 6)
+        for i in range(len(data)):
+            data[i] = 0xFF  # no zero pages at all
+        ndfs.write_file("SYSTEM/FULL:DAT", data)
+
+        used_after = ndfs.get_user(0).pages_used
+        assert used_after - used_before == 6, (
+            "exactly the 6 real data pages -- the index block must not "
+            "add +1 to quota"
+        )
+
+    def test_delete_refunds_exactly_what_create_charged(self):
+        ndfs = _make_fs()
+        used_before = ndfs.get_user(0).pages_used
+
+        data = bytearray(NDFS_PAGE_SIZE * 10)
+        for i in range(NDFS_PAGE_SIZE * 4):  # 4 real, 6 sparse
+            data[i] = 0xAA
+        ndfs.write_file("SYSTEM/MIXED2:DAT", data)
+        ndfs.delete_file("SYSTEM/MIXED2:DAT")
+
+        used_after = ndfs.get_user(0).pages_used
+        assert used_after == used_before, "delete must refund exactly what create charged"
+
+    def test_overwrite_grow_then_shrink_tracks_real_page_count(self):
+        # Previously the update-file path never adjusted pages_used at all
+        # on overwrite -- a separate bug fixed alongside the sparse
+        # over-charge one.
+        ndfs = _make_fs()
+        used_baseline = ndfs.get_user(0).pages_used
+
+        small = bytearray(NDFS_PAGE_SIZE * 2)
+        for i in range(len(small)):
+            small[i] = 0xAA
+        ndfs.write_file("SYSTEM/GROW:DAT", small)
+        used_after_first_write = ndfs.get_user(0).pages_used
+        assert used_after_first_write - used_baseline == 2
+
+        big = bytearray(NDFS_PAGE_SIZE * 8)
+        for i in range(len(big)):
+            big[i] = 0xBB
+        ndfs.write_file("SYSTEM/GROW:DAT", big)
+        used_after_overwrite = ndfs.get_user(0).pages_used
+        assert used_after_overwrite - used_baseline == 8, (
+            "overwriting with a larger file must charge the NEW real page "
+            "count, replacing the old"
+        )
+
+        tiny = bytearray(NDFS_PAGE_SIZE * 1)
+        for i in range(len(tiny)):
+            tiny[i] = 0xCC
+        ndfs.write_file("SYSTEM/GROW:DAT", tiny)
+        used_after_shrink = ndfs.get_user(0).pages_used
+        assert used_after_shrink - used_baseline == 1, (
+            "overwriting with a smaller file must refund down to the new "
+            "(smaller) real page count"
+        )
+
     def test_rename_nonexistent_raises(self):
         ndfs = _make_fs()
         with pytest.raises(FileNotFoundError):

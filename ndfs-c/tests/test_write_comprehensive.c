@@ -1130,6 +1130,265 @@ static int test_unreserved_pages_persist_does_not_touch_extended_info(void)
     return 0;
 }
 
+/* ---- Sparse-file quota accounting ----
+ *
+ * Regression tests for the pages_used over-counting bug: pages_used used to
+ * be charged data_pages (the LOGICAL page count, which counts sparse holes
+ * as if they consumed real disk space -- they do NOT, per NDFS-FORMAT.md's
+ * "No disk space is allocated for sparse holes") PLUS struct_pages (the
+ * index/sub-index structural blocks -- filesystem overhead, not user data,
+ * and must never count against a user's quota). Mirrors the C# reference
+ * fix's test file (NdfsSparseFileQuotaAccountingTests.cs) scenario-for-
+ * scenario: create_new_file/update_existing_file/ndfs_delete_file now use
+ * count_real_data_pages_in_buffer()/count_real_data_pages_in_object()
+ * (src/filesystem.c) to charge only real (non-sparse), non-structural
+ * pages. */
+
+/* A fully-sparse (all-zero) file must charge ZERO pages_used -- no data
+ * page is real, and no structural page is ever charged either. */
+static int test_quota_fully_sparse_file_charges_zero(void)
+{
+    ndfs_filesystem_t *fs = create_writable(NDFS_TMPL_FLOPPY_360KB, "QSPARSE0");
+    size_t size = NDFS_PAGE_SIZE * 4;
+    uint8_t *data = (uint8_t *)calloc(size, 1); /* all zero */
+    uint32_t used_before, used_after;
+
+    TEST_ASSERT_NOT_NULL(fs);
+    TEST_ASSERT_NOT_NULL(data);
+
+    used_before = get_user_pages_used(fs, "SYSTEM");
+    TEST_ASSERT_OK(ndfs_write_file(fs, "SYSTEM/ALLSPRS:DATA", data, size));
+    used_after = get_user_pages_used(fs, "SYSTEM");
+
+    TEST_ASSERT_EQUAL(used_before, used_after);
+
+    free(data);
+    ndfs_close(fs);
+    return 0;
+}
+
+/* A mixed file (some real pages, some zero pages) must charge only the real
+ * page count -- not the logical page count and not a structural add-on. */
+static int test_quota_mixed_sparse_charges_only_real(void)
+{
+    ndfs_filesystem_t *fs = create_writable(NDFS_TMPL_FLOPPY_360KB, "QMIXED");
+    uint32_t logical_pages = 5;
+    size_t size = (size_t)logical_pages * NDFS_PAGE_SIZE;
+    uint8_t *data = (uint8_t *)calloc(size, 1);
+    uint32_t real_pages = 2; /* only pages 1 and 3 carry real data */
+    uint32_t used_before, used_after;
+
+    TEST_ASSERT_NOT_NULL(fs);
+    TEST_ASSERT_NOT_NULL(data);
+
+    fill_nonzero_pattern(data + (size_t)1 * NDFS_PAGE_SIZE, NDFS_PAGE_SIZE, 11);
+    fill_nonzero_pattern(data + (size_t)3 * NDFS_PAGE_SIZE, NDFS_PAGE_SIZE, 22);
+
+    used_before = get_user_pages_used(fs, "SYSTEM");
+    TEST_ASSERT_OK(ndfs_write_file(fs, "SYSTEM/MIXED:DATA", data, size));
+    used_after = get_user_pages_used(fs, "SYSTEM");
+
+    TEST_ASSERT_EQUAL(used_before + real_pages, used_after);
+    TEST_ASSERT(used_after - used_before < logical_pages); /* proves no over-charge */
+
+    free(data);
+    ndfs_close(fs);
+    return 0;
+}
+
+/* A fully-real file must charge exactly its page count, with NO index-block
+ * overhead added on top (the old code added a flat "+1"/"+struct_pages"). */
+static int test_quota_fully_real_file_no_index_overhead(void)
+{
+    ndfs_filesystem_t *fs = create_writable(NDFS_TMPL_FLOPPY_360KB, "QREAL");
+    uint32_t pages = 4;
+    size_t size = (size_t)pages * NDFS_PAGE_SIZE;
+    uint8_t *data = (uint8_t *)malloc(size);
+    uint32_t used_before, used_after;
+
+    TEST_ASSERT_NOT_NULL(fs);
+    TEST_ASSERT_NOT_NULL(data);
+    fill_nonzero_pattern(data, size, 33);
+
+    used_before = get_user_pages_used(fs, "SYSTEM");
+    TEST_ASSERT_OK(ndfs_write_file(fs, "SYSTEM/FULLREAL:DATA", data, size));
+    used_after = get_user_pages_used(fs, "SYSTEM");
+
+    /* Exactly `pages` -- not pages+1 for the index block. */
+    TEST_ASSERT_EQUAL(used_before + pages, used_after);
+
+    free(data);
+    ndfs_close(fs);
+    return 0;
+}
+
+/* Deleting a file must refund EXACTLY what creating it charged -- pages_used
+ * returns to its prior value, for a mixed sparse/real file. */
+static int test_quota_delete_refunds_exactly(void)
+{
+    ndfs_filesystem_t *fs = create_writable(NDFS_TMPL_FLOPPY_360KB, "QDELREF");
+    uint32_t logical_pages = 6;
+    size_t size = (size_t)logical_pages * NDFS_PAGE_SIZE;
+    uint8_t *data = (uint8_t *)calloc(size, 1);
+    uint32_t used_before, used_after_create, used_after_delete;
+
+    TEST_ASSERT_NOT_NULL(fs);
+    TEST_ASSERT_NOT_NULL(data);
+
+    fill_nonzero_pattern(data + (size_t)2 * NDFS_PAGE_SIZE, NDFS_PAGE_SIZE, 44);
+
+    used_before = get_user_pages_used(fs, "SYSTEM");
+    TEST_ASSERT_OK(ndfs_write_file(fs, "SYSTEM/DELREF:DATA", data, size));
+    used_after_create = get_user_pages_used(fs, "SYSTEM");
+    TEST_ASSERT(used_after_create > used_before);
+
+    TEST_ASSERT_OK(ndfs_delete_file(fs, "SYSTEM/DELREF:DATA"));
+    used_after_delete = get_user_pages_used(fs, "SYSTEM");
+
+    TEST_ASSERT_EQUAL(used_before, used_after_delete);
+
+    free(data);
+    ndfs_close(fs);
+    return 0;
+}
+
+/* Overwriting a file with a larger, then smaller, real-content file must
+ * track the new real page count correctly each time -- exercises the
+ * update_existing_file fix (old_real_pages computed BEFORE freeing, new
+ * charge computed from the new buffer's real page count). */
+static int test_quota_overwrite_grow_then_shrink(void)
+{
+    ndfs_filesystem_t *fs = create_writable(NDFS_TMPL_FLOPPY_360KB, "QGROWSHR");
+    uint32_t small_pages = 2, big_pages = 6, tiny_pages = 1;
+    uint8_t *small = (uint8_t *)malloc((size_t)small_pages * NDFS_PAGE_SIZE);
+    uint8_t *big = (uint8_t *)malloc((size_t)big_pages * NDFS_PAGE_SIZE);
+    uint8_t *tiny = (uint8_t *)malloc((size_t)tiny_pages * NDFS_PAGE_SIZE);
+    uint32_t baseline, used_small, used_big, used_tiny;
+
+    TEST_ASSERT_NOT_NULL(fs);
+    TEST_ASSERT_NOT_NULL(small);
+    TEST_ASSERT_NOT_NULL(big);
+    TEST_ASSERT_NOT_NULL(tiny);
+    fill_nonzero_pattern(small, (size_t)small_pages * NDFS_PAGE_SIZE, 1);
+    fill_nonzero_pattern(big, (size_t)big_pages * NDFS_PAGE_SIZE, 2);
+    fill_nonzero_pattern(tiny, (size_t)tiny_pages * NDFS_PAGE_SIZE, 3);
+
+    baseline = get_user_pages_used(fs, "SYSTEM");
+
+    TEST_ASSERT_OK(ndfs_write_file(fs, "SYSTEM/GROWSHR:DATA",
+                                   small, (size_t)small_pages * NDFS_PAGE_SIZE));
+    used_small = get_user_pages_used(fs, "SYSTEM");
+    TEST_ASSERT_EQUAL(baseline + small_pages, used_small);
+
+    /* Grow: overwrite with a bigger, fully-real file. */
+    TEST_ASSERT_OK(ndfs_write_file(fs, "SYSTEM/GROWSHR:DATA",
+                                   big, (size_t)big_pages * NDFS_PAGE_SIZE));
+    used_big = get_user_pages_used(fs, "SYSTEM");
+    TEST_ASSERT_EQUAL(baseline + big_pages, used_big);
+
+    /* Shrink: overwrite with a smaller, fully-real file. */
+    TEST_ASSERT_OK(ndfs_write_file(fs, "SYSTEM/GROWSHR:DATA",
+                                   tiny, (size_t)tiny_pages * NDFS_PAGE_SIZE));
+    used_tiny = get_user_pages_used(fs, "SYSTEM");
+    TEST_ASSERT_EQUAL(baseline + tiny_pages, used_tiny);
+
+    free(small);
+    free(big);
+    free(tiny);
+    ndfs_close(fs);
+    return 0;
+}
+
+/* A SubIndexed file (>512 pages, so it needs the sub-index + group-index
+ * structure) that's mostly sparse must charge only its few real pages --
+ * not any of the structural (sub-index + group index) blocks needed to
+ * represent 1000 logical pages. */
+static int test_quota_subindexed_sparse_charges_only_real(void)
+{
+    ndfs_filesystem_t *fs = create_writable(NDFS_TMPL_SMD_75MB, "QSUBSPRS");
+    uint32_t data_pages = 1000; /* forces SubIndexed: > 512-pointer index block */
+    size_t size = (size_t)data_pages * NDFS_PAGE_SIZE;
+    uint8_t *data = (uint8_t *)calloc(size, 1);
+    uint32_t real_pages = 2;
+    uint32_t used_before, used_after;
+
+    TEST_ASSERT_NOT_NULL(fs);
+    TEST_ASSERT_NOT_NULL(data);
+
+    fill_nonzero_pattern(data + (size_t)5 * NDFS_PAGE_SIZE, NDFS_PAGE_SIZE, 55);
+    fill_nonzero_pattern(data + (size_t)900 * NDFS_PAGE_SIZE, NDFS_PAGE_SIZE, 66);
+
+    used_before = get_user_pages_used(fs, "SYSTEM");
+    TEST_ASSERT_OK(ndfs_write_file(fs, "SYSTEM/SUBSPRS:DATA", data, size));
+    used_after = get_user_pages_used(fs, "SYSTEM");
+
+    /* Exactly the 2 real pages -- none of the sub-index/group-index
+     * structural blocks (which would need 1 + ceil(1000/512) = 3 pages). */
+    TEST_ASSERT_EQUAL(used_before + real_pages, used_after);
+
+    free(data);
+    ndfs_close(fs);
+    return 0;
+}
+
+/* After a mix of sparse/real create, overwrite (grow+shrink), and delete
+ * operations, the "Phase 4: User quota verification" fsck diagnostic must
+ * report zero warnings -- it was rewritten to recompute actual_pages on the
+ * same real-page basis pages_used itself is now charged on
+ * (count_real_data_pages_in_object()), so it must never disagree.
+ *
+ * NOTE: this deliberately checks only for Phase 4's own warning text
+ * ("pages_used=" / "over quota"), not for any "WARNING" in the whole fsck
+ * report. Phase 3's bitmap-orphan check has a separate, pre-existing gap
+ * unrelated to this fix -- its refcount walk explicitly skips SubIndexed
+ * files ("SubIndexed: would need deeper walk, skip for now" in
+ * ndfs_fsck()'s Phase 2 block-reference loop) -- so a SubIndexed file's
+ * blocks always look "orphaned" to Phase 3 regardless of quota accounting.
+ * Fixing that is out of scope here per the task brief (bitmap
+ * allocation/consistency logic is untouched by this fix). */
+static int test_quota_fsck_reports_no_warnings(void)
+{
+    ndfs_filesystem_t *fs = create_writable(NDFS_TMPL_SMD_75MB, "QFSCKOK");
+    uint32_t small_pages = 2, big_pages = 700;
+    uint8_t *sparse = (uint8_t *)calloc((size_t)small_pages * NDFS_PAGE_SIZE, 1);
+    uint8_t *mixed = (uint8_t *)calloc((size_t)big_pages * NDFS_PAGE_SIZE, 1);
+    uint8_t *real4 = (uint8_t *)malloc(4 * NDFS_PAGE_SIZE);
+    char *report = NULL;
+    int fsck_errors = 0;
+
+    TEST_ASSERT_NOT_NULL(fs);
+    TEST_ASSERT_NOT_NULL(sparse);
+    TEST_ASSERT_NOT_NULL(mixed);
+    TEST_ASSERT_NOT_NULL(real4);
+    fill_nonzero_pattern(mixed + (size_t)3 * NDFS_PAGE_SIZE, NDFS_PAGE_SIZE, 77);
+    fill_nonzero_pattern(real4, 4 * NDFS_PAGE_SIZE, 88);
+
+    /* Fully-sparse small file. */
+    TEST_ASSERT_OK(ndfs_write_file(fs, "SYSTEM/FSCKA:DATA",
+                                   sparse, (size_t)small_pages * NDFS_PAGE_SIZE));
+    /* SubIndexed, mostly-sparse file (>512 pages). */
+    TEST_ASSERT_OK(ndfs_write_file(fs, "SYSTEM/FSCKB:DATA",
+                                   mixed, (size_t)big_pages * NDFS_PAGE_SIZE));
+    /* Overwrite it with a small, fully-real file (grow-then-shrink path). */
+    TEST_ASSERT_OK(ndfs_write_file(fs, "SYSTEM/FSCKB:DATA",
+                                   real4, 4 * NDFS_PAGE_SIZE));
+    /* Delete the first one. */
+    TEST_ASSERT_OK(ndfs_delete_file(fs, "SYSTEM/FSCKA:DATA"));
+
+    TEST_ASSERT_OK(ndfs_fsck(fs, &report, &fsck_errors));
+    TEST_ASSERT_NOT_NULL(report);
+    TEST_ASSERT_EQUAL(0, fsck_errors);
+    TEST_ASSERT(strstr(report, "pages_used=") == NULL);
+    TEST_ASSERT(strstr(report, "over quota") == NULL);
+
+    ndfs_free_string(report);
+    free(sparse);
+    free(mixed);
+    free(real4);
+    ndfs_close(fs);
+    return 0;
+}
+
 void run_write_comprehensive_tests(void)
 {
     TEST_SUITE_BEGIN("Write Comprehensive Tests");
@@ -1161,4 +1420,11 @@ void run_write_comprehensive_tests(void)
     RUN_TEST(test_subindexed_sparse_holes);
     RUN_TEST(test_subindexed_delete_frees_all_blocks);
     RUN_TEST(test_subindexed_overwrite_no_leak);
+    RUN_TEST(test_quota_fully_sparse_file_charges_zero);
+    RUN_TEST(test_quota_mixed_sparse_charges_only_real);
+    RUN_TEST(test_quota_fully_real_file_no_index_overhead);
+    RUN_TEST(test_quota_delete_refunds_exactly);
+    RUN_TEST(test_quota_overwrite_grow_then_shrink);
+    RUN_TEST(test_quota_subindexed_sparse_charges_only_real);
+    RUN_TEST(test_quota_fsck_reports_no_warnings);
 }

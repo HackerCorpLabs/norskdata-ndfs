@@ -313,6 +313,25 @@ For each divergence the matrix surfaces:
   Tests add 40 users (forcing a second page) and round-trip through a real
   close+reopen, not just in-memory state. c: 194/194 (+1). py: 351/5 (+1).
   ts: 307/0 (+1).
+- ✅ **Sparse-file quota accounting** — `pages_used` (per-user quota) was
+  charged the file's LOGICAL page count (counting sparse holes as if they
+  consumed real disk space — they don't) plus the index/sub-index structural
+  block(s) (filesystem overhead, not user data), in C/PY/TS. Also found a
+  separate bug in the same area: the update-existing-file path never adjusted
+  `pages_used` at all on overwrite, in all three plus RetroFS.NDFS. Fixed
+  RetroFS.NDFS first (`CountRealDataPages`, commit `ff40eed`), then ported the
+  same design to C/PY/TS: count only real (non-zero) data pages, scanning the
+  write buffer directly for creates or walking the existing file's resolved
+  block pointers for deletes/overwrites — never add structural-block cost.
+  Along the way, ndfs-c's `ndfs_fsck` Phase 4 (quota verification) diagnostic
+  needed the same real-page basis to avoid false warnings, and gained
+  SubIndexed support it was missing (Phase 3, the bitmap-orphan check,
+  still doesn't walk SubIndexed files — tracked separately below).
+  New tests in each port cover fully-sparse (charges zero), mixed sparse
+  (charges only real pages), fully-real (exact count, no index overhead),
+  delete-refunds-exactly, grow-then-shrink overwrite, and a SubIndexed sparse
+  file (charges only its few real pages despite needing several structural
+  blocks). RFS: 148/152 (+6). c: 201/201 (+7). py: 357/5 (+6). ts: 313/0 (+6).
 
 ### Open (tracked, lower priority)
 - ☐ **Image-creation-time `unreserved_pages` placeholder** — `image-creator.ts`
@@ -322,12 +341,13 @@ For each divergence the matrix surfaces:
   the fix above), so this only matters for a freshly-created, never-mutated
   image read by something that trusts the field verbatim. C/TS (PY/RFS not
   yet checked).
-- ☐ **Sparse-file accounting** — ports set `pages_in_file`/`pages_used` to the
-  logical page count incl. holes + the index block; RetroCore counts only
-  allocated data pages and excludes the index block from user quota. Diverges
-  only for sparse files.
 - ☐ **RFS C#** — apply the per-user partition, version chain, name-terminator,
   delete-clear, and >512 guards to RetroFS too; audit its `UserEntry`/`UserFile`.
+- ☐ **ndfs-c `ndfs_fsck` Phase 3 (bitmap-orphan check) doesn't walk SubIndexed
+  files** — found while fixing the sparse-file quota item below; Phase 4
+  (quota verification) was fixed to handle SubIndexed, Phase 3 wasn't (has its
+  own pre-existing `/* SubIndexed: would need deeper walk, skip for now */`
+  comment). Diagnostic-only gap, not a correctness bug in read/write/allocate.
 - ☐ **RetroCore** `UserFile.cs:240` `*8` user-slot formula is latently buggy
   for ≥32 users (report upstream; ports already correct).
 - ☐ Real ND creation **date** on new files (currently 0 → `1950-01-01`); needs

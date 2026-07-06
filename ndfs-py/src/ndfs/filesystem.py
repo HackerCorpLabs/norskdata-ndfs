@@ -241,13 +241,13 @@ class NdfsFileSystem:
         if user is None:
             raise ValueError(f"User not found: {user_name or '(default)'}")
 
-        # Calculate required pages (data pages + structural index/sub-index
-        # pages -- 1 for a plain Indexed file, or numGroups+1 for a
-        # SubIndexed file over 512 pages; see _structural_pages_for).
-        data_pages = math.ceil(len(file_data) / NDFS_PAGE_SIZE)
-        if data_pages == 0:
-            data_pages = 1
-        total_required = data_pages + self._structural_pages_for(data_pages)
+        # Calculate required pages for quota purposes. Quota (pages_used)
+        # tracks only REAL disk consumption: sparse (all-zero) pages allocate
+        # no block (see docs\NDFS-FORMAT.md, "No disk space is allocated for
+        # sparse holes") and the index/sub-index structural pages are
+        # filesystem overhead, not user data -- see
+        # _count_real_data_pages_in_buffer / _count_real_data_pages_for_object.
+        total_required = self._count_real_data_pages_in_buffer(file_data)
 
         # Check for existing file
         existing = self._object_file.find_object(object_name, user.user_name)
@@ -255,7 +255,7 @@ class NdfsFileSystem:
         # Determine additional pages needed
         additional_needed = total_required
         if existing is not None:
-            existing_total = existing.pages_in_file + self._structural_pages_for(existing.pages_in_file)
+            existing_total = self._count_real_data_pages_for_object(existing)
             additional_needed = total_required - existing_total if total_required > existing_total else 0
 
         # Check and expand quota if needed
@@ -286,25 +286,25 @@ class NdfsFileSystem:
         if obj is None:
             raise FileNotFoundError(f"File not found: {path}")
 
+        # Count real (non-sparse) data pages BEFORE freeing -- _free_file_blocks
+        # only marks bitmap entries free, it doesn't zero the index/data page
+        # bytes, but we compute this first regardless so the refund reflects
+        # the file's actual on-disk footprint rather than any structural
+        # overhead. See _count_real_data_pages_for_object.
+        real_pages_freed = self._count_real_data_pages_for_object(obj)
+
         # Free blocks
         if obj.file_pointer is not None and obj.file_pointer.block_id > 0:
             self._free_file_blocks(obj)
 
-        # Update user pages used
+        # Update user pages used: refund only the real data pages that were
+        # charged at write time -- never the index/sub-index structural
+        # block(s), which were never charged against the user's quota.
         user = self._user_file.get_user(obj.user_index)
         if user is not None:
-            total_blocks = obj.pages_in_file
-            if (
-                obj.file_pointer is not None
-                and (
-                    obj.file_pointer.type == PointerType.Indexed
-                    or obj.file_pointer.type == PointerType.SubIndexed
-                )
-            ):
-                # Index block (Indexed) or group index blocks + sub-index
-                # block (SubIndexed) -- see _structural_pages_for.
-                total_blocks += self._structural_pages_for(obj.pages_in_file)
-            user.pages_used = user.pages_used - total_blocks if user.pages_used >= total_blocks else 0
+            user.pages_used = (
+                user.pages_used - real_pages_freed if user.pages_used >= real_pages_freed else 0
+            )
 
         # Surgical writes: capture index/owner before removal, then rewrite the
         # freed object's page (zero-fill clears the slot), the owner's user
@@ -738,6 +738,88 @@ class NdfsFileSystem:
         num_index_blocks = math.ceil(data_pages / MAX_OBJECT_FILE_POINTERS)
         return num_index_blocks + 1  # + top-level sub-index block
 
+    def _count_real_data_pages_in_buffer(self, data: _BufType) -> int:
+        """Count how many 2048-byte pages of *data* are NOT sparse holes --
+        i.e. how many pages `_write_data_page_to_index` will actually
+        allocate a real disk block for.
+
+        Per docs\\NDFS-FORMAT.md, "No disk space is allocated for sparse
+        holes"; user.pages_used quota accounting must reflect only this real
+        count, never the file's full logical page count (which would count
+        holes as if they consumed space) and never the index/sub-index
+        structural pages (filesystem overhead, not user data -- see
+        `_count_real_data_pages_for_object`).
+
+        Uses the exact same all-zero-page test as
+        `_write_data_page_to_index` (a short trailing slice, i.e. one that
+        does not fill a whole page, can never be treated as a sparse hole --
+        matching that method's own `len(page_slice) == NDFS_PAGE_SIZE` guard)
+        so the count always agrees with what allocation will actually do.
+        """
+        total_pages = math.ceil(len(data) / NDFS_PAGE_SIZE)
+        if total_pages == 0:
+            total_pages = 1  # empty file still occupies (and charges for) one page
+
+        real_pages = 0
+        for p in range(total_pages):
+            offset = p * NDFS_PAGE_SIZE
+            end = min(offset + NDFS_PAGE_SIZE, len(data))
+            page_slice = data[offset:end]
+
+            if len(page_slice) != NDFS_PAGE_SIZE:
+                # Short/empty trailing slice: never treated as sparse, always
+                # a real page (mirrors _write_data_page_to_index exactly).
+                real_pages += 1
+                continue
+
+            all_zeros = True
+            for b in range(len(page_slice)):
+                if page_slice[b] != 0:
+                    all_zeros = False
+                    break
+            if not all_zeros:
+                real_pages += 1
+
+        return real_pages
+
+    def _count_real_data_pages_for_object(self, obj: ObjectEntry) -> int:
+        """Count how many of *obj*'s data pages are backed by a real disk
+        block (BlockID > 0), by walking its Indexed/SubIndexed block-pointer
+        tree. Never counts the index/sub-index block(s) themselves -- those
+        are filesystem overhead and were never charged against
+        user.pages_used (see `_count_real_data_pages_in_buffer`).
+
+        Used for the delete-time refund and the pre-write quota check against
+        an existing file, where the buffer itself is not available -- only
+        the on-disk block-pointer structure is.
+        """
+        if obj.file_pointer is None or obj.file_pointer.block_id == 0:
+            return 0
+
+        count = 0
+        if obj.file_pointer.type == PointerType.Indexed:
+            index_page = self._read_page(obj.file_pointer.block_id)
+            for i in range(MAX_OBJECT_FILE_POINTERS):
+                ptr = BlockPointer.from_bytes(index_page, i * 4)
+                if ptr.block_id > 0:
+                    count += 1
+        elif obj.file_pointer.type == PointerType.Contiguous:
+            # A Contiguous run has no sparse holes -- every page in it is a
+            # real allocated block.
+            count = obj.pages_in_file
+        elif obj.file_pointer.type == PointerType.SubIndexed:
+            sub_index_page = self._read_page(obj.file_pointer.block_id)
+            for si in range(MAX_OBJECT_FILE_POINTERS):
+                index_ptr = BlockPointer.from_bytes(sub_index_page, si * 4)
+                if not index_ptr.is_valid():
+                    continue
+                index_page = self._read_page(index_ptr.block_id)
+                for i in range(MAX_OBJECT_FILE_POINTERS):
+                    data_ptr = BlockPointer.from_bytes(index_page, i * 4)
+                    if data_ptr.block_id > 0:
+                        count += 1
+        return count
+
     def _write_data_page_to_index(
         self,
         file_data: Union[bytes, bytearray, memoryview],
@@ -1071,8 +1153,10 @@ class NdfsFileSystem:
         entry.prev_version = obj_index
         self._object_file.add_object(entry)
 
-        # Update user pages used: data pages + structural (index/sub-index) pages.
-        user.pages_used += data_pages + structural_pages
+        # Update user pages used: only the REAL (non-sparse) data pages --
+        # never the index/sub-index structural pages, which are filesystem
+        # overhead, not user data. See _count_real_data_pages_in_buffer.
+        user.pages_used += self._count_real_data_pages_in_buffer(file_data)
 
         # Surgical writes: new object's page, owner's user page, bitmap.
         self._write_object_page(entry.object_index)
@@ -1087,14 +1171,19 @@ class NdfsFileSystem:
         file_data: Union[bytes, bytearray, memoryview],
     ) -> None:
         """Update an existing file with new data."""
+        # Count the REAL (non-sparse) data pages the old file was charged for
+        # BEFORE freeing its blocks (structural index/sub-index blocks are
+        # never part of this count -- they were never charged against the
+        # user's quota; see _count_real_data_pages_for_object).
+        old_real_pages = self._count_real_data_pages_for_object(existing)
+
         # Free old blocks (data blocks, plus index/sub-index structural
         # block(s) -- _free_file_blocks already handles both Indexed and
         # SubIndexed layouts via obj.file_pointer.type).
-        old_total = existing.pages_in_file + self._structural_pages_for(existing.pages_in_file)
         self._free_file_blocks(existing)
 
         # Subtract old usage
-        user.pages_used = user.pages_used - old_total if user.pages_used >= old_total else 0
+        user.pages_used = user.pages_used - old_real_pages if user.pages_used >= old_real_pages else 0
 
         # Create new allocation. Files up to 512 pages use a single Indexed
         # index block; larger files (up to 262144 pages) use a SubIndexed
@@ -1117,8 +1206,10 @@ class NdfsFileSystem:
         existing.bytes_in_file = len(file_data) if len(file_data) > 0 else 1
         existing.file_pointer = BlockPointer(top_block_id, top_pointer_type)
 
-        # Update user pages used: data pages + structural (index/sub-index) pages.
-        user.pages_used += data_pages + structural_pages
+        # Update user pages used: only the REAL (non-sparse) data pages of the
+        # new content -- never the index/sub-index structural pages. See
+        # _count_real_data_pages_in_buffer.
+        user.pages_used += self._count_real_data_pages_in_buffer(file_data)
 
         # Surgical writes: the file's object page, owner's user page, bitmap.
         self._write_object_page(existing.object_index)
