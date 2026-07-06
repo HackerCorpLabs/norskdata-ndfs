@@ -345,6 +345,45 @@ For each divergence the matrix surfaces:
   Added `NdfsHistoricalPortFixesAuditTests.cs` (5 tests) as a real regression
   guard proving all 5 together, rather than relying on the code read alone.
   RFS: 153/157 (+5).
+- ✅ **Object-directory growth past 16,384 files** — the object file (the
+  volume-wide directory listing every file across every user, distinct from
+  a single file's own >512-page SubIndexed growth fixed earlier) was a plain
+  Indexed structure capped at 512 directory pages: 16,384 files, or just 64
+  users at 8 reserved index-pointer slots each, whichever bound first (the
+  64-user ceiling binds first in practice, independent of files-per-user).
+  Past that, `ensure_object_dir_page`/`_ensure_object_dir_page`/
+  `ensureObjectDirPage`/`EnsureObjectDirPage` either returned failure (c),
+  had no bounds check at all (py, ts — a latent out-of-bounds read/crash
+  risk), or threw `NotSupportedException` (RFS). Fixed in all four with a
+  one-time conversion mirroring how a single file's own data already grows
+  past 512 pages: wrap the existing Indexed block as group 0 of a new
+  SubIndexed structure (sub-index block -> up to 512 group index blocks ->
+  up to 512 directory pages each). No data migration — the old block's
+  pointers for pages 0-511 stay exactly where they are; only a new level of
+  indirection is added above it. Fixed RFS first (`EnsureObjectDirPage`,
+  commit `0c0089b`), then ported the same design to C/PY/TS (commit
+  `f869e8a`). Two additional real bugs were found and fixed purely as a side
+  effect of building the 30,000-file regression test: (1) RFS's
+  `ReadIndexedObjectFileBlock` ignored its own `subindex` parameter, which
+  would have produced colliding `ObjectIndex`/ownership values for every
+  group beyond the first; (2) RFS's `ObjectFile.WritePageForEntry` had zero
+  SubIndexed awareness at all, throwing `ArgumentOutOfRangeException` for
+  any write past the first group; (3) ndfs-c's custom-image layout placed
+  the object/user file index blocks at a fixed offset sized for only a
+  1-page BitFile bitmap — large custom images (needed to provision a
+  30,000-file stress image) have a multi-page bitmap whose later pages
+  silently overlapped and corrupted the object directory, fixed by computing
+  the real bitmap page span. Each of C/PY/TS uses `PointerType.Contiguous`
+  (not `Indexed`) for the embedded group-pointer slots inside index/
+  sub-index pages — verified against each read side directly (not assumed):
+  this is the pre-existing convention for all embedded slot pointers in
+  those ports (they gate on `.isValid()`/blockId, not stored type), so it is
+  consistent, not a divergence. Verified with a real 30,000-file/120-user
+  regression test (spread across enough users to force 2 SubIndexed groups
+  and cross the old 64-user ceiling), round-tripped through a genuine
+  close+reopen, in all four. RFS: 156/160 (+3, commit `0c0089b`). c: 204/204
+  (+3, commit `f869e8a`). py: 360 passed/5 skipped (+3, commit `f869e8a`).
+  ts: 316/316 (+3, commit `f869e8a`).
 
 ### Open (tracked, lower priority)
 - ☐ **Image-creation-time `unreserved_pages` placeholder** — `image-creator.ts`
