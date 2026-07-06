@@ -332,6 +332,19 @@ For each divergence the matrix surfaces:
   delete-refunds-exactly, grow-then-shrink overwrite, and a SubIndexed sparse
   file (charges only its few real pages despite needing several structural
   blocks). RFS: 148/152 (+6). c: 201/201 (+7). py: 357/5 (+6). ts: 313/0 (+6).
+- ✅ **RFS C# audit** — checked whether RetroFS.NDFS needed the per-user
+  partition, version chain, name-terminator, delete-clear, and >512 guard
+  fixes already applied to c/py/ts. Verified against current code (2026-07-06,
+  not assumed): all 5 are already correctly implemented there — per-user
+  partitioning via `FindFreeUserSlot`/`EnsureObjectDirPage`, self-referential
+  version chain on create, a single `0x27` terminator + NULs (not the old
+  all-`0x27`-padding bug) in both `ObjectEntry`/`UserEntry`, whole-page
+  zero-rebuild on delete (`ObjectFile.WritePageForEntry`), and the >512 guard
+  via this session's own SubIndexed fix. Some landed in earlier sessions,
+  the last in this one — this open item was stale, not actually outstanding.
+  Added `NdfsHistoricalPortFixesAuditTests.cs` (5 tests) as a real regression
+  guard proving all 5 together, rather than relying on the code read alone.
+  RFS: 153/157 (+5).
 
 ### Open (tracked, lower priority)
 - ☐ **Image-creation-time `unreserved_pages` placeholder** — `image-creator.ts`
@@ -341,8 +354,6 @@ For each divergence the matrix surfaces:
   the fix above), so this only matters for a freshly-created, never-mutated
   image read by something that trusts the field verbatim. C/TS (PY/RFS not
   yet checked).
-- ☐ **RFS C#** — apply the per-user partition, version chain, name-terminator,
-  delete-clear, and >512 guards to RetroFS too; audit its `UserEntry`/`UserFile`.
 - ☐ **ndfs-c `ndfs_fsck` Phase 3 (bitmap-orphan check) doesn't walk SubIndexed
   files** — found while fixing the sparse-file quota item below; Phase 4
   (quota verification) was fixed to handle SubIndexed, Phase 3 wasn't (has its
