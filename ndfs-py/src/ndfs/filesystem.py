@@ -315,6 +315,7 @@ class NdfsFileSystem:
         self._write_object_page(freed_index)
         self._write_user_page(owner)
         self._write_bit_file()
+        self._persist_master_block()
 
     def rename(self, old_path: str, new_path: str) -> None:
         """Rename a file."""
@@ -1037,6 +1038,7 @@ class NdfsFileSystem:
         self._write_object_page(entry.object_index)
         self._write_user_page(user.user_index)
         self._write_bit_file()
+        self._persist_master_block()
 
     def _update_existing_file(
         self,
@@ -1082,6 +1084,7 @@ class NdfsFileSystem:
         self._write_object_page(existing.object_index)
         self._write_user_page(user.user_index)
         self._write_bit_file()
+        self._persist_master_block()
 
     def _free_file_blocks(self, obj: ObjectEntry) -> None:
         """Free all blocks associated with a file."""
@@ -1126,6 +1129,28 @@ class NdfsFileSystem:
         pages = self._bit_file.to_page_buffers()
         for i in range(len(pages)):
             self._write_page(mb.bit_file_pointer.block_id + i, pages[i])
+
+    def _persist_master_block(self) -> None:
+        """Refresh the master block's cached "Unreserved Pages" field (page 0,
+        offset MASTER_BLOCK_OFFSET+0x1C) from the live bitmap and write it
+        back to disk.
+
+        Real SINTRAN reads this cached count to report free disk space
+        without rescanning the bitmap, so it must be kept in sync with the
+        actual bitmap state after every allocation-affecting mutation.
+        Callers must invoke this after `_write_bit_file()` succeeds (i.e.
+        after the bitmap mutation that changed free-page count), never on
+        error/early-return paths.
+
+        `MasterBlock.write_to_bytes` only patches its own 32-byte region
+        (page 0, MASTER_BLOCK_OFFSET..MASTER_BLOCK_OFFSET+32); it does not
+        touch the separate Extended Info Block checksum at offset 0x07D0,
+        so that unrelated structure is left byte-identical.
+        """
+        self._master_block.unreserved_pages = self._bit_file.get_free_pages()
+        page0 = bytearray(self._read_page(0))
+        self._master_block.write_to_bytes(page0)
+        self._write_page(0, page0)
 
     def _write_user_page(self, user_index: int) -> None:
         """Write only the UserFile data page holding `user_index`."""

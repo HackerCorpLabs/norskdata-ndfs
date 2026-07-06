@@ -7,9 +7,42 @@
 
 #include "test_framework.h"
 #include <ndfs/ndfs.h>
+#include "endian_util.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+
+/* Read the raw on-disk "Unreserved Pages" field straight out of page 0,
+ * bypassing the filesystem API entirely -- this is what real SINTRAN would
+ * read to report free space without rescanning the bitmap, so a test that
+ * only calls ndfs_get_free_pages() would not catch a stale on-disk copy. */
+static uint32_t read_raw_unreserved_pages(ndfs_filesystem_t *fs)
+{
+    uint8_t *buf = NULL;
+    size_t size = 0;
+    uint32_t value = 0;
+
+    if (ndfs_to_buffer(fs, &buf, &size) == NDFS_OK) {
+        value = ndfs_read_u32be(buf, NDFS_MASTER_BLOCK_OFFSET + 0x1C);
+        free(buf);
+    }
+    return value;
+}
+
+/* Read the 16 raw bytes of the Extended Info Block (a structure completely
+ * separate from the master block) straight out of page 0. Used to prove the
+ * master-block persistence fix never touches this region or its checksum. */
+static void read_raw_extended_info(ndfs_filesystem_t *fs, uint8_t *out16)
+{
+    uint8_t *buf = NULL;
+    size_t size = 0;
+
+    memset(out16, 0, 16);
+    if (ndfs_to_buffer(fs, &buf, &size) == NDFS_OK) {
+        memcpy(out16, buf + NDFS_EXTENDED_INFO_OFFSET, 16);
+        free(buf);
+    }
+}
 
 /* ---- Helper: create a writable image ---- */
 
@@ -926,6 +959,117 @@ static int test_subindexed_overwrite_no_leak(void)
     return 0;
 }
 
+/* ---- Master block "Unreserved Pages" stays in sync on file create/delete ----
+ *
+ * Real SINTRAN reads master_block.unreserved_pages directly to report free
+ * disk space, without rescanning the BitFile bitmap. This field used to only
+ * ever be written once, at image-creation time (image_creator.c) -- any
+ * later create/update/delete left the on-disk copy stale relative to the
+ * real bitmap. persist_master_block()/write_bit_file() (src/filesystem.c)
+ * now refreshes it after every allocation-changing mutation. */
+static int test_unreserved_pages_tracks_create_delete(void)
+{
+    ndfs_filesystem_t *fs = create_writable(NDFS_TMPL_FLOPPY_360KB, "UNRESV");
+    uint8_t buf[NDFS_PAGE_SIZE * 2];
+    uint32_t live_free_baseline, live_free;
+    uint32_t raw_after_create, raw_after_delete;
+
+    TEST_ASSERT_NOT_NULL(fs);
+    memset(buf, 0x55, sizeof(buf));
+
+    /* NOTE: image_creator.c writes a template-defined placeholder for
+     * unreserved_pages at creation time (e.g. a hardcoded "1" for the small
+     * floppy templates here), not necessarily the true live free count --
+     * that mismatch is a separate, pre-existing property of image creation
+     * and out of scope for this fix. What this test verifies is that from
+     * this point on, every allocation-changing mutation (create/delete)
+     * rewrites the on-disk field to track the *live* bitmap-derived count. */
+    ndfs_get_free_pages(fs, &live_free_baseline);
+
+    /* After creating a file, the on-disk field must be rewritten to match
+     * the now-smaller live free count. */
+    TEST_ASSERT_OK(ndfs_write_file(fs, "SYSTEM/UNRFILE:DATA", buf, sizeof(buf)));
+    ndfs_get_free_pages(fs, &live_free);
+    raw_after_create = read_raw_unreserved_pages(fs);
+    TEST_ASSERT_EQUAL(live_free, raw_after_create);
+    TEST_ASSERT(live_free < live_free_baseline);
+
+    /* After deleting it, the on-disk field must be rewritten again, tracking
+     * the freed pages back up to the original live free count. */
+    TEST_ASSERT_OK(ndfs_delete_file(fs, "SYSTEM/UNRFILE:DATA"));
+    ndfs_get_free_pages(fs, &live_free);
+    raw_after_delete = read_raw_unreserved_pages(fs);
+    TEST_ASSERT_EQUAL(live_free, raw_after_delete);
+    TEST_ASSERT_EQUAL(live_free_baseline, raw_after_delete);
+
+    ndfs_close(fs);
+    return 0;
+}
+
+/* ---- Unreserved Pages tracks correctly across several mutations, not just
+ * at the start and the end -- verifies each intermediate step too. ---- */
+static int test_unreserved_pages_tracks_multiple_mutations(void)
+{
+    ndfs_filesystem_t *fs = create_writable(NDFS_TMPL_FLOPPY_360KB, "UNRSEQ");
+    uint8_t bufA[NDFS_PAGE_SIZE];
+    uint8_t bufB[NDFS_PAGE_SIZE * 2];
+    uint32_t live_free, raw;
+
+    TEST_ASSERT_NOT_NULL(fs);
+    memset(bufA, 0x11, sizeof(bufA));
+    memset(bufB, 0x22, sizeof(bufB));
+
+    /* Step 1: create file A. */
+    TEST_ASSERT_OK(ndfs_write_file(fs, "SYSTEM/SEQA:DATA", bufA, sizeof(bufA)));
+    ndfs_get_free_pages(fs, &live_free);
+    raw = read_raw_unreserved_pages(fs);
+    TEST_ASSERT_EQUAL(live_free, raw);
+
+    /* Step 2: create file B. */
+    TEST_ASSERT_OK(ndfs_write_file(fs, "SYSTEM/SEQB:DATA", bufB, sizeof(bufB)));
+    ndfs_get_free_pages(fs, &live_free);
+    raw = read_raw_unreserved_pages(fs);
+    TEST_ASSERT_EQUAL(live_free, raw);
+
+    /* Step 3: delete file A -- B still exists. */
+    TEST_ASSERT_OK(ndfs_delete_file(fs, "SYSTEM/SEQA:DATA"));
+    ndfs_get_free_pages(fs, &live_free);
+    raw = read_raw_unreserved_pages(fs);
+    TEST_ASSERT_EQUAL(live_free, raw);
+
+    ndfs_close(fs);
+    return 0;
+}
+
+/* ---- The Extended Info Block (and its checksum) at offset 0x07D0 must be
+ * byte-identical before and after mutations that only touch the master
+ * block's Unreserved Pages field -- ndfs_mb_write() must never bleed into
+ * that separate structure. ---- */
+static int test_unreserved_pages_persist_does_not_touch_extended_info(void)
+{
+    ndfs_filesystem_t *fs = create_writable(NDFS_TMPL_FLOPPY_360KB, "UNREXT");
+    uint8_t buf[NDFS_PAGE_SIZE * 2];
+    uint8_t ext_before[16];
+    uint8_t ext_after_create[16];
+    uint8_t ext_after_delete[16];
+
+    TEST_ASSERT_NOT_NULL(fs);
+    memset(buf, 0x33, sizeof(buf));
+
+    read_raw_extended_info(fs, ext_before);
+
+    TEST_ASSERT_OK(ndfs_write_file(fs, "SYSTEM/EXTFILE:DATA", buf, sizeof(buf)));
+    read_raw_extended_info(fs, ext_after_create);
+    TEST_ASSERT(memcmp(ext_before, ext_after_create, 16) == 0);
+
+    TEST_ASSERT_OK(ndfs_delete_file(fs, "SYSTEM/EXTFILE:DATA"));
+    read_raw_extended_info(fs, ext_after_delete);
+    TEST_ASSERT(memcmp(ext_before, ext_after_delete, 16) == 0);
+
+    ndfs_close(fs);
+    return 0;
+}
+
 void run_write_comprehensive_tests(void)
 {
     TEST_SUITE_BEGIN("Write Comprehensive Tests");
@@ -935,6 +1079,9 @@ void run_write_comprehensive_tests(void)
     RUN_TEST(test_write_multi_page_file);
     RUN_TEST(test_overwrite_file);
     RUN_TEST(test_delete_reclaims_space);
+    RUN_TEST(test_unreserved_pages_tracks_create_delete);
+    RUN_TEST(test_unreserved_pages_tracks_multiple_mutations);
+    RUN_TEST(test_unreserved_pages_persist_does_not_touch_extended_info);
     RUN_TEST(test_rename_file);
     RUN_TEST(test_write_persistence);
     RUN_TEST(test_sparse_file);

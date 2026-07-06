@@ -995,6 +995,31 @@ static ndfs_error_t update_existing_file(struct ndfs_filesystem *fs,
  * model and writes it into the image buffer. Rebuilding a page zero-filled
  * also clears freed slots, so a deleted file does not reappear on reload. */
 
+/* Patch the 32-byte master block (page 0, offset NDFS_MASTER_BLOCK_OFFSET)
+ * with the current free-page count, WITHOUT touching anything else on page 0
+ * -- in particular the Extended Info Block (offset NDFS_EXTENDED_INFO_OFFSET,
+ * a completely separate 16-byte structure) and its checksum, which RetroCore
+ * (the golden reference for this project) never rewrites. Real SINTRAN reads
+ * master_block.unreserved_pages to report free space without rescanning the
+ * bit file, so this cached count must be kept in sync with the live bitmap
+ * on every allocation/free -- otherwise it silently goes stale. */
+static void persist_master_block(struct ndfs_filesystem *fs)
+{
+    uint8_t *page0;
+
+    fs->master_block.unreserved_pages = ndfs_bf_count_free(&fs->bit_file);
+
+    page0 = write_page_ptr(fs, 0);
+    if (!page0) return;
+
+    /* ndfs_mb_write() only clears/rewrites the NDFS_MASTER_BLOCK_SIZE (32)
+     * bytes at NDFS_MASTER_BLOCK_OFFSET -- see master_block.c. It never
+     * touches the Extended Info Block or its checksum at
+     * NDFS_EXTENDED_INFO_OFFSET, so those bytes are left exactly as they
+     * were on disk. */
+    ndfs_mb_write(&fs->master_block, page0);
+}
+
 /* Write the BitFile allocation bitmap (contiguous; a page or two for most
  * disks). The bitmap is small, so it is written whole when allocation
  * changed — that mirrors the C# reference, which writes the affected BitFile
@@ -1020,6 +1045,14 @@ static ndfs_error_t write_bit_file(struct ndfs_filesystem *fs)
         if (src_off + copy_len > bm_len) copy_len = bm_len - src_off;
         if (copy_len > 0 && src_off < bm_len) memcpy(page, bm_data + src_off, copy_len);
     }
+
+    /* Every call site of write_bit_file() follows an actual allocate/free
+     * (create/update/delete file), so this is exactly the choke point where
+     * the cached free-page count in the master block goes stale and must be
+     * refreshed. Doing it here (rather than at each call site) guarantees no
+     * mutation path can forget it. */
+    persist_master_block(fs);
+
     return NDFS_OK;
 }
 

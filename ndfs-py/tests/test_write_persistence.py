@@ -8,7 +8,8 @@ HackerCorp Labs - https://github.com/HackerCorpLabs
 import pytest
 
 from ndfs.filesystem import NdfsFileSystem
-from ndfs.constants import NDFS_PAGE_SIZE
+from ndfs.constants import NDFS_PAGE_SIZE, MASTER_BLOCK_OFFSET, EXTENDED_INFO_OFFSET
+from ndfs.endian import read_uint32_be
 from ndfs.types import ImageTemplate, ImageCreationOptions
 
 
@@ -217,6 +218,95 @@ def test_friends_add_list_remove():
     assert fs.list_friends("ALICE") == []
     with pytest.raises(KeyError):
         fs.remove_friend("ALICE", "BOB")
+
+
+def _raw_unreserved_pages(ndfs: NdfsFileSystem) -> int:
+    """Read the on-disk "Unreserved Pages" master-block field directly from
+    raw page-0 bytes, bypassing the filesystem API's parsed MasterBlock."""
+    buf = ndfs.to_buffer()
+    page0 = buf[:NDFS_PAGE_SIZE]
+    return read_uint32_be(page0, MASTER_BLOCK_OFFSET + 0x1C)
+
+
+def _raw_ext_checksum_bytes(ndfs: NdfsFileSystem) -> bytes:
+    """Read the 2-byte Extended Info Block checksum directly from raw page-0
+    bytes at offset EXTENDED_INFO_OFFSET (0x07D0) -- a structure unrelated to
+    the master block that must never be touched by _persist_master_block."""
+    buf = ndfs.to_buffer()
+    page0 = buf[:NDFS_PAGE_SIZE]
+    return bytes(page0[EXTENDED_INFO_OFFSET:EXTENDED_INFO_OFFSET + 2])
+
+
+class TestMasterBlockUnreservedPagesSync:
+    """The master block's cached "Unreserved Pages" field (page 0, offset
+    MASTER_BLOCK_OFFSET+0x1C) must be rewritten from the live bitmap after
+    every allocation-affecting mutation, since real SINTRAN trusts this
+    cached count instead of rescanning the bitmap."""
+
+    def test_create_file_updates_on_disk_unreserved_pages(self):
+        fs = _make_fs()
+        fs.write_file("SYSTEM/A:DATA", b"hello world")
+        assert _raw_unreserved_pages(fs) == fs.get_free_pages()
+
+    def test_delete_file_updates_on_disk_unreserved_pages(self):
+        fs = _make_fs()
+        fs.write_file("SYSTEM/A:DATA", b"hello world")
+        free_after_create = fs.get_free_pages()
+
+        fs.delete_file("SYSTEM/A:DATA")
+        free_after_delete = fs.get_free_pages()
+
+        assert free_after_delete > free_after_create
+        assert _raw_unreserved_pages(fs) == free_after_delete
+
+    def test_multi_step_sequence_tracks_after_each_step(self):
+        """Create A, create B, delete A -- the on-disk value must track the
+        live bitmap after EACH step, not just at the very end."""
+        fs = _make_fs()
+
+        fs.write_file("SYSTEM/A:DATA", b"aaaaaaaaaa")
+        assert _raw_unreserved_pages(fs) == fs.get_free_pages()
+        free_after_a = fs.get_free_pages()
+
+        fs.write_file("SYSTEM/B:DATA", b"bbbbbbbbbbbbbbbbbbbb")
+        assert _raw_unreserved_pages(fs) == fs.get_free_pages()
+        free_after_b = fs.get_free_pages()
+        assert free_after_b < free_after_a
+
+        fs.delete_file("SYSTEM/A:DATA")
+        assert _raw_unreserved_pages(fs) == fs.get_free_pages()
+        free_after_delete_a = fs.get_free_pages()
+        assert free_after_delete_a > free_after_b
+
+    def test_overwrite_updates_on_disk_unreserved_pages(self):
+        fs = _make_fs()
+        fs.write_file("SYSTEM/A:DATA", b"short")
+        free_after_first = _raw_unreserved_pages(fs)
+
+        # Overwrite with much larger, non-zero content -- consumes more data
+        # blocks. (An all-zero buffer would hit the sparse-hole path in
+        # _write_data_page_to_index and allocate no data blocks at all, which
+        # would defeat the point of this test.)
+        bigger = bytearray(5000)
+        for i in range(len(bigger)):
+            bigger[i] = (i & 0xFF) or 1
+        fs.write_file("SYSTEM/A:DATA", bigger)
+        assert _raw_unreserved_pages(fs) == fs.get_free_pages()
+        assert _raw_unreserved_pages(fs) != free_after_first
+
+    def test_extended_info_checksum_untouched_by_mutations(self):
+        """The Extended Info Block checksum at raw offset 0x07D0 is a
+        separate structure from the master block and must stay
+        byte-identical across create/delete mutations."""
+        fs = _make_fs()
+        checksum_before = _raw_ext_checksum_bytes(fs)
+
+        fs.write_file("SYSTEM/A:DATA", b"one")
+        fs.write_file("SYSTEM/B:DATA", b"two")
+        fs.delete_file("SYSTEM/A:DATA")
+
+        checksum_after = _raw_ext_checksum_bytes(fs)
+        assert checksum_after == checksum_before
 
 
 def test_surgical_write_preserves_empty_type():

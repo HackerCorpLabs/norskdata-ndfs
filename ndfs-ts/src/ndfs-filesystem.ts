@@ -1082,6 +1082,27 @@ export class NdfsFileSystem {
     for (let i = 0; i < pages.length; i++) {
       this.writePage(mb.bitFilePointer.blockId + i, pages[i]);
     }
+    // The bitmap just changed, so the master block's cached "Unreserved
+    // Pages" free-page count (page 0, offset 0x1C of the master block) is
+    // now stale. Real SINTRAN trusts this cached count instead of rescanning
+    // the bitmap, so every caller of writeBitFile() (createNewFile,
+    // updateExistingFile, deleteFile) must keep it in sync.
+    this.persistMasterBlock();
+  }
+
+  /**
+   * Rewrite only the 32-byte master block region of page 0 with the current
+   * free-page count from the live bit file. Must NOT disturb the adjacent
+   * Extended Info Block (page 0 offset 0x07D0) or its checksum -- RetroCore
+   * (the golden reference) never rewrites that checksum, and
+   * MasterBlock.writeToBytes() only clears/writes its own 32-byte region
+   * starting at MASTER_BLOCK_OFFSET (0x07E0), so this is safe.
+   */
+  private persistMasterBlock(): void {
+    this.masterBlock.unreservedPages = this.bitFile.getFreePages();
+    const page0 = this.readPage(0);
+    this.masterBlock.writeToBytes(page0);
+    this.writePage(0, page0);
   }
 
   /** Write only the UserFile data page holding `userIndex`. */

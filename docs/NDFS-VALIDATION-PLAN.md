@@ -288,11 +288,28 @@ For each divergence the matrix surfaces:
   disk, user index 32 sits at page 1/slot 0. RetroCore's `user-(user/32)*8`
   formula is the latent bug (impossible slot ≥32). **Ports unchanged.**
 
+### Fixed (with regression tests), verified against RetroCore / a real disk (cont'd)
+- ✅ **Master-block free count** (`unreserved_pages`@0x1C) now rewritten after
+  every mutation that changes the bit file (create/update/delete file; RFS
+  also covers `AddUser`'s on-demand user-file-page allocation), in C/TS/PY/RFS.
+  Recomputed from the live bit file (`getFreePages()`/`get_free_pages()`/
+  `ndfs_bf_count_free()`/`BitFile.GetFreePages()`) rather than tracked
+  incrementally, so it can't drift out of sync with the bitmap. Confirmed the
+  Extended Info Block checksum (0x07D0) is never touched by this write, in all
+  four. Tests added in each port's write-persistence suite. Along the way,
+  found a separate, still-open, lower-priority quirk: `image-creator`
+  (TS)/`image_creator.c` (C) seed `unreserved_pages` with a template
+  placeholder rather than the true free count at *creation* time — this fix
+  only targets keeping it correct after mutations, not the initial value.
+
 ### Open (tracked, lower priority)
-- ☐ **Master-block free count** (`unreserved_pages`@0x1C) not rewritten on
-  mutation in any port → stale free count after add/delete (SINTRAN reads it).
-  Fix: update + write the master-block directory word on persist (NOT the
-  extended-info checksum — RetroCore never rewrites that). C/TS/PY (+RFS).
+- ☐ **Image-creation-time `unreserved_pages` placeholder** — `image-creator.ts`
+  and `image_creator.c` seed the master block's free-page count with a
+  template constant (e.g. `1` for floppy templates) rather than computing the
+  true free-page count at creation time. First mutation self-corrects it (see
+  the fix above), so this only matters for a freshly-created, never-mutated
+  image read by something that trusts the field verbatim. C/TS (PY/RFS not
+  yet checked).
 - ☐ **On-demand user-file page growth** — adding a user whose user-file page is
   not yet allocated silently drops it (edge: >32 users). Mirror
   `ensureObjectDirPage` as `ensureUserDirPage` in C/TS/PY.

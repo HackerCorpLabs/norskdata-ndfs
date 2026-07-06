@@ -1,7 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import { NdfsFileSystem } from '../src/ndfs-filesystem.js';
 import { ImageTemplate } from '../src/types.js';
-import { NDFS_PAGE_SIZE } from '../src/constants.js';
+import { NDFS_PAGE_SIZE, MASTER_BLOCK_OFFSET, EXTENDED_INFO_OFFSET } from '../src/constants.js';
+import { readUint32BE } from '../src/endian.js';
 
 function createFS(pages: number = 200): NdfsFileSystem {
   return NdfsFileSystem.createImage({
@@ -9,6 +10,18 @@ function createFS(pages: number = 200): NdfsFileSystem {
     customPages: pages,
     directoryName: 'PERSIST',
   });
+}
+
+/** Read the on-disk "Unreserved Pages" field directly from page 0, bypassing the filesystem API. */
+function readOnDiskUnreservedPages(fsys: NdfsFileSystem): number {
+  const page0 = fsys.toBuffer().subarray(0, NDFS_PAGE_SIZE);
+  return readUint32BE(page0, MASTER_BLOCK_OFFSET + 0x1c);
+}
+
+/** Read the raw 16-byte Extended Info Block (page 0, offset 0x07D0), including its checksum. */
+function readExtendedInfoBytes(fsys: NdfsFileSystem): Uint8Array {
+  const page0 = fsys.toBuffer().subarray(0, NDFS_PAGE_SIZE);
+  return page0.slice(EXTENDED_INFO_OFFSET, EXTENDED_INFO_OFFSET + 16);
 }
 
 describe('WritePersistence', () => {
@@ -167,5 +180,65 @@ describe('WritePersistence', () => {
     // Export + reload: the empty type must survive, not become 'DATA'.
     const fs2 = new NdfsFileSystem(fs.toBuffer());
     expect(fs2.getMetadata('SYSTEM/NOTYPE')!.type).toBe('');
+  });
+
+  // Regression: the master block's cached "Unreserved Pages" field (page 0,
+  // offset 0x1C of the 32-byte master block) is what real SINTRAN reads to
+  // report free disk space -- it never rescans the bitmap itself. Every
+  // mutation that changes the bit file must keep this cached count in sync.
+  it('master block unreserved-pages count is rewritten on disk after creating a file', () => {
+    const fs = createFS();
+    // Note: image-creator.ts seeds this field with a template placeholder
+    // (not necessarily the true free-page count) -- that pre-existing
+    // creation-time value is out of scope here. What matters is that the
+    // very first mutation makes the on-disk field match the live bit file.
+    const freeBeforeWrite = fs.getFreePages();
+
+    fs.writeFile('SYSTEM/A:DATA', new Uint8Array(3000)); // spans several pages
+    const after = readOnDiskUnreservedPages(fs);
+    expect(after).toBe(fs.getFreePages());
+    expect(after).toBeLessThan(freeBeforeWrite);
+  });
+
+  it('master block unreserved-pages count is rewritten on disk after deleting a file', () => {
+    const fs = createFS();
+    fs.writeFile('SYSTEM/A:DATA', new Uint8Array(3000));
+    const afterCreate = readOnDiskUnreservedPages(fs);
+
+    fs.deleteFile('SYSTEM/A:DATA');
+    const afterDelete = readOnDiskUnreservedPages(fs);
+    expect(afterDelete).toBe(fs.getFreePages());
+    expect(afterDelete).toBeGreaterThan(afterCreate);
+  });
+
+  it('master block unreserved-pages count tracks correctly across a sequence of mutations', () => {
+    const fs = createFS();
+
+    fs.writeFile('SYSTEM/A:DATA', new Uint8Array(1000));
+    const afterA = readOnDiskUnreservedPages(fs);
+    expect(afterA).toBe(fs.getFreePages());
+
+    fs.writeFile('SYSTEM/B:DATA', new Uint8Array(2000));
+    const afterB = readOnDiskUnreservedPages(fs);
+    expect(afterB).toBe(fs.getFreePages());
+    expect(afterB).toBeLessThan(afterA);
+
+    fs.deleteFile('SYSTEM/A:DATA');
+    const afterDeleteA = readOnDiskUnreservedPages(fs);
+    expect(afterDeleteA).toBe(fs.getFreePages());
+    expect(afterDeleteA).toBeGreaterThan(afterB);
+  });
+
+  it('does not touch the Extended Info Block checksum when persisting unreserved pages', () => {
+    const fs = createFS();
+    const extBefore = readExtendedInfoBytes(fs);
+
+    fs.writeFile('SYSTEM/A:DATA', new Uint8Array(1000));
+    fs.writeFile('SYSTEM/B:DATA', new Uint8Array(2000));
+    fs.deleteFile('SYSTEM/A:DATA');
+    fs.addUser('BACKUP', 50);
+
+    const extAfter = readExtendedInfoBytes(fs);
+    expect(Array.from(extAfter)).toEqual(Array.from(extBefore));
   });
 });
