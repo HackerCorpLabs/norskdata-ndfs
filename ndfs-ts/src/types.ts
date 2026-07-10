@@ -22,6 +22,19 @@ export enum BootFormat {
   FloMon = 'flomon',
 }
 
+/**
+ * Hard-disk controller family identified from the IOX/IOXT instructions in a
+ * raw-binary bootstrap. Only meaningful when BootFormat is Binary; BPUN/FloMon
+ * boots are always floppy media and are not classified this way.
+ */
+export enum BootControllerType {
+  Unknown = 'unknown',
+  SmdEcc = 'smd_ecc',
+  Winchester = 'winchester',
+  Scsi = 'scsi',
+  Floppy = 'floppy',
+}
+
 /** Access level for a user relative to a file. */
 export enum FileAccessType {
   Own = 0,
@@ -83,6 +96,7 @@ export interface FileEntry {
 /** Boot code extracted from page 0. */
 export interface BootCode {
   format: BootFormat;
+  controllerType: BootControllerType;
   startAddress: number;
   bootAddress: number;
   loadAddress: number;

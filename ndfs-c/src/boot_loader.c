@@ -155,32 +155,102 @@ static bool try_parse_bpun(const uint8_t *data, size_t excl_pos,
     return true;
 }
 
+/*
+ * ND-100 CPU opcodes (16-bit, big-endian on disk). A real bootstrap always begins
+ * by disabling interrupts (and usually paging) before touching hardware - these
+ * are the ONLY two words a genuine boot sector can start with. Verified against
+ * the assembler source (norsk_data/nd100-as/instr.h: PIOF=0150405, IOF=0150401)
+ * and cross-checked against nd100x/asm/DISK-IMAGE-INVENTORY.md, which uses the
+ * same two values to classify real disk images.
+ */
+#define NDFS_OPCODE_PIOF 0xD105u /* octal 150405 - disable interrupts + paging */
+#define NDFS_OPCODE_IOF  0xD101u /* octal 150401 - disable interrupts only */
+
+/*
+ * Literal IOX instruction word = base opcode 0164000 (octal) OR'd with an 11-bit
+ * device address in bits 10-0 (norsk_data/nd100-as/instr.h:
+ * OPC("iox",A_IOX,0164000)). IOXT (device address taken from the T register at
+ * runtime - used by SCSI/NCR-5386) is the single fixed word 0150415 octal; no
+ * device address is visible in the instruction stream for it.
+ */
+#define NDFS_IOX_OPCODE_BASE 0xE800u /* octal 164000 */
+#define NDFS_IOX_OPCODE_MASK 0xF800u /* top 5 bits select the IOX instruction class */
+#define NDFS_IOX_DEVICE_MASK 0x07FFu /* low 11 bits carry the literal device address */
+#define NDFS_IOXT_OPCODE     0xD10Du /* octal 150415 (SCSI/NCR-5386, indirect) */
+
+/*
+ * Hard-disk controller IOX device bases (octal, converted to decimal), each
+ * covering an 8-word register window. Source: nd100-dis/DEVICE-BASES.md
+ * (thumbwheel-selectable base addresses extracted from the RetroCore NDBus
+ * controller drivers).
+ */
+static const uint16_t NDFS_SMD_ECC_BASES[]    = { 0x360, 0x368, 0x160, 0x168 }; /* 1540,1550,540,550 octal */
+static const uint16_t NDFS_WINCHESTER_BASES[] = { 0x140, 0x148 };               /* 500,510 octal */
+static const uint16_t NDFS_FLOPPY_BASES[]     = { 0x370, 0x378 };               /* 1560,1570 octal */
+
+/** Checks whether a 16-bit word is the genuine ND-100 bootstrap prologue. */
+static bool is_prologue_opcode(uint16_t word)
+{
+    return word == NDFS_OPCODE_PIOF || word == NDFS_OPCODE_IOF;
+}
+
+/** Checks whether a device address falls within any of the given controllers'
+ *  8-word register windows (base .. base+7). */
+static bool is_in_device_window(uint16_t address, const uint16_t *bases, size_t count)
+{
+    size_t i;
+    for (i = 0; i < count; i++) {
+        if (address >= bases[i] && address <= (uint16_t)(bases[i] + 7)) return true;
+    }
+    return false;
+}
+
 /**
- * Check if page 0 contains raw binary boot code (heuristic).
+ * Scans page 0 for a literal IOX (SMD/ECC, Winchester, Floppy) or indirect IOXT
+ * (SCSI/NCR-5386) instruction to classify which hard-disk controller the
+ * bootstrap targets. Only meaningful once is_prologue_opcode() has already
+ * confirmed the page is a genuine bootstrap.
+ */
+static ndfs_boot_controller_type_t detect_controller_type(const uint8_t *data)
+{
+    size_t word_count = NDFS_PAGE_SIZE / 2;
+    size_t i;
+
+    for (i = 0; i < word_count; i++) {
+        uint16_t word = ndfs_read_u16be(data, i * 2);
+
+        if (word == NDFS_IOXT_OPCODE) {
+            return NDFS_CONTROLLER_SCSI;
+        }
+
+        if ((word & NDFS_IOX_OPCODE_MASK) == NDFS_IOX_OPCODE_BASE) {
+            uint16_t device_address = (uint16_t)(word & NDFS_IOX_DEVICE_MASK);
+
+            if (is_in_device_window(device_address, NDFS_SMD_ECC_BASES,
+                                     sizeof(NDFS_SMD_ECC_BASES) / sizeof(NDFS_SMD_ECC_BASES[0])))
+                return NDFS_CONTROLLER_SMD_ECC;
+            if (is_in_device_window(device_address, NDFS_WINCHESTER_BASES,
+                                     sizeof(NDFS_WINCHESTER_BASES) / sizeof(NDFS_WINCHESTER_BASES[0])))
+                return NDFS_CONTROLLER_WINCHESTER;
+            if (is_in_device_window(device_address, NDFS_FLOPPY_BASES,
+                                     sizeof(NDFS_FLOPPY_BASES) / sizeof(NDFS_FLOPPY_BASES[0])))
+                return NDFS_CONTROLLER_FLOPPY;
+        }
+    }
+
+    return NDFS_CONTROLLER_UNKNOWN;
+}
+
+/**
+ * Check if page 0 contains a genuine raw hard-disk bootstrap (SMD/ECC,
+ * Winchester, SCSI). Unlike BPUN/FLOMON, raw bootstraps carry no ASCII
+ * preamble or delimiter, so the only reliable signature is the CPU opcode
+ * itself: real boot code always starts with PIOF or IOF. Anything else -
+ * including data that merely "looks non-uniform" - is not bootable.
  */
 static bool is_valid_binary(const uint8_t *data)
 {
-    bool all_zero = true;
-    bool all_ff = true;
-    bool all_f6 = true;
-    int i;
-    int limit = 256;
-
-    for (i = 0; i < limit; i++) {
-        if (data[i] != 0x00) all_zero = false;
-        if (data[i] != 0xFF) all_ff = false;
-        if (data[i] != 0xF6) all_f6 = false;
-        if (!all_zero && !all_ff && !all_f6) break;
-    }
-
-    if (all_zero || all_ff || all_f6) return false;
-
-    /* If a '!' exists in first 512 bytes, it might be BPUN, not raw binary */
-    for (i = 0; i < 512 && i < (int)NDFS_PAGE_SIZE; i++) {
-        if (data[i] == 0x21) return false;
-    }
-
-    return true;
+    return is_prologue_opcode(ndfs_read_u16be(data, 0));
 }
 
 /* ---- Internal load from raw page 0 ---------------------------------- */
@@ -205,6 +275,7 @@ static ndfs_error_t load_from_page0(const uint8_t *page0, ndfs_boot_code_t *code
     /* Try raw binary */
     if (is_valid_binary(page0)) {
         code->format = NDFS_BOOT_BINARY;
+        code->controller_type = detect_controller_type(page0);
         code->load_address = 0;
         code->start_address = 0;
         /* Copy entire page 0 as code data (up to master block area) */
@@ -267,6 +338,22 @@ ndfs_error_t ndfs_is_bootable(ndfs_filesystem_t *fs, bool *bootable)
     if (err != NDFS_OK) return err;
 
     *bootable = (fmt != NDFS_BOOT_NONE);
+    return NDFS_OK;
+}
+
+ndfs_error_t ndfs_detect_boot_controller_type(ndfs_filesystem_t *fs,
+                                              ndfs_boot_controller_type_t *type)
+{
+    ndfs_boot_code_t code;
+    ndfs_error_t err;
+
+    if (!fs || !type) return NDFS_ERR_NULL_PTR;
+
+    err = ndfs_load_boot_code(fs, &code);
+    if (err != NDFS_OK) return err;
+
+    *type = code.controller_type;
+    ndfs_boot_code_destroy(&code);
     return NDFS_OK;
 }
 

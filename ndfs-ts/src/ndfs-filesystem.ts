@@ -35,9 +35,9 @@ import {
   FT_INDEXED,
   FT_CONTIGUOUS,
 } from './object-entry.js';
-import { PointerType, FileEntry, BootFormat, BootCode, ImageTemplate, ImageCreationOptions } from './types.js';
+import { PointerType, FileEntry, BootFormat, BootControllerType, BootCode, ImageTemplate, ImageCreationOptions } from './types.js';
 import { createNdfsImage } from './image-creator.js';
-import { detectBootFormat, loadBootCode as loadBootCodeFromPage } from './boot-loader.js';
+import { detectBootFormat, loadBootCode as loadBootCodeFromPage, detectControllerType } from './boot-loader.js';
 import { stripParity, setParity } from './parity.js';
 
 /** Parity mode for read/write operations. */
@@ -537,6 +537,16 @@ export class NdfsFileSystem {
   /** Check if this image contains bootable code. */
   isBootable(): boolean {
     return this.detectBootFormat() !== BootFormat.None;
+  }
+
+  /**
+   * Detect the hard-disk controller family (SMD/ECC, Winchester, SCSI) targeted by
+   * a raw-binary bootstrap. Returns BootControllerType.Unknown for BPUN/FloMon
+   * (floppy) boots or non-bootable disks.
+   */
+  detectBootControllerType(): BootControllerType {
+    const page0 = this.readPage(0);
+    return detectControllerType(page0);
   }
 
   // ── Diagnostics ────────────────────────────────────────────────────

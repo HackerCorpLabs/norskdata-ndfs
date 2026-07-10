@@ -29,6 +29,17 @@ class BootFormat(enum.Enum):
     FLOMON = "flomon"
 
 
+class BootControllerType(enum.Enum):
+    """Hard-disk controller family identified from IOX/IOXT instructions in a
+    raw-binary bootstrap. Only meaningful when BootFormat is BINARY; BPUN/FLOMON
+    boots are always floppy media and are not classified this way."""
+    UNKNOWN = "unknown"
+    SMD_ECC = "smd_ecc"
+    WINCHESTER = "winchester"
+    SCSI = "scsi"
+    FLOPPY = "floppy"
+
+
 class FileAccessType(enum.IntEnum):
     """Access level for a user relative to a file."""
     Own = 0
@@ -92,6 +103,7 @@ class FileEntry:
 class BootCode:
     """Boot code extracted from page 0."""
     format: BootFormat = BootFormat.NONE
+    controller_type: BootControllerType = BootControllerType.UNKNOWN
     start_address: int = 0
     boot_address: int = 0
     load_address: int = 0

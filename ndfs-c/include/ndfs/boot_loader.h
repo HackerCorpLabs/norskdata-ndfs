@@ -19,7 +19,8 @@ extern "C" {
 
 /** Loaded boot code information. */
 typedef struct {
-    ndfs_boot_format_t format;
+    ndfs_boot_format_t          format;
+    ndfs_boot_controller_type_t controller_type;
     uint16_t           start_address;
     uint16_t           boot_address;
     uint16_t           load_address;
@@ -52,6 +53,16 @@ ndfs_error_t ndfs_load_boot_code(ndfs_filesystem_t *fs,
  * @param bootable  Receives true if bootable.
  */
 ndfs_error_t ndfs_is_bootable(ndfs_filesystem_t *fs, bool *bootable);
+
+/**
+ * Detect the hard-disk controller family (SMD/ECC, Winchester, SCSI) targeted by
+ * a raw-binary bootstrap. Result is NDFS_CONTROLLER_UNKNOWN for BPUN/FLOMON
+ * (floppy) boots or non-bootable disks.
+ * @param fs    Open filesystem handle.
+ * @param type  Receives the detected controller type.
+ */
+ndfs_error_t ndfs_detect_boot_controller_type(ndfs_filesystem_t *fs,
+                                              ndfs_boot_controller_type_t *type);
 
 /**
  * Free resources in a boot code struct.

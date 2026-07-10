@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { NdfsFileSystem } from '../src/ndfs-filesystem.js';
-import { detectBootFormat, loadBootCode } from '../src/boot-loader.js';
-import { BootFormat, ImageTemplate } from '../src/types.js';
+import { detectBootFormat, loadBootCode, detectControllerType } from '../src/boot-loader.js';
+import { BootFormat, BootControllerType, ImageTemplate } from '../src/types.js';
 import { NDFS_PAGE_SIZE, MASTER_BLOCK_OFFSET } from '../src/constants.js';
 import { writeUint16BE } from '../src/endian.js';
 import * as fs from 'fs';
@@ -64,17 +64,29 @@ describe('BootLoader', () => {
       expect(detectBootFormat(page0)).toBe(BootFormat.BPUN);
     });
 
-    it('detects Binary when non-zero data but no !', () => {
+    it('detects Binary when page starts with the real PIOF prologue opcode', () => {
+      // A real ND-100 bootstrap always starts by disabling interrupts/paging.
+      // PIOF = octal 150405 = 0xD105 (big-endian on disk).
       const buf = createPage0WithBoot((page) => {
-        // Write random-looking non-zero data (no '!' character 0x21)
+        page[0] = 0xD1;
+        page[1] = 0x05;
+      });
+      const page0 = buf.subarray(0, NDFS_PAGE_SIZE);
+      expect(detectBootFormat(page0)).toBe(BootFormat.Binary);
+    });
+
+    it('rejects non-uniform garbage that lacks the prologue opcode', () => {
+      // Regression: the old heuristic accepted ANY non-zero/non-uniform block
+      // without a '!' as "Binary". A real bootstrap must start with PIOF/IOF;
+      // this buffer does not.
+      const buf = createPage0WithBoot((page) => {
         for (let i = 0; i < 100; i++) {
           page[i] = (i * 7 + 3) & 0xFF;
-          // Make sure no 0x21 accidentally appears
           if (page[i] === 0x21) page[i] = 0x22;
         }
       });
       const page0 = buf.subarray(0, NDFS_PAGE_SIZE);
-      expect(detectBootFormat(page0)).toBe(BootFormat.Binary);
+      expect(detectBootFormat(page0)).toBe(BootFormat.None);
     });
 
     it('returns None for all-zero page', () => {
@@ -137,15 +149,37 @@ describe('BootLoader', () => {
 
     it('loads Binary boot code', () => {
       const page0 = new Uint8Array(NDFS_PAGE_SIZE);
-      for (let i = 0; i < 100; i++) {
-        page0[i] = (i * 13 + 5) & 0xFF;
-        if (page0[i] === 0x21) page0[i] = 0x22;
-      }
+      page0[0] = 0xD1; // PIOF, big-endian
+      page0[1] = 0x05;
 
       const boot = loadBootCode(page0);
       expect(boot).not.toBeNull();
       expect(boot!.format).toBe(BootFormat.Binary);
       expect(boot!.data.length).toBe(1024);
+    });
+
+    it('detects SMD/ECC controller type from IOX 1540 octal', () => {
+      // IOX 1540 octal (SMD/ECC base) = opcode 0164000 | 1540 octal
+      // = 0165540 octal = 0xEB60 big-endian.
+      const page0 = new Uint8Array(NDFS_PAGE_SIZE);
+      page0[0] = 0xD1; page0[1] = 0x05;
+      page0[2] = 0xEB; page0[3] = 0x60;
+
+      const boot = loadBootCode(page0);
+      expect(boot).not.toBeNull();
+      expect(boot!.controllerType).toBe(BootControllerType.SmdEcc);
+      expect(detectControllerType(page0)).toBe(BootControllerType.SmdEcc);
+    });
+
+    it('detects SCSI controller type from the fixed indirect IOXT opcode', () => {
+      // IOXT = octal 150415 = 0xD10D big-endian.
+      const page0 = new Uint8Array(NDFS_PAGE_SIZE);
+      page0[0] = 0xD1; page0[1] = 0x01;
+      page0[2] = 0xD1; page0[3] = 0x0D;
+
+      const boot = loadBootCode(page0);
+      expect(boot).not.toBeNull();
+      expect(boot!.controllerType).toBe(BootControllerType.Scsi);
     });
   });
 

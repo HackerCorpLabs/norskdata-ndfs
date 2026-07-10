@@ -8,8 +8,8 @@ HackerCorp Labs - https://github.com/HackerCorpLabs
 import os
 import pytest
 
-from ndfs.boot_loader import load_boot_code, detect_boot_format, is_bootable
-from ndfs.types import BootFormat
+from ndfs.boot_loader import load_boot_code, detect_boot_format, is_bootable, detect_controller_type
+from ndfs.types import BootFormat, BootControllerType
 from ndfs.constants import NDFS_PAGE_SIZE
 from ndfs.filesystem import NdfsFileSystem
 from ndfs.image_creator import create_image
@@ -192,13 +192,12 @@ class TestFLOMONFormat:
 
 
 class TestBinaryFormat:
-    def test_detects_binary_code(self):
+    def test_detects_binary_code_with_real_prologue_opcode(self):
+        # A real ND-100 bootstrap always starts by disabling interrupts/paging.
+        # PIOF = octal 150405 = 0xD105 (big-endian on disk).
         page = bytearray(NDFS_PAGE_SIZE)
-        # Fill with varied byte values (no '!' to avoid BPUN detection)
-        for i in range(256):
-            page[i] = (i * 7 + 3) & 0xFF
-            if page[i] == 0x21:
-                page[i] = 0x22  # Avoid '!' delimiter
+        page[0] = 0xD1
+        page[1] = 0x05
         boot = load_boot_code(page)
         assert boot is not None
         assert boot.format == BootFormat.BINARY
@@ -207,6 +206,42 @@ class TestBinaryFormat:
         page = bytearray(b"\xF6" * NDFS_PAGE_SIZE)
         boot = load_boot_code(page)
         assert boot is None
+
+    def test_rejects_nonuniform_garbage_without_prologue_opcode(self):
+        # Regression: the old heuristic accepted ANY non-uniform block without a
+        # '!' byte as "valid binary code". A real bootstrap must start with the
+        # PIOF/IOF prologue opcode; this buffer does not.
+        page = bytearray(NDFS_PAGE_SIZE)
+        for i in range(256):
+            page[i] = (i * 7 + 3) & 0xFF
+            if page[i] == 0x21:
+                page[i] = 0x22  # avoid accidental BPUN delimiter
+        boot = load_boot_code(page)
+        assert boot is None
+
+    def test_detects_smd_controller_type(self):
+        # IOX 1540 octal (SMD/ECC base) = opcode 0164000 | 1540 octal = 0165540
+        # octal = 0xEB60 big-endian.
+        page = bytearray(NDFS_PAGE_SIZE)
+        page[0] = 0xD1
+        page[1] = 0x05
+        page[2] = 0xEB
+        page[3] = 0x60
+        boot = load_boot_code(page)
+        assert boot is not None
+        assert boot.controller_type == BootControllerType.SMD_ECC
+        assert detect_controller_type(page) == BootControllerType.SMD_ECC
+
+    def test_detects_scsi_controller_type(self):
+        # Fixed indirect IOXT opcode = octal 150415 = 0xD10D big-endian.
+        page = bytearray(NDFS_PAGE_SIZE)
+        page[0] = 0xD1
+        page[1] = 0x01
+        page[2] = 0xD1
+        page[3] = 0x0D
+        boot = load_boot_code(page)
+        assert boot is not None
+        assert boot.controller_type == BootControllerType.SCSI
 
 
 class TestBootLoaderFixtures:

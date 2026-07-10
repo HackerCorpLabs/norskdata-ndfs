@@ -34,7 +34,7 @@ from ndfs.object_file import ObjectFile
 from ndfs.user_entry import UserEntry
 from ndfs.user_friend import UserFriend
 from ndfs.object_entry import ObjectEntry, ACCESS_DEFAULT, FT_INDEXED
-from ndfs.types import PointerType, FileEntry, ImageCreationOptions, BootFormat, BootCode
+from ndfs.types import PointerType, FileEntry, ImageCreationOptions, BootFormat, BootControllerType, BootCode
 from ndfs.xat import object_entry_to_xat, xat_to_object_entry
 
 _BufType = Union[bytes, bytearray, memoryview]
@@ -531,6 +531,14 @@ class NdfsFileSystem:
         from ndfs.boot_loader import is_bootable as _is_bootable
         page0 = self._read_page(0)
         return _is_bootable(page0)
+
+    def detect_boot_controller_type(self) -> BootControllerType:
+        """Detect the hard-disk controller family (SMD/ECC, Winchester, SCSI)
+        targeted by a raw-binary bootstrap. Returns BootControllerType.UNKNOWN
+        for BPUN/FLOMON (floppy) boots or non-bootable disks."""
+        from ndfs.boot_loader import detect_controller_type as _detect
+        page0 = self._read_page(0)
+        return _detect(page0)
 
     # -- Low-level access --------------------------------------------------
 

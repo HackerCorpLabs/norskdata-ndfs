@@ -107,6 +107,19 @@ typedef enum {
     NDFS_BOOT_FLOMON = 3
 } ndfs_boot_format_t;
 
+/**
+ * Hard-disk controller family identified from the IOX/IOXT instructions in a
+ * raw-binary bootstrap. Only meaningful when ndfs_boot_format_t is NDFS_BOOT_BINARY;
+ * BPUN/FLOMON boots are always floppy media and are not classified this way.
+ */
+typedef enum {
+    NDFS_CONTROLLER_UNKNOWN    = 0,
+    NDFS_CONTROLLER_SMD_ECC    = 1,
+    NDFS_CONTROLLER_WINCHESTER = 2,
+    NDFS_CONTROLLER_SCSI       = 3,
+    NDFS_CONTROLLER_FLOPPY     = 4
+} ndfs_boot_controller_type_t;
+
 /** Access level for a user relative to a file. */
 typedef enum {
     NDFS_ACCESS_OWN    = 0,

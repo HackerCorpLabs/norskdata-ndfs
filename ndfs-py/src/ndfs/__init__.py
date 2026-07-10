@@ -28,6 +28,7 @@ from ndfs.constants import (
 from ndfs.types import (
     PointerType,
     BootFormat,
+    BootControllerType,
     FileAccessType,
     FileOperationType,
     ChecksumValidation,
@@ -59,7 +60,7 @@ from ndfs.access_permissions import (
 )
 from ndfs.access_control import get_access_level, get_friend_permissions, check_access
 from ndfs.image_creator import create_image, TemplateSpec
-from ndfs.boot_loader import load_boot_code, detect_boot_format, is_bootable
+from ndfs.boot_loader import load_boot_code, detect_boot_format, is_bootable, detect_controller_type
 from ndfs.xat import (
     object_entry_to_xat,
     xat_to_object_entry,
@@ -97,7 +98,7 @@ __all__ = [
     "MASTER_BLOCK_SIZE", "EXTENDED_INFO_SIZE", "FIRST_ALLOCATABLE_BLOCK",
     "USER_ENTRY_FLAG", "OBJECT_ENTRY_IN_USE",
     # Types / Enums
-    "PointerType", "BootFormat", "FileAccessType", "FileOperationType",
+    "PointerType", "BootFormat", "BootControllerType", "FileAccessType", "FileOperationType",
     "ChecksumValidation", "ImageTemplate", "FileTypeFlags",
     "FileEntry", "BootCode", "ImageCreationOptions", "UserCreationInfo",
     # Endian helpers
@@ -116,7 +117,7 @@ __all__ = [
     # Image creation
     "create_image", "TemplateSpec",
     # Boot loader
-    "load_boot_code", "detect_boot_format", "is_bootable",
+    "load_boot_code", "detect_boot_format", "is_bootable", "detect_controller_type",
     # XAT support
     "object_entry_to_xat", "xat_to_object_entry", "serialize_xat", "deserialize_xat",
     "get_xat_filename", "is_xat_file",

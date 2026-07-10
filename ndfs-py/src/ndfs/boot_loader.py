@@ -30,43 +30,100 @@ from __future__ import annotations
 from typing import Optional, Union
 
 from ndfs.constants import NDFS_PAGE_SIZE
-from ndfs.types import BootFormat, BootCode
+from ndfs.types import BootFormat, BootControllerType, BootCode
 
 _BufType = Union[bytes, bytearray, memoryview]
 
 BPUN_DELIMITER = 0x21  # '!'
 
+# ND-100 CPU opcodes (16-bit, big-endian on disk). A real bootstrap always begins by
+# disabling interrupts (and usually paging) before touching hardware - these are the
+# ONLY two words a genuine boot sector can start with. Verified against the assembler
+# source (norsk_data/nd100-as/instr.h: PIOF=0150405, IOF=0150401) and cross-checked
+# against nd100x/asm/DISK-IMAGE-INVENTORY.md, which uses the same two values to
+# classify real disk images.
+_OPCODE_PIOF = 0xD105  # octal 150405 - disable interrupts + paging
+_OPCODE_IOF = 0xD101   # octal 150401 - disable interrupts only
 
-def _is_valid_binary_code(data: _BufType) -> bool:
-    """Heuristic check if data contains valid ND-100 binary code."""
-    if len(data) < 16:
-        return False
+# Literal IOX instruction word = base opcode 0164000 (octal) OR'd with an 11-bit device
+# address in bits 10-0 (norsk_data/nd100-as/instr.h: OPC("iox",A_IOX,0164000)). IOXT
+# (device address taken from the T register at runtime - used by SCSI/NCR-5386) is the
+# single fixed word 0150415 octal; no device address is visible in the instruction
+# stream for it.
+_IOX_OPCODE_BASE = 0xE800  # octal 164000
+_IOX_OPCODE_MASK = 0xF800  # top 5 bits select the IOX instruction class
+_IOX_DEVICE_MASK = 0x07FF  # low 11 bits carry the literal device address
+_IOXT_OPCODE = 0xD10D      # octal 150415 (SCSI/NCR-5386, indirect)
 
-    all_zeros = True
-    all_ff = True
-    all_f6 = True
+# Hard-disk controller IOX device bases (octal, converted to decimal), each covering an
+# 8-word register window. Source: nd100-dis/DEVICE-BASES.md (thumbwheel-selectable base
+# addresses extracted from the RetroCore NDBus controller drivers).
+_SMD_ECC_BASES = (0x360, 0x368, 0x160, 0x168)  # 1540, 1550, 540, 550 octal
+_WINCHESTER_BASES = (0x140, 0x148)             # 500, 510 octal
+_FLOPPY_BASES = (0x370, 0x378)                 # 1560, 1570 octal
 
-    limit = min(256, len(data))
-    for i in range(limit):
-        if data[i] != 0x00:
-            all_zeros = False
-        if data[i] != 0xFF:
-            all_ff = False
-        if data[i] != 0xF6:
-            all_f6 = False
-        if not all_zeros and not all_ff and not all_f6:
-            break
 
-    if all_zeros or all_ff or all_f6:
-        return False
+def _is_prologue_opcode(word: int) -> bool:
+    """Checks whether a 16-bit word is the genuine ND-100 bootstrap prologue."""
+    return word == _OPCODE_PIOF or word == _OPCODE_IOF
 
-    # Check for BPUN marker - if present, it's not raw binary
-    check_limit = min(512, len(data))
-    for i in range(check_limit):
-        if data[i] == BPUN_DELIMITER:
-            return False
 
-    return True
+def _is_in_device_window(address: int, bases: tuple) -> bool:
+    """Checks whether a device address falls within any of the given controllers'
+    8-word register windows (base .. base+7)."""
+    for base in bases:
+        if base <= address <= base + 7:
+            return True
+    return False
+
+
+def _detect_controller_type(data: _BufType) -> BootControllerType:
+    """Scans block 0 for a literal IOX (SMD/ECC, Winchester, Floppy) or indirect IOXT
+    (SCSI/NCR-5386) instruction to classify which hard-disk controller the bootstrap
+    targets. Only meaningful once _is_prologue_opcode has already confirmed the block
+    is a genuine bootstrap."""
+    word_count = len(data) // 2
+
+    for i in range(word_count):
+        word = (data[i * 2] << 8) | data[i * 2 + 1]
+
+        if word == _IOXT_OPCODE:
+            return BootControllerType.SCSI
+
+        if (word & _IOX_OPCODE_MASK) == _IOX_OPCODE_BASE:
+            device_address = word & _IOX_DEVICE_MASK
+
+            if _is_in_device_window(device_address, _SMD_ECC_BASES):
+                return BootControllerType.SMD_ECC
+            if _is_in_device_window(device_address, _WINCHESTER_BASES):
+                return BootControllerType.WINCHESTER
+            if _is_in_device_window(device_address, _FLOPPY_BASES):
+                return BootControllerType.FLOPPY
+
+    return BootControllerType.UNKNOWN
+
+
+def _try_load_raw_binary(data: _BufType) -> Optional[BootCode]:
+    """Attempts to load a raw hard-disk bootstrap (SMD/ECC, Winchester, SCSI) from
+    block 0. Unlike BPUN/FLOMON, raw bootstraps carry no ASCII preamble or delimiter,
+    so the only reliable signature is the CPU opcode itself: real boot code always
+    starts with PIOF or IOF. Anything else - including data that merely "looks
+    non-uniform" - is not bootable."""
+    if len(data) < 2:
+        return None
+
+    word0 = (data[0] << 8) | data[1]
+    if not _is_prologue_opcode(word0):
+        return None
+
+    boot = BootCode()
+    boot.format = BootFormat.BINARY
+    boot.controller_type = _detect_controller_type(data)
+    boot.start_address = 0
+    boot.load_address = 0
+    boot.data = bytes(data[:NDFS_PAGE_SIZE])
+    boot.checksum_valid = False
+    return boot
 
 
 def _try_parse_bpun_binary_section(
@@ -198,17 +255,8 @@ def load_boot_code(data: _BufType) -> Optional[BootCode]:
         if result is not None:
             return result
 
-    # Check for raw binary
-    if _is_valid_binary_code(data):
-        boot = BootCode()
-        boot.format = BootFormat.BINARY
-        boot.start_address = 0
-        boot.load_address = 0
-        boot.data = bytes(data[:NDFS_PAGE_SIZE])
-        boot.checksum_valid = False
-        return boot
-
-    return None
+    # Check for raw binary hard-disk bootstrap (SMD/ECC, Winchester, SCSI - not BPUN/FLOMON)
+    return _try_load_raw_binary(data)
 
 
 def detect_boot_format(data: _BufType) -> BootFormat:
@@ -236,3 +284,20 @@ def is_bootable(data: _BufType) -> bool:
         True if valid boot code exists.
     """
     return detect_boot_format(data) != BootFormat.NONE
+
+
+def detect_controller_type(data: _BufType) -> BootControllerType:
+    """Detect the hard-disk controller family (SMD/ECC, Winchester, SCSI) targeted by
+    a raw-binary bootstrap. Returns BootControllerType.UNKNOWN for BPUN/FLOMON
+    (floppy) boots or non-bootable disks.
+
+    Args:
+        data: First page (at least 2048 bytes) from NDFS disk.
+
+    Returns:
+        The detected BootControllerType.
+    """
+    boot = load_boot_code(data)
+    if boot is None:
+        return BootControllerType.UNKNOWN
+    return boot.controller_type

@@ -257,6 +257,115 @@ static int test_null_args(void)
     return 0;
 }
 
+/* ---- Raw hard-disk bootstrap detection (opcode/IOX based) ---- */
+
+/* Injects a boot-area prefix into page 0, leaving the master block (the last
+   32 bytes of page 0, at NDFS_MASTER_BLOCK_OFFSET) untouched so the image
+   created by the template stays valid. */
+static ndfs_filesystem_t *create_image_with_page0(const uint8_t *page0_prefix, size_t prefix_len)
+{
+    ndfs_filesystem_t *fs = NULL;
+    ndfs_image_options_t opts;
+    uint8_t *exported = NULL;
+    size_t exported_size = 0;
+
+    if (prefix_len > NDFS_MASTER_BLOCK_OFFSET) prefix_len = NDFS_MASTER_BLOCK_OFFSET;
+
+    ndfs_image_options_init(&opts);
+    opts.template_type = NDFS_TMPL_FLOPPY_360KB;
+    strcpy(opts.directory_name, "RAWTEST");
+    if (ndfs_create_image(&fs, &opts) != NDFS_OK) return NULL;
+
+    if (ndfs_to_buffer(fs, &exported, &exported_size) != NDFS_OK) {
+        ndfs_close(fs);
+        return NULL;
+    }
+    ndfs_close(fs);
+    fs = NULL;
+
+    memcpy(exported, page0_prefix, prefix_len);
+
+    if (ndfs_open_buffer_copy(exported, exported_size, false, &fs) != NDFS_OK) {
+        free(exported);
+        return NULL;
+    }
+    free(exported);
+    return fs;
+}
+
+static int test_rejects_nonuniform_garbage_without_prologue_opcode(void)
+{
+    /* Regression: the old heuristic accepted ANY non-uniform block without a
+       '!' byte as "valid binary code". A real bootstrap must start with the
+       PIOF/IOF prologue opcode; this buffer does not. */
+    uint8_t page0[2048];
+    ndfs_filesystem_t *fs;
+    ndfs_boot_format_t fmt;
+    size_t i;
+
+    for (i = 0; i < sizeof(page0); i++) {
+        page0[i] = (uint8_t)((i * 7 + 3) & 0xFF);
+        if (page0[i] == 0x21) page0[i] = 0x22; /* avoid accidental BPUN delimiter */
+    }
+
+    fs = create_image_with_page0(page0, sizeof(page0));
+    TEST_ASSERT_NOT_NULL(fs);
+
+    TEST_ASSERT_OK(ndfs_detect_boot_format(fs, &fmt));
+    TEST_ASSERT_EQUAL(NDFS_BOOT_NONE, fmt);
+
+    ndfs_close(fs);
+    return 0;
+}
+
+static int test_detects_smd_controller_type(void)
+{
+    /* PIOF (0xD105) followed by IOX 1540 octal (SMD/ECC base) =
+       opcode 0164000 | 1540 octal = 0165540 octal = 0xEB60 big-endian. */
+    uint8_t page0[2048];
+    ndfs_filesystem_t *fs;
+    ndfs_boot_format_t fmt;
+    ndfs_boot_controller_type_t ctype;
+
+    memset(page0, 0, sizeof(page0));
+    page0[0] = 0xD1; page0[1] = 0x05;
+    page0[2] = 0xEB; page0[3] = 0x60;
+
+    fs = create_image_with_page0(page0, sizeof(page0));
+    TEST_ASSERT_NOT_NULL(fs);
+
+    TEST_ASSERT_OK(ndfs_detect_boot_format(fs, &fmt));
+    TEST_ASSERT_EQUAL(NDFS_BOOT_BINARY, fmt);
+
+    TEST_ASSERT_OK(ndfs_detect_boot_controller_type(fs, &ctype));
+    TEST_ASSERT_EQUAL(NDFS_CONTROLLER_SMD_ECC, ctype);
+
+    ndfs_close(fs);
+    return 0;
+}
+
+static int test_detects_scsi_controller_type(void)
+{
+    /* IOF (0xD101) followed by the fixed indirect IOXT opcode
+       (octal 150415 = 0xD10D big-endian). */
+    uint8_t page0[2048];
+    ndfs_filesystem_t *fs;
+    ndfs_boot_controller_type_t ctype;
+
+    memset(page0, 0, sizeof(page0));
+    page0[0] = 0xD1; page0[1] = 0x01;
+    page0[2] = 0xD1; page0[3] = 0x0D;
+
+    fs = create_image_with_page0(page0, sizeof(page0));
+    TEST_ASSERT_NOT_NULL(fs);
+
+    TEST_ASSERT_OK(ndfs_detect_boot_controller_type(fs, &ctype));
+    TEST_ASSERT_EQUAL(NDFS_CONTROLLER_SCSI, ctype);
+
+    ndfs_close(fs);
+    return 0;
+}
+
 static int test_boot_code_destroy_zeroed(void)
 {
     ndfs_boot_code_t code;
@@ -275,4 +384,7 @@ void run_boot_loader_tests(void)
     RUN_TEST(test_flomon_zero_words);
     RUN_TEST(test_null_args);
     RUN_TEST(test_boot_code_destroy_zeroed);
+    RUN_TEST(test_rejects_nonuniform_garbage_without_prologue_opcode);
+    RUN_TEST(test_detects_smd_controller_type);
+    RUN_TEST(test_detects_scsi_controller_type);
 }
