@@ -40,6 +40,45 @@ export class MasterBlock {
   hasFlomon: boolean = false;
 
   /**
+   * Extended-info flag word (1754B) bit 15: "directory entered / in use".
+   *
+   * The kernel sets it on enter (CHDSI 37763B, `BSET ONE 170`) and clears it on release
+   * (REENB 40162B, `BSET ZRO 170`). A stored 0x8000 means the volume was left entered by
+   * the system in `extLastSystemNumber`. Bits 0-14 have no known meaning — preserve them.
+   *
+   * NOTE: system number 0 means NO OWNER recorded — never report "entered by system 0".
+   */
+  static readonly EXT_FLAG_ENTERED = 0x8000;
+
+  /** True when the volume was left "entered" (flag bit 15 set) and not cleanly released. */
+  get isDirectoryEntered(): boolean {
+    return (this.extFlagWord & MasterBlock.EXT_FLAG_ENTERED) !== 0;
+  }
+
+  /**
+   * Compute the extended-info checksum exactly as the kernel does: a plain 16-bit
+   * ADDITIVE SUM of the seven words FOLLOWING the checksum slot (words 1751B-1757B).
+   *
+   * Kernel-proven from both sides of the carved 006-S3FS segment — the writer WXDIR
+   * (37702B) and the enter-directory validator CHDSI (37763B) run the identical
+   * `ADD ,X 0` accumulation loop. There is no XOR, and the system number is simply one of
+   * the seven summed words, not a separate addend.
+   */
+  static computeExtChecksum(
+    reserved1: number,
+    reserved2: number,
+    reserved3: number,
+    flagWord: number,
+    systemNumber: number,
+    pagesHi: number,
+    pagesLo: number,
+  ): number {
+    const sum =
+      reserved1 + reserved2 + reserved3 + flagWord + systemNumber + pagesHi + pagesLo;
+    return sum & 0xffff;
+  }
+
+  /**
    * Parse a master block (and extended info) from a full page 0 buffer.
    * The buffer must be at least NDFS_PAGE_SIZE bytes.
    */
@@ -72,26 +111,30 @@ export class MasterBlock {
     mb.extLastSystemNumber = readUint16BE(pageData, ext + 10);
     mb.extPagesAvailable = readUint32BE(pageData, ext + 12);
 
-    // Calculate checksum
+    // KERNEL-CORRECTED: the checksum is a plain 16-bit ADDITIVE SUM of the seven words
+    // FOLLOWING it (1751B-1757B) — NOT "XOR six words, then add the system number".
+    // Proven from both sides of the real SINTRAN kernel (carved 006-S3FS): the writer
+    // WXDIR (37702B) and the validator CHDSI (37763B) run the identical `ADD ,X 0` loop.
+    // The XOR form matched PACK-ONE only by coincidence (its only two words sharing a set
+    // bit are flag=0x8000 and pagesLo=0x9051, both bit 15 — which cancel under XOR and
+    // carry out under ADD, giving the same low 16 bits). Verified on three real disks.
     const pagesLo = mb.extPagesAvailable & 0xffff;
     const pagesHi = (mb.extPagesAvailable >>> 16) & 0xffff;
-    const calculated =
-      ((pagesLo ^ pagesHi ^ mb.extFlagWord ^ mb.extReserved1 ^ mb.extReserved2 ^ mb.extReserved3) +
-        mb.extLastSystemNumber) &
-      0xffff;
+    const calculated = MasterBlock.computeExtChecksum(
+      mb.extReserved1,
+      mb.extReserved2,
+      mb.extReserved3,
+      mb.extFlagWord,
+      mb.extLastSystemNumber,
+      pagesHi,
+      pagesLo,
+    );
     mb.extCalculatedChecksum = calculated;
 
-    // Determine checksum validation state
-    if (mb.extChecksum === calculated) {
-      mb.checksumState = ChecksumValidation.Valid;
-    } else if (
-      (mb.extChecksum & 0xff) === (calculated & 0xff) &&
-      (mb.extChecksum & 0xff00) === 0
-    ) {
-      mb.checksumState = ChecksumValidation.ValidLowByteOnly;
-    } else {
-      mb.checksumState = ChecksumValidation.Invalid;
-    }
+    // The kernel writes and compares the FULL 16 bits, so there is no "low byte only"
+    // accept state — that was a reader-side heuristic SINTRAN never produces.
+    mb.checksumState =
+      mb.extChecksum === calculated ? ChecksumValidation.Valid : ChecksumValidation.Invalid;
 
     // Detect FLOMON: all extended fields are zero (floppy)
     // FLOMON signature: address(2) + count(2) + checksum(2) all zero in boot area
@@ -103,9 +146,7 @@ export class MasterBlock {
       mb.extValid = false;
     } else {
       const checksumNonZero = mb.extChecksum !== 0;
-      const checksumOk =
-        mb.checksumState === ChecksumValidation.Valid ||
-        mb.checksumState === ChecksumValidation.ValidLowByteOnly;
+      const checksumOk = mb.checksumState === ChecksumValidation.Valid;
       mb.extValid = checksumNonZero && checksumOk;
     }
 
@@ -189,13 +230,20 @@ export class MasterBlock {
 
     const ext = EXTENDED_INFO_OFFSET;
 
-    // Calculate checksum
+    // Recompute the checksum from the current fields, exactly as the kernel writer WXDIR
+    // (37702B) does: a 16-bit additive sum of words 1751B-1757B. Every write of the
+    // extended-info block is followed by a fresh checksum.
     const pagesLo = this.extPagesAvailable & 0xffff;
     const pagesHi = (this.extPagesAvailable >>> 16) & 0xffff;
-    const checksum =
-      ((pagesLo ^ pagesHi ^ this.extFlagWord ^ this.extReserved1 ^ this.extReserved2 ^ this.extReserved3) +
-        this.extLastSystemNumber) &
-      0xffff;
+    const checksum = MasterBlock.computeExtChecksum(
+      this.extReserved1,
+      this.extReserved2,
+      this.extReserved3,
+      this.extFlagWord,
+      this.extLastSystemNumber,
+      pagesHi,
+      pagesLo,
+    );
 
     writeUint16BE(pageData, ext, checksum);
     writeUint16BE(pageData, ext + 2, this.extReserved1);

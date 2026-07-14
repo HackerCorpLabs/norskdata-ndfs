@@ -40,6 +40,30 @@ typedef struct {
 } ndfs_master_block_t;
 
 /**
+ * Compute the extended-info checksum (word 1750B) exactly as the SINTRAN kernel does:
+ * a plain 16-bit ADDITIVE SUM of the seven words that FOLLOW it (words 1751B-1757B),
+ * truncated to 16 bits.
+ *
+ * Kernel-proven from both sides of the carved 006-S3FS segment: the writer WXDIR
+ * (37702B) and the enter-directory validator CHDSI (37763B) run the identical
+ * `ADD ,X 0` accumulation loop over these words. There is no XOR, and the system number
+ * is simply one of the seven summed words - NOT added separately.
+ *
+ * (The previous "XOR six words, then add system_number" model reproduced the PACK-ONE
+ * sample only by coincidence and is wrong; see master_block.c.)
+ */
+uint16_t ndfs_mb_ext_checksum(uint16_t reserved1, uint16_t reserved2, uint16_t reserved3,
+                              uint16_t flag_word, uint16_t system_number,
+                              uint16_t pages_hi, uint16_t pages_lo);
+
+/** Extended-info flag word (1754B) bit 15: "directory entered / in use".
+ *  Set by the kernel on enter (CHDSI 37763B, BSET ONE 170) and cleared on release
+ *  (REENB 40162B, BSET ZRO 170). A stored 0x8000 means the volume was left entered by
+ *  the system in ext_last_system_number. Bits 0-14 have no known meaning - preserve them.
+ *  NOTE: system number 0 means NO OWNER recorded, not "system zero". */
+#define NDFS_EXT_FLAG_ENTERED 0x8000u
+
+/**
  * Parse a master block (and extended info) from a full page 0 buffer.
  * @param page_data  Buffer of at least NDFS_PAGE_SIZE bytes.
  * @param out        Receives the parsed master block.

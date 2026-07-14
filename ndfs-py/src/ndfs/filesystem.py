@@ -719,6 +719,23 @@ class NdfsFileSystem:
             total_pages = len(self._data) // NDFS_PAGE_SIZE
             self._bit_file.initialize(total_pages)
 
+            # Bound the ALLOCATION window by the directory's declared capacity
+            # (ext_pages_available, words 1756B-1757B) when the extended-info block is
+            # valid. SINTRAN's downward allocator never hands out a page above capacity-1;
+            # the gap between capacity and the physical device is the drive's bad-sector
+            # spare region, which stays free-but-unreachable.
+            #
+            # The `<= total_pages` clamp is load-bearing, not defensive noise: the real
+            # Winchester WD0.img declares a capacity of 36396 pages in a file only 36360
+            # pages long. Without the clamp the allocator would start at page 36395, which
+            # does not exist in the file.
+            #
+            # Falls back to the whole device when there is no valid extended info (FLOMON
+            # floppies never have one).
+            if (mb.ext_valid
+                    and 0 < mb.ext_pages_available <= total_pages):
+                self._bit_file.alloc_ceiling = mb.ext_pages_available
+
             # Determine bitmap size in pages
             bitmap_bytes = math.ceil(total_pages / 8)
             bitmap_pages = math.ceil(bitmap_bytes / NDFS_PAGE_SIZE)

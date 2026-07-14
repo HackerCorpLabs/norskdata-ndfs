@@ -122,6 +122,27 @@ When copying back, the `.xat` file restores all metadata. Essential for archival
 
 See [NDFS-FORMAT.md](docs/NDFS-FORMAT.md) for the complete binary format specification covering master blocks, block pointers, user/object entries, allocation bitmaps, boot sectors, and XAT sidecar files.
 
+### Verified against the real SINTRAN kernel
+
+This library was originally reverse-engineered from disk images **without** the producing
+code. It has since been corrected against the **real SINTRAN III kernel** (the carved
+`006-S3FS` filesystem segment of an L-VSX-500 system) plus a set of real ND disks.
+
+See **[KERNEL-VERIFIED-CORRECTIONS.md](docs/KERNEL-VERIFIED-CORRECTIONS.md)** for the full
+list with kernel addresses and disk evidence. The headline corrections:
+
+- The extended-info **checksum is an ADDITIVE SUM**, not XOR (the XOR form matched the
+  sample disk only by coincidence).
+- There is **no "valid low byte only"** checksum state — the kernel compares all 16 bits.
+- **Allocation runs HIGH → LOW**, bounded by the *declared capacity*, not upward from
+  block 7.
+- **Bit-file placement** is `9 * floor(floor(pages/2) / 9)` — a track boundary — not
+  `pages/2`.
+- Flag-word **bit 15 = "directory entered"**; **system number 0 means *no owner***.
+- Every real drive reserves a **bad-sector spare region**, so the device is always *larger*
+  than the declared capacity — and the spare is a property of the **drive**, never a
+  percentage.
+
 ## Building
 
 ```bash

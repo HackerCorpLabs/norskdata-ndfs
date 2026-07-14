@@ -67,20 +67,33 @@ describe('BitFile', () => {
     });
   });
 
+  // Allocation scans HIGH -> LOW, matching genuine SINTRAN: the scanner TESTP (51355B)
+  // only ever decrements its bitmap index (`AAX -1`), bounded below by the block-7 floor.
+  // These tests previously asserted the old upward answers.
   describe('findFirstFreeBlock', () => {
-    it('skips system blocks 0-6', () => {
+    it('never hands out system blocks 0-6', () => {
       const bf = new BitFile();
       bf.initialize(32);
-      // Mark blocks 0-6 as used (system)
-      for (let i = 0; i < 7; i++) bf.markBlockUsed(i);
-      expect(bf.findFirstFreeBlock()).toBe(7);
+      // Everything from the block-7 floor upward is used; only system blocks remain "free".
+      for (let i = 7; i < 32; i++) bf.markBlockUsed(i);
+      expect(bf.findFirstFreeBlock()).toBe(-1);
     });
 
-    it('finds first free after some used blocks', () => {
+    it('allocates from the TOP of the volume downward', () => {
       const bf = new BitFile();
       bf.initialize(32);
       for (let i = 0; i < 12; i++) bf.markBlockUsed(i);
-      expect(bf.findFirstFreeBlock()).toBe(12);
+      // Downward scan starts at the top of the window (31), not just above the used run.
+      expect(bf.findFirstFreeBlock()).toBe(31);
+    });
+
+    it('never allocates above the declared capacity ceiling', () => {
+      const bf = new BitFile();
+      // Device has 1000 pages but the directory declares only 900. The 100-page gap is the
+      // drive's bad-sector spare region: free in the bitmap, but never handed out.
+      bf.initialize(1000);
+      bf.allocCeiling = 900;
+      expect(bf.findFirstFreeBlock()).toBe(899); // capacity - 1, NOT device - 1
     });
 
     it('returns -1 when all blocks used', () => {

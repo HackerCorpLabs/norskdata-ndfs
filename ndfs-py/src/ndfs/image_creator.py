@@ -26,6 +26,7 @@ from ndfs.constants import (
 from ndfs.endian import write_uint16_be, write_uint32_be
 from ndfs.ndfs_name import write_ndfs_name
 from ndfs.block_pointer import BlockPointer
+from ndfs.master_block import MasterBlock
 from ndfs.types import PointerType, ImageTemplate, ImageCreationOptions
 
 
@@ -67,27 +68,37 @@ _TEMPLATES = {
         ext_valid=False,
         spare_blocks=0,
     ),
+    # Drive geometries below are MEASURED from real ND disk images. Every real drive
+    # reserves a spare (bad-sector remap) region, so file_blocks (the physical device) is
+    # always LARGER than ndfs_pages (the declared, usable capacity) -- never smaller.
+    # The spare size is a property of the DRIVE, not a percentage of capacity.
     ImageTemplate.Smd75MB: TemplateSpec(
-        ndfs_pages=36945,
-        file_blocks=38400,
+        ndfs_pages=36945,   # DOCUMENTED: ND-30.003.007, "75 MB disk pack giving 36,945 pages"
+        file_blocks=38400,  # real device (PACK-ONE / SMD0.IMG)
         object_file_block=18684,
         user_file_block=18686,
-        bit_file_block=18472,
+        # KERNEL-CORRECTED (ALBIT 137526B): floor(36945/2)=18472 rounded DOWN to a multiple
+        # of 9 = 18468 -- the true PACK-ONE bit_file_ptr. Plain pages/2 gave 18472 (off by 4).
+        bit_file_block=18468,
         unreserved_pages=36945,
         is_floppy=False,
         ext_valid=True,
-        spare_blocks=1455,
+        spare_blocks=1455,  # 38400 - 36945
     ),
     ImageTemplate.Winchester74MB: TemplateSpec(
-        ndfs_pages=36396,
-        file_blocks=36360,
-        object_file_block=32771,
-        user_file_block=32769,
-        bit_file_block=18198,
+        ndfs_pages=36396,   # DOCUMENTED: ND-30.003.007 DEVICE-COPY, "Pages to copy: 36396"
+        # Real drive: a Micropolis 1325 (5.25" ST-506/MFM), measured across 7 real images --
+        # device 36864 pages = exactly 72.0 MiB, spare 468.
+        # file_blocks used to be 36360, SMALLER than the declared capacity: the image's last
+        # 36 pages did not exist at all.
+        file_blocks=36864,
+        object_file_block=18428,  # real disk (1325.img)
+        user_file_block=18430,    # = object + 2
+        bit_file_block=18198,     # 9*floor(floor(36396/2)/9)
         unreserved_pages=36396,
         is_floppy=False,
         ext_valid=True,
-        spare_blocks=0,
+        spare_blocks=468,   # 36864 - 36396
     ),
 }
 
@@ -107,20 +118,39 @@ def _create_custom_spec(options: ImageCreationOptions) -> TemplateSpec:
 
     ndfs_pages = options.custom_pages
 
-    # For custom, assume no spare blocks (like Winchester)
+    # Custom sizes have no real drive behind them, so we cannot know a spare region.
     file_blocks = ndfs_pages
 
-    # Place pointers near end (floppy style for small, hard disk style for large)
+    # Floppies carry no valid extended-info block; that is what this flag really selects.
     is_floppy = ndfs_pages < 1000
 
-    if is_floppy:
-        object_file_block = ndfs_pages - 5
-        user_file_block = ndfs_pages - 3
-        bit_file_block = ndfs_pages - 1
-    else:
-        bit_file_block = ndfs_pages // 2
-        object_file_block = int(ndfs_pages * 0.85)
-        user_file_block = object_file_block + 2
+    # Placement -- KERNEL-DERIVED from ALBIT (137517B).
+    #
+    # The old "small disk vs big disk" branch was WRONG: SINTRAN does not switch layout on
+    # device size. It branches on whether @CREATE-DIRECTORY was given an EXPLICIT bit-file
+    # address. A small floppy created on the DEFAULT path still lands mid-disk. (Two
+    # same-size 616-page floppies sit in opposite layouts for exactly this reason.)
+    #
+    # DEFAULT path:  bit_file = 9 * floor(floor(pages / 2) / 9)
+    #   i.e. floor(pages/2) rounded DOWN to a multiple of 9.
+    #   ALBIT 137526B-137532B: /2 -> /9 -> *9.
+    #   Verified on every real disk: 36945 -> 18468, 616 -> 306, 61036 -> 30510.
+    #   Plain pages/2 (18472 for PACK-ONE) is simply wrong.
+    #
+    # The "9" is PAGES PER TRACK (SMD: 18 sectors x 1024 B = 18432 B = 9 pages of 2048),
+    # which is why @CREATE-DIRECTORY says the bit file starts "at a track boundary".
+    #
+    # The object/user base is APPROXIMATE -- it comes from the CRDIR scan loop
+    # (137173B-137352B) and has no clean closed form (empirically bit+216 on SMD, bit+206
+    # on SCSI, bit+202 on floppy). We place object/user clear of the bitmap's own page span
+    # so a multi-page bitmap can never overwrite them. Only bit-exactness with a
+    # SINTRAN-created image is affected; the reader is pointer-driven.
+    bitmap_bytes = math.ceil(ndfs_pages / 8)
+    bitmap_pages = math.ceil(bitmap_bytes / NDFS_PAGE_SIZE)
+
+    bit_file_block = (ndfs_pages // 2 // 9) * 9
+    object_file_block = bit_file_block + bitmap_pages
+    user_file_block = object_file_block + 2
 
     return TemplateSpec(
         ndfs_pages=ndfs_pages,
@@ -152,9 +182,14 @@ def _write_extended_info(
     """Write Extended Info block (bytes 2000-2015)."""
     ext = EXTENDED_INFO_OFFSET
 
+    # Kernel-correct checksum: a 16-bit ADDITIVE sum of the seven words following the
+    # checksum slot (reserved1-3 = 0, flag, system#, pages-hi, pages-lo). NOT XOR-then-add
+    # -- see MasterBlock.compute_ext_checksum (WXDIR 37702B / CHDSI 37763B).
     pages_lo = ndfs_pages & 0xFFFF
     pages_hi = (ndfs_pages >> 16) & 0xFFFF
-    checksum = ((pages_lo ^ pages_hi ^ flag_word ^ 0 ^ 0 ^ 0) + system_number) & 0xFFFF
+    checksum = MasterBlock.compute_ext_checksum(
+        0, 0, 0, flag_word, system_number, pages_hi, pages_lo,
+    )
 
     write_uint16_be(disk_image, ext, checksum)
     write_uint16_be(disk_image, ext + 2, 0)

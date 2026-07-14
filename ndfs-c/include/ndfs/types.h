@@ -128,10 +128,15 @@ typedef enum {
 } ndfs_file_access_type_t;
 
 /** Checksum validation state for extended info. */
+/* Extended-info checksum state.
+ *
+ * NOTE: there is deliberately NO "valid low byte only" state. The SINTRAN kernel writes
+ * and compares the FULL 16-bit checksum (writer WXDIR 37702B, validator CHDSI 37763B);
+ * accepting a low-byte-only match was a reader-side heuristic that SINTRAN never
+ * produces. See ndfs_mb_ext_checksum(). */
 typedef enum {
-    NDFS_CHECKSUM_VALID          = 0,
-    NDFS_CHECKSUM_VALID_LOW_BYTE = 1,
-    NDFS_CHECKSUM_INVALID        = 2
+    NDFS_CHECKSUM_VALID   = 0,
+    NDFS_CHECKSUM_INVALID = 1
 } ndfs_checksum_validation_t;
 
 /** File type flags (bit field). */

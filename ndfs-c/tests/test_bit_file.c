@@ -60,6 +60,8 @@ static int test_count_used(void)
     return 0;
 }
 
+/* Allocation scans HIGH -> LOW, matching genuine SINTRAN (TESTP 51355B only ever does
+ * `AAX -1`). These tests previously asserted the old upward answers. */
 static int test_find_free(void)
 {
     ndfs_bit_file_t bf;
@@ -67,15 +69,34 @@ static int test_find_free(void)
     uint32_t i;
     memset(&bf, 0, sizeof(bf));
 
-    ndfs_bf_init(&bf, 32);
+    ndfs_bf_init(&bf, 32);   /* alloc_ceiling defaults to 32 -> top page is 31 */
 
     /* Mark blocks 0-9 as used */
     for (i = 0; i < 10; i++) {
         ndfs_bf_mark_used(&bf, i);
     }
 
+    /* Downward scan starts at the top of the window, not just above the used run. */
     TEST_ASSERT_OK(ndfs_bf_find_free(&bf, &block));
-    TEST_ASSERT_EQUAL(10, block);
+    TEST_ASSERT_EQUAL(31, block);
+
+    ndfs_bf_destroy(&bf);
+    return 0;
+}
+
+static int test_find_free_respects_capacity_ceiling(void)
+{
+    ndfs_bit_file_t bf;
+    uint32_t block;
+    memset(&bf, 0, sizeof(bf));
+
+    /* Device has 1000 pages, but the directory only declares 900 of them. The 100-page
+     * gap is the drive's bad-sector spare region: free in the bitmap, never allocated. */
+    ndfs_bf_init(&bf, 1000);
+    bf.alloc_ceiling = 900;
+
+    TEST_ASSERT_OK(ndfs_bf_find_free(&bf, &block));
+    TEST_ASSERT_EQUAL(899, block);   /* capacity - 1, NOT device - 1 */
 
     ndfs_bf_destroy(&bf);
     return 0;
@@ -87,7 +108,7 @@ static int test_find_free_range(void)
     uint32_t start;
     memset(&bf, 0, sizeof(bf));
 
-    ndfs_bf_init(&bf, 64);
+    ndfs_bf_init(&bf, 64);   /* top page is 63 */
 
     /* Mark blocks 0-6 (system), 10, 12 */
     {
@@ -97,13 +118,31 @@ static int test_find_free_range(void)
     ndfs_bf_mark_used(&bf, 10);
     ndfs_bf_mark_used(&bf, 12);
 
-    /* Find 2 contiguous: should find 7-8 */
+    /* Downward: the highest 2-page run is 62-63, so the run STARTS at 62. */
     TEST_ASSERT_OK(ndfs_bf_find_free_range(&bf, 2, &start));
-    TEST_ASSERT_EQUAL(7, start);
+    TEST_ASSERT_EQUAL(62, start);
 
-    /* Find 5 contiguous: should find 13-17 */
+    /* Highest 5-page run is 59-63 -> starts at 59. */
     TEST_ASSERT_OK(ndfs_bf_find_free_range(&bf, 5, &start));
-    TEST_ASSERT_EQUAL(13, start);
+    TEST_ASSERT_EQUAL(59, start);
+
+    ndfs_bf_destroy(&bf);
+    return 0;
+}
+
+/* Blocks 0-6 are system-reserved and must never be handed out, even when the rest of the
+ * volume is full. */
+static int test_find_free_stops_at_block7_floor(void)
+{
+    ndfs_bit_file_t bf;
+    uint32_t block;
+    uint32_t i;
+    memset(&bf, 0, sizeof(bf));
+
+    ndfs_bf_init(&bf, 20);
+    for (i = NDFS_FIRST_ALLOC_BLOCK; i < 20; i++) ndfs_bf_mark_used(&bf, i);
+
+    TEST_ASSERT_EQUAL(NDFS_ERR_NO_SPACE, ndfs_bf_find_free(&bf, &block));
 
     ndfs_bf_destroy(&bf);
     return 0;
@@ -185,7 +224,9 @@ void run_bit_file_tests(void)
     RUN_TEST(test_mark_used_and_free);
     RUN_TEST(test_count_used);
     RUN_TEST(test_find_free);
+    RUN_TEST(test_find_free_respects_capacity_ceiling);
     RUN_TEST(test_find_free_range);
+    RUN_TEST(test_find_free_stops_at_block7_floor);
     RUN_TEST(test_allocate_blocks);
     RUN_TEST(test_free_range);
     RUN_TEST(test_bitmap_bit_layout);

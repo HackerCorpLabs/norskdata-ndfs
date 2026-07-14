@@ -122,7 +122,9 @@ describe('ImageCreator', () => {
       const mb = fs.getMasterBlock();
       expect(mb.objectFilePointer!.blockId).toBe(18684);
       expect(mb.userFilePointer!.blockId).toBe(18686);
-      expect(mb.bitFilePointer!.blockId).toBe(18472);
+      // ALBIT 137526B: floor(36945/2)=18472 rounded DOWN to a multiple of 9 = 18468 — the
+      // true PACK-ONE bit_file_ptr. This previously asserted 18472 (plain pages/2), off by 4.
+      expect(mb.bitFilePointer!.blockId).toBe(18468);
       expect(mb.unreservedPages).toBe(36945);
     });
 
@@ -144,9 +146,11 @@ describe('ImageCreator', () => {
       });
       expect(fs.getDirectoryName()).toBe('WINCH74');
       const mb = fs.getMasterBlock();
-      expect(mb.objectFilePointer!.blockId).toBe(32771);
-      expect(mb.userFilePointer!.blockId).toBe(32769);
-      expect(mb.bitFilePointer!.blockId).toBe(18198);
+      // Real Winchester drive = a Micropolis 1325 (5.25" ST-506/MFM), measured across 7
+      // real images: device 36864 pages (72.0 MiB), capacity 36396, spare 468.
+      expect(mb.objectFilePointer!.blockId).toBe(18428);
+      expect(mb.userFilePointer!.blockId).toBe(18430);
+      expect(mb.bitFilePointer!.blockId).toBe(18198); // 9*floor(floor(36396/2)/9)
     });
   });
 
@@ -159,10 +163,14 @@ describe('ImageCreator', () => {
       });
       expect(fs.getDirectoryName()).toBe('CUSTOM');
       const mb = fs.getMasterBlock();
-      // Floppy formula: obj=pages-5, usr=pages-3, bit=pages-1
-      expect(mb.objectFilePointer!.blockId).toBe(195);
-      expect(mb.userFilePointer!.blockId).toBe(197);
-      expect(mb.bitFilePointer!.blockId).toBe(199);
+      // KERNEL-CORRECTED: there is no "small disk goes near the end" layout. SINTRAN
+      // branches on whether an explicit bit-file address was given, NOT on device size, so
+      // a small volume on the DEFAULT path still lands mid-disk:
+      //   bit = 9*floor(floor(200/2)/9) = 9*floor(100/9) = 9*11 = 99
+      //   obj = bit + bitmapPages(1) = 100, usr = obj + 2 = 102
+      expect(mb.bitFilePointer!.blockId).toBe(99);
+      expect(mb.objectFilePointer!.blockId).toBe(100);
+      expect(mb.userFilePointer!.blockId).toBe(102);
     });
 
     it('creates a custom-sized hard disk image', () => {
@@ -173,10 +181,12 @@ describe('ImageCreator', () => {
       });
       expect(fs.getDirectoryName()).toBe('BIGDISK');
       const mb = fs.getMasterBlock();
-      // Hard disk formula: bit=pages/2, obj=floor(pages*0.85), usr=obj+2
-      expect(mb.bitFilePointer!.blockId).toBe(2500);
-      expect(mb.objectFilePointer!.blockId).toBe(4250);
-      expect(mb.userFilePointer!.blockId).toBe(4252);
+      // ALBIT default path: bit = 9*floor(floor(5000/2)/9) = 9*floor(2500/9) = 9*277 = 2493.
+      // (Plain pages/2 gave 2500 — the old, wrong formula.)
+      // obj = bit + bitmapPages(1) = 2494, usr = obj + 2 = 2496.
+      expect(mb.bitFilePointer!.blockId).toBe(2493);
+      expect(mb.objectFilePointer!.blockId).toBe(2494);
+      expect(mb.userFilePointer!.blockId).toBe(2496);
     });
 
     it('verifies all fields on custom image', () => {

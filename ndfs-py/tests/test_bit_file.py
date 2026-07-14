@@ -68,19 +68,33 @@ class TestBitFileMarkCheck:
 
 
 class TestBitFileFindFirstFreeBlock:
-    def test_skips_system_blocks_0_to_6(self):
+    # Allocation scans HIGH -> LOW, matching genuine SINTRAN: the scanner TESTP (51355B)
+    # only ever decrements its bitmap index (`AAX -1`), bounded below by the block-7 floor.
+    # These tests previously asserted the old upward answers.
+
+    def test_never_hands_out_system_blocks_0_to_6(self):
         bf = BitFile()
         bf.initialize(32)
-        for i in range(7):
+        # Everything from the block-7 floor up is used; only system blocks remain "free".
+        for i in range(7, 32):
             bf.mark_block_used(i)
-        assert bf.find_first_free_block() == 7
+        assert bf.find_first_free_block() == -1
 
-    def test_finds_first_free_after_some_used_blocks(self):
+    def test_allocates_from_the_top_downward(self):
         bf = BitFile()
         bf.initialize(32)
         for i in range(12):
             bf.mark_block_used(i)
-        assert bf.find_first_free_block() == 12
+        # Downward scan starts at the top of the window (31), not just above the used run.
+        assert bf.find_first_free_block() == 31
+
+    def test_never_allocates_above_the_declared_capacity_ceiling(self):
+        bf = BitFile()
+        # Device has 1000 pages but the directory declares only 900. The 100-page gap is
+        # the drive's bad-sector spare region: free in the bitmap, but never handed out.
+        bf.initialize(1000)
+        bf.alloc_ceiling = 900
+        assert bf.find_first_free_block() == 899  # capacity - 1, NOT device - 1
 
     def test_returns_minus_1_when_all_blocks_used(self):
         bf = BitFile()

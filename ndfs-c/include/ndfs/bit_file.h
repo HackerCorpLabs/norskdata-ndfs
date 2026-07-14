@@ -19,7 +19,23 @@ extern "C" {
 /** Allocation bitmap. */
 typedef struct {
     ndfs_block_pointer_t index_pointer;
+    /** Pages the bitmap covers. SINTRAN sizes the bitmap to the PHYSICAL DEVICE
+     *  (e.g. 38400 on a 75MB SMD pack), not to the declared capacity. */
     uint32_t             total_pages;
+    /** Highest allocatable page + 1 - the descending allocator's ceiling.
+     *
+     *  SINTRAN bounds the allocatable window by the directory's DECLARED CAPACITY
+     *  (ext_pages_available, words 1756B-1757B), not by the device size. On PACK-ONE the
+     *  capacity is 36945, so the highest allocatable page is 36944; pages 36945..38399 are
+     *  a deliberate free-but-unreachable gap (drive spare / bad-sector remap area) - they
+     *  stay 0 in the bitmap yet are never handed out. Verified on the real disk: page 36944
+     *  is used, 36945+ are all free.
+     *
+     *  Set to total_pages when the capacity is unknown (e.g. FLOMON floppies, which carry
+     *  no valid extended-info block). MUST be clamped to total_pages: the real Winchester
+     *  WD0.img declares a capacity 36 pages LARGER than the file, and allocating there
+     *  would run off the end. */
+    uint32_t             alloc_ceiling;
     uint8_t             *bitmap;      /**< Owned by the struct. */
     size_t               bitmap_size; /**< Bytes in bitmap.     */
 } ndfs_bit_file_t;

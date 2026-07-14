@@ -68,6 +68,41 @@ class MasterBlock:
         self.checksum_state: ChecksumValidation = ChecksumValidation.Invalid
         self.has_flomon: bool = False
 
+    #: Extended-info flag word (1754B) bit 15: "directory entered / in use".
+    #:
+    #: The kernel sets it on enter (CHDSI 37763B, ``BSET ONE 170``) and clears it on
+    #: release (REENB 40162B, ``BSET ZRO 170``). A stored 0x8000 means the volume was left
+    #: entered by the system in ``ext_last_system_number``. Bits 0-14 have no known
+    #: meaning -- preserve them verbatim.
+    #:
+    #: NOTE: system number 0 means NO OWNER recorded, not "system zero".
+    EXT_FLAG_ENTERED = 0x8000
+
+    @property
+    def is_directory_entered(self) -> bool:
+        """True when the volume was left 'entered' (flag bit 15) and not cleanly released."""
+        return (self.ext_flag_word & MasterBlock.EXT_FLAG_ENTERED) != 0
+
+    @staticmethod
+    def compute_ext_checksum(
+        reserved1: int, reserved2: int, reserved3: int,
+        flag_word: int, system_number: int,
+        pages_hi: int, pages_lo: int,
+    ) -> int:
+        """Compute the extended-info checksum exactly as the SINTRAN kernel does.
+
+        A plain 16-bit ADDITIVE SUM of the seven words that FOLLOW the checksum slot
+        (words 1751B-1757B), truncated to 16 bits.
+
+        Kernel-proven from both sides of the carved 006-S3FS segment: the writer WXDIR
+        (37702B) and the enter-directory validator CHDSI (37763B) run the identical
+        ``ADD ,X 0`` accumulation loop. There is no XOR, and the system number is simply
+        one of the seven summed words -- not a separate addend.
+        """
+        total = (reserved1 + reserved2 + reserved3
+                 + flag_word + system_number + pages_hi + pages_lo)
+        return total & 0xFFFF
+
     @classmethod
     def from_bytes(cls, page_data: _BufType) -> MasterBlock:
         """Parse a master block (and extended info) from a full page 0 buffer.
@@ -101,26 +136,29 @@ class MasterBlock:
         mb.ext_last_system_number = read_uint16_be(page_data, ext + 10)
         mb.ext_pages_available = read_uint32_be(page_data, ext + 12)
 
-        # Calculate checksum
+        # KERNEL-CORRECTED: the checksum is a plain 16-bit ADDITIVE SUM of the seven words
+        # FOLLOWING it (1751B-1757B) -- NOT "XOR six words, then add the system number".
+        # Proven from both sides of the real SINTRAN kernel (carved 006-S3FS): the writer
+        # WXDIR (37702B) and the enter-directory validator CHDSI (37763B) run the identical
+        # `ADD ,X 0` accumulation loop. The XOR form matched PACK-ONE only by coincidence
+        # (its only two words sharing a set bit are flag=0x8000 and pages_lo=0x9051, both
+        # bit 15 -- they cancel under XOR and carry out under ADD, giving the same low 16
+        # bits). Verified against three real disks: 0x10B7, 0x1051, 0xC162.
         pages_lo = mb.ext_pages_available & 0xFFFF
         pages_hi = (mb.ext_pages_available >> 16) & 0xFFFF
-        calculated = (
-            (pages_lo ^ pages_hi ^ mb.ext_flag_word ^ mb.ext_reserved1
-             ^ mb.ext_reserved2 ^ mb.ext_reserved3)
-            + mb.ext_last_system_number
-        ) & 0xFFFF
+        calculated = MasterBlock.compute_ext_checksum(
+            mb.ext_reserved1, mb.ext_reserved2, mb.ext_reserved3,
+            mb.ext_flag_word, mb.ext_last_system_number, pages_hi, pages_lo,
+        )
         mb.ext_calculated_checksum = calculated
 
-        # Determine checksum validation state
-        if mb.ext_checksum == calculated:
-            mb.checksum_state = ChecksumValidation.Valid
-        elif (
-            (mb.ext_checksum & 0xFF) == (calculated & 0xFF)
-            and (mb.ext_checksum & 0xFF00) == 0
-        ):
-            mb.checksum_state = ChecksumValidation.ValidLowByteOnly
-        else:
-            mb.checksum_state = ChecksumValidation.Invalid
+        # The kernel writes and compares the FULL 16 bits, so there is no "low byte only"
+        # accept state -- that was a reader-side heuristic SINTRAN never produces.
+        mb.checksum_state = (
+            ChecksumValidation.Valid
+            if mb.ext_checksum == calculated
+            else ChecksumValidation.Invalid
+        )
 
         # Detect FLOMON
         mb.has_flomon = MasterBlock._detect_flomon(page_data)
@@ -130,10 +168,7 @@ class MasterBlock:
             mb.ext_valid = False
         else:
             checksum_non_zero = mb.ext_checksum != 0
-            checksum_ok = (
-                mb.checksum_state == ChecksumValidation.Valid
-                or mb.checksum_state == ChecksumValidation.ValidLowByteOnly
-            )
+            checksum_ok = mb.checksum_state == ChecksumValidation.Valid
             mb.ext_valid = checksum_non_zero and checksum_ok
 
         return mb
@@ -220,11 +255,13 @@ class MasterBlock:
         # Calculate checksum
         pages_lo = self.ext_pages_available & 0xFFFF
         pages_hi = (self.ext_pages_available >> 16) & 0xFFFF
-        checksum = (
-            (pages_lo ^ pages_hi ^ self.ext_flag_word ^ self.ext_reserved1
-             ^ self.ext_reserved2 ^ self.ext_reserved3)
-            + self.ext_last_system_number
-        ) & 0xFFFF
+        # Recompute the checksum from the current fields, exactly as the kernel writer
+        # WXDIR (37702B) does: a 16-bit additive sum of words 1751B-1757B. Every write of
+        # the extended-info block is followed by a fresh checksum.
+        checksum = MasterBlock.compute_ext_checksum(
+            self.ext_reserved1, self.ext_reserved2, self.ext_reserved3,
+            self.ext_flag_word, self.ext_last_system_number, pages_hi, pages_lo,
+        )
 
         write_uint16_be(page_data, ext, checksum)
         write_uint16_be(page_data, ext + 2, self.ext_reserved1)

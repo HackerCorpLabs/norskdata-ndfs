@@ -31,11 +31,11 @@ static const char *boot_format_str(ndfs_boot_format_t f)
 
 static const char *checksum_str(ndfs_checksum_validation_t c)
 {
+    /* No "valid low byte" state: the kernel compares the full 16-bit checksum. */
     switch (c) {
-    case NDFS_CHECKSUM_VALID:          return "Valid";
-    case NDFS_CHECKSUM_VALID_LOW_BYTE: return "Valid (low byte)";
-    case NDFS_CHECKSUM_INVALID:        return "Invalid";
-    default:                           return "Unknown";
+    case NDFS_CHECKSUM_VALID:   return "Valid";
+    case NDFS_CHECKSUM_INVALID: return "Invalid";
+    default:                    return "Unknown";
     }
 }
 

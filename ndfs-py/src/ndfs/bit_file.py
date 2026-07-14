@@ -19,16 +19,36 @@ _BufType = Union[bytes, bytearray, memoryview]
 class BitFile:
     """NDFS allocation bitmap manager."""
 
-    __slots__ = ("index_pointer", "total_pages", "_bitmap")
+    __slots__ = ("index_pointer", "total_pages", "alloc_ceiling", "_bitmap")
 
     def __init__(self) -> None:
         self.index_pointer: Optional[BlockPointer] = None
+        #: Pages the bitmap covers -- the PHYSICAL DEVICE size, not the declared capacity.
         self.total_pages: int = 0
+        #: Highest allocatable page + 1 -- the descending allocator's ceiling.
+        #:
+        #: SINTRAN bounds the allocatable window by the directory's DECLARED CAPACITY
+        #: (ext_pages_available, words 1756B-1757B), not by the device size. On PACK-ONE
+        #: the capacity is 36945, so the highest allocatable page is 36944; pages
+        #: 36945..38399 are a deliberate free-but-unreachable gap (the drive's bad-sector
+        #: spare region) -- they stay 0 in the bitmap yet are never handed out.
+        #:
+        #: Defaults to total_pages when the capacity is unknown (FLOMON floppies carry no
+        #: valid extended-info block). Always clamped to total_pages: the real Winchester
+        #: WD0.img declares a capacity 36 pages LARGER than the file, and allocating there
+        #: would run off the end.
+        self.alloc_ceiling: int = 0
         self._bitmap: Optional[bytearray] = None
 
     def initialize(self, total_pages: int) -> None:
-        """Initialize a new empty bitmap for the given total page count."""
+        """Initialize a new empty bitmap for the given total page count.
+
+        ``total_pages`` is the PHYSICAL DEVICE size -- SINTRAN sizes the bitmap to the
+        device (e.g. 38400 on a 75MB SMD pack), not to the declared capacity.
+        """
         self.total_pages = total_pages
+        # Until the caller supplies the declared capacity, the whole device is allocatable.
+        self.alloc_ceiling = total_pages
         bitmap_bytes = math.ceil(total_pages / 8)
         self._bitmap = bytearray(bitmap_bytes)
 
@@ -74,34 +94,57 @@ class BitFile:
         """Get number of free pages."""
         return self.total_pages - self.calc_used_pages()
 
+    def _top_scan_index(self) -> int:
+        """Highest page the allocator may consider (inclusive), or -1 if no usable window.
+
+        Bounded by :attr:`alloc_ceiling` -- the DECLARED CAPACITY, not the device size --
+        and clamped to the bitmap so a stale ceiling can never index past it.
+        """
+        ceiling = self.alloc_ceiling
+        if ceiling <= 0 or ceiling > self.total_pages:
+            ceiling = self.total_pages
+        if ceiling <= FIRST_ALLOCATABLE_BLOCK:
+            return -1
+        return ceiling - 1
+
     def find_first_free_block(self) -> int:
-        """Find the first free block, starting from block 7 (blocks 0-6 are system).
+        """Find a single free block, scanning HIGH -> LOW.
+
+        KERNEL-CORRECTED: SINTRAN allocates from the TOP of the volume downward. The
+        scanner TESTP (51355B) only ever DECREMENTS its bitmap word index (``AAX -1`` at
+        51372B and 51401B) -- it never increments -- bounded below by the block-7 floor.
+        This matches the @CREATE-FILE rule "contiguous files are positioned in the highest
+        page addresses". The old upward scan produced the opposite layout to real SINTRAN.
+
+        Blocks 0-6 are system-reserved and are never handed out.
 
         Returns the block ID or -1 if no free block exists.
         """
-        for i in range(FIRST_ALLOCATABLE_BLOCK, self.total_pages):
+        for i in range(self._top_scan_index(), FIRST_ALLOCATABLE_BLOCK - 1, -1):
             if not self.is_block_used(i):
                 return i
         return -1
 
     def find_free_block_range(self, blocks_needed: int) -> int:
-        """Find a contiguous range of free blocks.
+        """Find a contiguous run of free blocks, scanning HIGH -> LOW.
 
-        Returns the starting block ID or -1 if no range found.
+        The run lands in the highest available addresses (SINTRAN's downward range
+        reserve, RSPAG 51120B -> TESTP). Returns the LOWEST block of the run (its start),
+        or -1 if no run is found.
         """
         if blocks_needed == 0 or blocks_needed > self.total_pages:
             return -1
 
-        consecutive_free = 0
-        range_start = 0
+        top = self._top_scan_index()
+        if top < FIRST_ALLOCATABLE_BLOCK:
+            return -1
 
-        for i in range(self.total_pages):
+        consecutive_free = 0
+        for i in range(top, FIRST_ALLOCATABLE_BLOCK - 1, -1):
             if not self.is_block_used(i):
-                if consecutive_free == 0:
-                    range_start = i
                 consecutive_free += 1
                 if consecutive_free >= blocks_needed:
-                    return range_start
+                    return i  # i is the lowest block of the run
             else:
                 consecutive_free = 0
         return -1

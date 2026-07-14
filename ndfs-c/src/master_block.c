@@ -39,6 +39,19 @@ static bool detect_flomon(const uint8_t *page_data)
 
 /* ── Public API ──────────────────────────────────────────────────── */
 
+uint16_t ndfs_mb_ext_checksum(uint16_t reserved1, uint16_t reserved2, uint16_t reserved3,
+                              uint16_t flag_word, uint16_t system_number,
+                              uint16_t pages_hi, uint16_t pages_lo)
+{
+    /* Plain 16-bit additive sum of the seven words FOLLOWING the checksum slot
+     * (1751B-1757B). Kernel: WXDIR 37702B (writer) and CHDSI 37763B (validator) both run
+     * the identical `ADD ,X 0` loop. Overflow past bit 15 is discarded, exactly as the
+     * ND-100's two's-complement ADD does. */
+    uint32_t sum = (uint32_t)reserved1 + reserved2 + reserved3 +
+                   flag_word + system_number + pages_hi + pages_lo;
+    return (uint16_t)(sum & 0xFFFF);
+}
+
 ndfs_error_t ndfs_mb_parse(const uint8_t *page_data, ndfs_master_block_t *out)
 {
     size_t off, ext;
@@ -71,24 +84,33 @@ ndfs_error_t ndfs_mb_parse(const uint8_t *page_data, ndfs_master_block_t *out)
     out->ext_last_system_number = ndfs_read_u16be(page_data, ext + 10);
     out->ext_pages_available    = ndfs_read_u32be(page_data, ext + 12);
 
-    /* Calculate checksum */
+    /* Calculate checksum.
+     *
+     * KERNEL-CORRECTED: the checksum is a plain 16-bit ADDITIVE SUM of the seven words
+     * that FOLLOW the checksum slot (words 1751B-1757B) - NOT "XOR six words, then add
+     * the system number". Proven from BOTH sides of the real SINTRAN III kernel (carved
+     * 006-S3FS): the writer WXDIR (37702B) and the enter-directory validator CHDSI
+     * (37763B) run the identical `ADD ,X 0` accumulation loop over these words. There is
+     * no XOR anywhere, and the system number is simply one of the seven summed words.
+     *
+     * The old XOR-then-add form matched PACK-ONE only by coincidence: its only two
+     * summed words sharing a set bit are flag=0x8000 and pages_lo=0x9051 (both bit 15);
+     * under ADD the two bit-15s carry out past bit 15 and are lost, under XOR they
+     * cancel - identical low 16 bits. It breaks as soon as any two words share a LOWER
+     * set bit. Verified against three real disks (0x10B7, 0x1051, 0xC162). */
     pages_lo = (uint16_t)(out->ext_pages_available & 0xFFFF);
     pages_hi = (uint16_t)((out->ext_pages_available >> 16) & 0xFFFF);
-    calculated = (uint16_t)(
-        (pages_lo ^ pages_hi ^ out->ext_flag_word ^
-         out->ext_reserved1 ^ out->ext_reserved2 ^ out->ext_reserved3)
-        + out->ext_last_system_number);
+    calculated = ndfs_mb_ext_checksum(out->ext_reserved1, out->ext_reserved2,
+                                      out->ext_reserved3, out->ext_flag_word,
+                                      out->ext_last_system_number, pages_hi, pages_lo);
     out->ext_calculated_checksum = calculated;
 
-    /* Determine checksum validation state */
-    if (out->ext_checksum == calculated) {
-        out->checksum_state = NDFS_CHECKSUM_VALID;
-    } else if ((out->ext_checksum & 0xFF) == (calculated & 0xFF) &&
-               (out->ext_checksum & 0xFF00) == 0) {
-        out->checksum_state = NDFS_CHECKSUM_VALID_LOW_BYTE;
-    } else {
-        out->checksum_state = NDFS_CHECKSUM_INVALID;
-    }
+    /* Determine checksum validation state. The kernel writes and compares the FULL 16
+     * bits (WXDIR stores it, CHDSI compares it), so there is no "low byte only" accept
+     * state - that was a reader-side heuristic SINTRAN never produces. */
+    out->checksum_state = (out->ext_checksum == calculated)
+                              ? NDFS_CHECKSUM_VALID
+                              : NDFS_CHECKSUM_INVALID;
 
     /* Detect FLOMON */
     out->has_flomon = detect_flomon(page_data);
@@ -98,8 +120,7 @@ ndfs_error_t ndfs_mb_parse(const uint8_t *page_data, ndfs_master_block_t *out)
         out->ext_valid = false;
     } else {
         checksum_non_zero = out->ext_checksum != 0;
-        checksum_ok = (out->checksum_state == NDFS_CHECKSUM_VALID ||
-                       out->checksum_state == NDFS_CHECKSUM_VALID_LOW_BYTE);
+        checksum_ok = (out->checksum_state == NDFS_CHECKSUM_VALID);
         out->ext_valid = checksum_non_zero && checksum_ok;
     }
 
@@ -164,13 +185,14 @@ ndfs_error_t ndfs_mb_write_extended(const ndfs_master_block_t *mb, uint8_t *page
 
     ext = NDFS_EXTENDED_INFO_OFFSET;
 
-    /* Calculate checksum */
+    /* Recompute the checksum from the current fields, exactly as the kernel writer WXDIR
+     * (37702B) does: a 16-bit additive sum of words 1751B-1757B. Every write of the
+     * extended-info block is followed by a fresh checksum. */
     pages_lo = (uint16_t)(mb->ext_pages_available & 0xFFFF);
     pages_hi = (uint16_t)((mb->ext_pages_available >> 16) & 0xFFFF);
-    checksum = (uint16_t)(
-        (pages_lo ^ pages_hi ^ mb->ext_flag_word ^
-         mb->ext_reserved1 ^ mb->ext_reserved2 ^ mb->ext_reserved3)
-        + mb->ext_last_system_number);
+    checksum = ndfs_mb_ext_checksum(mb->ext_reserved1, mb->ext_reserved2, mb->ext_reserved3,
+                                    mb->ext_flag_word, mb->ext_last_system_number,
+                                    pages_hi, pages_lo);
 
     ndfs_write_u16be(page_data, ext,      checksum);
     ndfs_write_u16be(page_data, ext + 2,  mb->ext_reserved1);

@@ -58,9 +58,13 @@ class FileOperationType(enum.IntEnum):
 
 
 class ChecksumValidation(enum.Enum):
-    """Checksum validation state for extended info."""
+    """Checksum validation state for extended info.
+
+    NOTE: there is deliberately no ``ValidLowByteOnly``. The SINTRAN kernel writes and
+    compares the FULL 16-bit checksum (writer WXDIR 37702B, validator CHDSI 37763B);
+    accepting a low-byte-only match was a reader-side heuristic SINTRAN never produces.
+    """
     Valid = "valid"
-    ValidLowByteOnly = "valid_low_byte"
     Invalid = "invalid"
 
 

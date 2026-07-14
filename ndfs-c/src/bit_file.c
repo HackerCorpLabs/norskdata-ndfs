@@ -18,6 +18,9 @@ ndfs_error_t ndfs_bf_init(ndfs_bit_file_t *bf, uint32_t total_pages)
     ndfs_bf_destroy(bf);
 
     bf->total_pages = total_pages;
+    /* Until the caller supplies the directory's declared capacity, the whole device is
+     * allocatable. ndfs_fs_* narrows this to ext_pages_available on mount. */
+    bf->alloc_ceiling = total_pages;
     bytes = (total_pages + 7) / 8;
     bf->bitmap = (uint8_t *)calloc(bytes, 1);
     if (!bf->bitmap) return NDFS_ERR_ALLOC;
@@ -107,43 +110,82 @@ uint32_t ndfs_bf_count_free(const ndfs_bit_file_t *bf)
     return bf->total_pages - ndfs_bf_count_used(bf);
 }
 
+/* Highest page index the allocator may consider (inclusive).
+ *
+ * The window is bounded by the declared capacity (alloc_ceiling), NOT the device size,
+ * and is clamped to the bitmap so a stale or over-large ceiling can never index past it.
+ * Returns 0 and sets *empty when there is no usable window at all. */
+static uint32_t bf_top_index(const ndfs_bit_file_t *bf, bool *empty)
+{
+    uint32_t ceiling = bf->alloc_ceiling;
+
+    if (ceiling == 0 || ceiling > bf->total_pages) ceiling = bf->total_pages;
+    if (ceiling <= NDFS_FIRST_ALLOC_BLOCK) { *empty = true; return 0; }
+
+    *empty = false;
+    return ceiling - 1;
+}
+
+/* Find a single free page, scanning HIGH -> LOW.
+ *
+ * KERNEL-CORRECTED: SINTRAN allocates from the TOP of the volume downward. The scanner
+ * TESTP (51355B) only ever DECREMENTS its bitmap word index (`AAX -1` at 51372B and
+ * 51401B) - it never increments - and is bounded below by the block-7 floor. This matches
+ * the @CREATE-FILE rule "contiguous files are positioned in the highest page addresses".
+ * The old upward scan produced the opposite layout to genuine SINTRAN.
+ *
+ * Reading an existing bitmap is direction-agnostic; it is the ALLOCATION CHOICE that must
+ * descend. */
 ndfs_error_t ndfs_bf_find_free(const ndfs_bit_file_t *bf, uint32_t *out_block)
 {
     uint32_t i;
+    bool empty;
 
     if (!bf || !out_block) return NDFS_ERR_NULL_PTR;
 
-    for (i = NDFS_FIRST_ALLOC_BLOCK; i < bf->total_pages; i++) {
+    i = bf_top_index(bf, &empty);
+    if (empty) return NDFS_ERR_NO_SPACE;
+
+    for (;;) {
         if (!ndfs_bf_is_used(bf, i)) {
             *out_block = i;
             return NDFS_OK;
         }
+        if (i == NDFS_FIRST_ALLOC_BLOCK) break;  /* floor reached; avoid unsigned wrap */
+        i--;
     }
     return NDFS_ERR_NO_SPACE;
 }
 
+/* Find a contiguous run of free pages, scanning HIGH -> LOW so the run lands in the
+ * highest available addresses (SINTRAN's downward range reserve, RSPAG 51120B -> TESTP).
+ * Returns the LOWEST block of the run (its start). */
 ndfs_error_t ndfs_bf_find_free_range(const ndfs_bit_file_t *bf,
                                      uint32_t count,
                                      uint32_t *out_start)
 {
     uint32_t consecutive = 0;
-    uint32_t range_start = 0;
     uint32_t i;
+    bool empty;
 
     if (!bf || !out_start) return NDFS_ERR_NULL_PTR;
     if (count == 0 || count > bf->total_pages) return NDFS_ERR_INVALID_ARG;
 
-    for (i = 0; i < bf->total_pages; i++) {
+    i = bf_top_index(bf, &empty);
+    if (empty) return NDFS_ERR_NO_SPACE;
+
+    for (;;) {
         if (!ndfs_bf_is_used(bf, i)) {
-            if (consecutive == 0) range_start = i;
             consecutive++;
             if (consecutive >= count) {
-                *out_start = range_start;
+                *out_start = i;  /* i is the lowest block of the run */
                 return NDFS_OK;
             }
         } else {
             consecutive = 0;
         }
+        if (i == NDFS_FIRST_ALLOC_BLOCK) break;
+        i--;
     }
     return NDFS_ERR_NO_SPACE;
 }

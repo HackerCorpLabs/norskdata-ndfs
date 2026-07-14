@@ -413,6 +413,25 @@ static ndfs_error_t load_structures(struct ndfs_filesystem *fs)
         err = ndfs_bf_init(&fs->bit_file, total_pages);
         if (err != NDFS_OK) return err;
 
+        /* Bound the ALLOCATION window by the directory's declared capacity
+         * (ext_pages_available, words 1756B-1757B) when the extended-info block is valid.
+         * SINTRAN's downward allocator never hands out a page above capacity-1; the gap
+         * between capacity and the physical device is the drive's bad-sector spare region,
+         * which stays free-but-unreachable.
+         *
+         * The `<= total_pages` clamp is load-bearing, not defensive noise: the real
+         * Winchester WD0.img declares a capacity of 36396 pages in a file only 36360 pages
+         * long. Without the clamp the allocator would start at page 36395, which does not
+         * exist in the file.
+         *
+         * Falls back to the whole device when there is no valid extended info (FLOMON
+         * floppies never have one). */
+        if (mb->ext_valid &&
+            mb->ext_pages_available > 0 &&
+            mb->ext_pages_available <= total_pages) {
+            fs->bit_file.alloc_ceiling = mb->ext_pages_available;
+        }
+
         /* Read contiguous bitmap pages */
         {
             uint8_t *tmp = (uint8_t *)malloc((size_t)bitmap_pages * NDFS_PAGE_SIZE);

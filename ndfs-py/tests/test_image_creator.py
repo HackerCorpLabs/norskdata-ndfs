@@ -84,14 +84,20 @@ class TestSmd75MB:
         mb = ndfs.get_master_block()
         assert mb.object_file_pointer.block_id == 18684
         assert mb.user_file_pointer.block_id == 18686
-        assert mb.bit_file_pointer.block_id == 18472
+        # ALBIT 137526B: floor(36945/2)=18472 rounded DOWN to a multiple of 9 = 18468 --
+        # the true PACK-ONE bit_file_ptr. This asserted 18472 (plain pages/2), off by 4.
+        assert mb.bit_file_pointer.block_id == 18468
 
 
 class TestWinchester74MB:
     def test_creates_correct_size(self):
         opts = ImageCreationOptions(template=ImageTemplate.Winchester74MB, directory_name="WIN74")
         data = create_image(opts)
-        assert len(data) == 36360 * NDFS_PAGE_SIZE
+        # Real Winchester drive = a Micropolis 1325 (5.25" ST-506/MFM), measured across 7
+        # real images: device 36864 pages = exactly 72.0 MiB, capacity 36396, spare 468.
+        # This asserted 36360 pages -- SMALLER than the declared 36396-page capacity, so the
+        # created image's last 36 pages did not exist at all.
+        assert len(data) == 36864 * NDFS_PAGE_SIZE
 
     def test_opens_as_valid_ndfs(self):
         opts = ImageCreationOptions(template=ImageTemplate.Winchester74MB, directory_name="WIN74")
@@ -104,9 +110,10 @@ class TestWinchester74MB:
         data = create_image(opts)
         ndfs = NdfsFileSystem(data)
         mb = ndfs.get_master_block()
-        assert mb.object_file_pointer.block_id == 32771
-        assert mb.user_file_pointer.block_id == 32769
-        assert mb.bit_file_pointer.block_id == 18198
+        # Measured from the real Micropolis 1325 images.
+        assert mb.object_file_pointer.block_id == 18428
+        assert mb.user_file_pointer.block_id == 18430
+        assert mb.bit_file_pointer.block_id == 18198  # 9*floor(floor(36396/2)/9)
 
 
 class TestCustomTemplate:

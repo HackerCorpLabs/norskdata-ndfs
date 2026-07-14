@@ -62,33 +62,48 @@ static void build_custom_spec(uint32_t pages, ndfs_template_spec_t *out)
     out->has_flomon  = false;
     out->ext_valid   = (pages > 1000);
 
-    /* Layout: object file ~50%, user file after it, bit file (BitFile
-     * bitmap) before both -- or near the end for small disks. */
-    if (pages > 1000) {
-        /* The BitFile bitmap is 1 bit per page, so it needs
-         * ceil(ceil(pages/8)/NDFS_PAGE_SIZE) contiguous pages -- for small
-         * page counts that is always 1, but for large custom images (tens
-         * of thousands of pages, e.g. a 30,000+ file stress image) it can
-         * span several pages. The object-file and user-file index blocks
-         * used to be placed at a fixed bf_block+2/+4 offset, which only
-         * left room for a 1-page bitmap; on any custom image needing more
-         * than that, the bitmap's own later pages silently overlapped and
-         * overwrote the object/user file index blocks the very first time
-         * write_bit_file() ran, corrupting the object directory. Compute
-         * the real bitmap page span here and place object/user file blocks
-         * strictly after it. */
+    /* Placement.
+     *
+     * KERNEL-DERIVED from ALBIT (137517B). The old ">1000 pages = big disk" branch was
+     * WRONG: SINTRAN does not switch layout on device size at all. It branches on whether
+     * @CREATE-DIRECTORY was given an EXPLICIT bit-file address. A small floppy created on
+     * the default path still lands mid-disk. (Real proof: two same-size 616-page floppies
+     * sit in opposite layouts because one used the override path.)
+     *
+     * DEFAULT path (no address supplied):
+     *     bit_file = 9 * floor(floor(declared_pages / 2) / 9)
+     * i.e. floor(pages/2) rounded DOWN to a multiple of 9.
+     * ALBIT 137526B-137532B: SAD ZIN SHR 1 (/2) -> SAT 11 (=9) -> RDIV ST (/9)
+     *                        -> RMPY ST DA (*9).
+     * Checks out on every real disk: 36945 -> 18472 -> 18468 (the true PACK-ONE
+     * bit_file_ptr; plain pages/2 gives 18472, off by 4); 616 -> 308 -> 306; and
+     * 61036 -> 30518 -> 30510 on the real SCSI pack. Plain pages/2 is simply wrong.
+     *
+     * The "9" is PAGES PER TRACK (SMD: 18 sectors/track x 1024 B = 18432 B = 9 pages of
+     * 2048), which is why @CREATE-DIRECTORY says the bit file starts "at a track
+     * boundary". Note SINTRAN uses the fixed immediate 9 regardless of drive.
+     *
+     * The object/user base is APPROXIMATE and NOT statically derivable: it comes from the
+     * CRDIR scan loop (137173B-137352B) and has no clean closed form - empirically
+     * bit+216 on SMD, bit+206 on SCSI, bit+202 on floppy. We use bit + bitmap_pages
+     * rounded up so the object/user index blocks always clear the bitmap's own page span
+     * (the bitmap can be several pages on a large image; overlapping it corrupted the
+     * object directory). Only bit-exactness with a SINTRAN-created image is affected -
+     * the reader is pointer-driven and reads any placement correctly.
+     *
+     * user_file = object_file + 2 holds on floppies and SMD/SCSI. (On the real Winchester
+     * WD0.img it is object - 2; the invariant that actually holds everywhere is
+     * |user - object| == 2. We emit +2 here.) */
+    {
         uint32_t bitmap_bytes = (pages + 7) / 8;
         uint32_t bitmap_pages = (bitmap_bytes + NDFS_PAGE_SIZE - 1) / NDFS_PAGE_SIZE;
+        uint32_t half         = pages / 2;
 
-        bf_block = pages / 2;
+        bf_block = (half / 9u) * 9u;                          /* ALBIT: round to a track */
+
         out->bit_file_block    = bf_block;
-        out->object_file_block = bf_block + bitmap_pages;     /* +index +data page */
-        out->user_file_block   = out->object_file_block + 2;  /* +index +data page */
-    } else {
-        /* Small disks: put system structures near end */
-        out->object_file_block = pages - 5;
-        out->user_file_block   = pages - 3;
-        out->bit_file_block    = pages - 1;
+        out->object_file_block = bf_block + bitmap_pages;     /* clear the bitmap span */
+        out->user_file_block   = out->object_file_block + 2;
     }
     out->unreserved_pages = pages;
 }

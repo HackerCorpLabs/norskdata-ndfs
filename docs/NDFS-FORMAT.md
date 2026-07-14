@@ -79,21 +79,70 @@ Offset  Size  Field              ND Word    Format
 
 ### Checksum Calculation
 
+The checksum (word 1750B) is a plain **16-bit ADDITIVE SUM of the seven words that follow
+it** (words 1751B–1757B), truncated to 16 bits:
+
 ```
-pagesLo  = PagesAvailable & 0xFFFF
-pagesHi  = (PagesAvailable >> 16) & 0xFFFF
-checksum = (pagesLo XOR pagesHi XOR FlagWord XOR Reserved1 XOR Reserved2 XOR Reserved3)
-         + SystemNumber
-checksum = checksum & 0xFFFF
+checksum = (Reserved1 + Reserved2 + Reserved3
+          + FlagWord + SystemNumber
+          + PagesHi + PagesLo) & 0xFFFF
 ```
+
+**Kernel-proven from both sides.** In the carved `006-S3FS` segment of a real SINTRAN III
+image, the writer **`WXDIR` (37702B)** and the enter-directory validator **`CHDSI`
+(37763B)** run the *identical* `ADD ,X 0` accumulation loop over these words:
+
+```
+037716  062000  ADD ,X 0        ; A += word   (ADD - not REXO)
+037717  173401  AAX 1           ; next word
+037720  146401  RADD AD1 0 DD   ; counter 1..7
+037723  006000  STA ,X 0        ; store the sum in word 0
+```
+
+There is **no XOR**, and the system number is simply **one of the seven summed words** —
+it is not added separately.
+
+> **Correction.** Earlier revisions of this document specified
+> `(pagesLo XOR pagesHi XOR FlagWord XOR Reserved1..3) + SystemNumber`. That is **wrong**.
+> It reproduced the PACK-ONE sample only by coincidence: the only two summed words sharing
+> a set bit are `FlagWord = 0x8000` and `pagesLo = 0x9051` (both bit 15). Under ADD the two
+> bit-15s carry out past bit 15 and are lost; under XOR they cancel — identical low 16 bits.
+> The XOR form breaks as soon as any two words share a *lower* set bit.
+>
+> Verified against three real disks: `SMD0.IMG` → `0x10B7`, `BIGDISK0-K.IMG` → `0x1051`,
+> `scsi-1.img` → `0xC162`.
 
 ### Validation States
 
 | State | Condition |
 |-------|-----------|
-| Valid | Stored checksum == calculated checksum |
-| ValidLowByteOnly | Low bytes match, high byte of stored is 0x00 |
+| Valid | Stored checksum == calculated checksum (full 16 bits) |
 | Invalid | No match |
+
+> There is deliberately **no "ValidLowByteOnly" state**. The kernel writes (`WXDIR`) and
+> compares (`CHDSI`) the **full 16-bit** value; no code path accepts a low-byte-only match.
+> That state was a reader-side heuristic SINTRAN never produces, and it has been removed.
+
+### Flag Word (1754B)
+
+| Bit | Meaning |
+|-----|---------|
+| 15 (`0x8000`) | **Directory entered / in use** — a cross-system mount interlock. `CHDSI` (37763B) *sets* it on enter (`BSET ONE 170`); `REENB` (40162B) *clears* it on release (`BSET ZRO 170`). |
+| 0–14 | No known meaning on this SINTRAN revision. **Preserve verbatim.** |
+
+A stored `0x8000` means the volume was **left entered** (not cleanly released) by the
+system in the System Number word.
+
+> **System Number 0 means NO OWNER recorded** — not "system zero". `CHDSI` (040113–040114)
+> loads the stored number and, if it is zero, proceeds as if the directory is unowned. Never
+> report a volume as "entered by system 0".
+
+### Bad-checksum behaviour
+
+SINTRAN does **not** refuse the mount on a bad checksum. `CHDSI` **zeroes the 8-word
+extended-info block and rebuilds it** (writes the capacity, stamps the owner and flag, then
+recomputes the checksum via `WXDIR`). The extended-info block is a *self-healing* record,
+not a mount gate.
 
 ### FLOMON Detection
 
@@ -195,6 +244,45 @@ is_used    = (bitmap[byte_index] & (1 << bit_index)) != 0
 ### System Blocks
 
 Blocks 0-6 are reserved for system use and must never be allocated for file data.
+
+### Bitmap size vs. allocation window
+
+These are **two different numbers** and must not be conflated:
+
+- The **bitmap is sized to the PHYSICAL DEVICE** (e.g. 38,400 bits on a 75 MB SMD pack).
+  Its popcount over the whole device is what a disk tool reports as used/free.
+- The **allocation window is bounded by the DECLARED CAPACITY** (`PagesAvailable`, words
+  1756B–1757B). On PACK-ONE that is 36,945, so the highest allocatable page is **36,944**.
+  Pages 36,945–38,399 are the drive's **bad-sector spare region**: they stay `0` (free) in
+  the bitmap yet are **never handed out**.
+
+Verified on the real disk: page 36,944 is used; pages 36,945+ are all free and unreachable.
+
+> **Always clamp the ceiling to the device size.** The real Winchester `WD0.img` declares a
+> capacity of **36,396** pages in a file only **36,360** pages long. Without the clamp, a
+> downward allocator would start at page 36,395 — which does not exist in the file.
+
+### Allocation direction: HIGH → LOW
+
+**SINTRAN allocates from the TOP of the volume downward**, not upward from block 7.
+
+The scanner **`TESTP` (51355B)** only ever *decrements* its bitmap word index — `AAX -1` at
+**51372B** and **51401B**, never `AAX 1` — bounded below by the block-7 floor:
+
+```
+051363  LDT ,B 10          ; T = the block-7 floor word
+051364  SKP IF DX LST ST   ; while X >= floor ...
+051372  173777  AAX -1     ; X-- : step to the NEXT-LOWER bitmap word
+051401  173777  AAX -1     ; X-- : (the other scan path)
+```
+
+This matches the `@CREATE-FILE` rule that *"contiguous files are positioned in the highest
+page addresses"*. The contiguous range reserve `RSPAG` (51120B) drives the same downward
+`TESTP` scan.
+
+> **Correction.** Earlier revisions of this library scanned **upward** from block 7. That
+> produces the exact opposite layout to genuine SINTRAN. Reading an existing bitmap is
+> direction-agnostic — it is the **allocation choice** that must descend.
 
 ## File Allocation
 
@@ -333,18 +421,112 @@ Binary Section:
 
 A BPUN variant where address=0 and count=0 after the `!` delimiter. Used on ND floppy disks.
 
-### Binary
+### Binary (raw hard-disk bootstrap)
 
-Raw machine code with no BPUN/FLOMON markers. Detected by checking for non-zero, non-uniform data in the first 1024 bytes.
+Raw ND-100 machine code with no BPUN/FLOMON markers. Detected by the **CPU opcode
+signature**, not by a data heuristic.
+
+A genuine bootstrap *must* disable interrupts (and usually paging) before it touches the
+controller, so the **first word** is always one of exactly two opcodes:
+
+| Opcode | Octal | Word | Meaning |
+|--------|-------|------|---------|
+| `PIOF` | 150405 | `0xD105` | interrupts **and** paging off |
+| `IOF`  | 150401 | `0xD101` | interrupts off |
+
+Nothing else can legally start boot code. The controller family is then taken from the
+first I/O instruction:
+
+| Controller | Signature |
+|------------|-----------|
+| SMD / ECC | literal `IOX` in the octal device window 1540–1547 / 1550–1557 / 540–547 / 550–557 |
+| Winchester (ST-506 / MFM) | literal `IOX` in the octal window 500–517 |
+| Floppy | literal `IOX` in the octal window 1560–1577 |
+| SCSI (NCR-5386) | `IOXT` (octal 150415) — device number taken from the **T register** |
+
+> **Correction.** Earlier revisions described Binary detection as *"checking for non-zero,
+> non-uniform data in the first 1024 bytes."* That heuristic was wrong in both directions:
+> it **false-negatived** `SMD0.IMG` (a real SMD bootstrap, reported as *None*) and
+> **false-positived** `FLOPPY.IMG` (a space-filled `0x40` boot area, reported as *Binary*).
+> The shipping code uses the opcode signature above.
+
+> **Trap — do not "optimise" the controller scan.** Page 0 is boot **code followed by
+> data**, and a word scan cannot tell them apart: any *data* word equal to `0150415`
+> (`0xD10D`) is indistinguishable from an `IOXT` instruction. Treating "IOXT anywhere on the
+> page" as an overriding SCSI signature therefore **misclassifies real Winchester disks**.
+> The real `1325.img` (a Micropolis 1325, ST-506/MFM) has 23 genuine `IOX` instructions in
+> the Winchester window across words 79–570, then 17 *data* words equal to `0xD10D` at words
+> 714–929 — past the end of its code. Scan **in order and take the first signature**: the
+> Winchester disk hits its real `IOX` first, and a genuine SCSI disk (which has *no*
+> controller-window `IOX` at all) falls through to its early `IOXT`.
+
+> **Boot region size.** "The first 1024 bytes are the boot sector" is a simplification. Live
+> boot code can run all the way up to the extended-info block — i.e. bytes **0–1999**
+> (words 0B–1747B). Do not assume structured data before offset `0x07D0`.
 
 ## Disk Image Templates
 
-| Template | Pages | File Blocks | Obj Block | User Block | Bit Block |
-|----------|-------|-------------|-----------|------------|-----------|
-| Floppy 360KB | 154 | 154 | 149 | 151 | 153 |
-| Floppy 1.2MB | 616 | 616 | 611 | 613 | 615 |
-| SMD 75MB | 36,945 | 38,400 | 18,684 | 18,686 | 18,472 |
-| Winchester 74MB | 36,396 | 36,360 | 32,771 | 32,769 | 18,198 |
+Geometries below are **measured from real ND disk images**. Every real drive reserves a
+**spare (bad-sector remap) region**, so *File Blocks* (the physical device) is always
+**larger** than *Pages* (the declared, usable capacity) — never smaller.
+
+**Spare is a property of the DRIVE, not a percentage of capacity.** The same 36,396-page
+capacity sits on different drives with different spare, so it can never be derived by
+formula — templates must carry real measured geometry.
+
+| Template | Pages (capacity) | File Blocks (device) | Spare | Obj Block | User Block | Bit Block |
+|----------|------------------|----------------------|-------|-----------|------------|-----------|
+| Floppy — SINTRAN format 0 | 154 | 154 | — | 149 | 151 | 153 |
+| Floppy — SINTRAN format 17₈ | 616 | 616 | — | 611 | 613 | 615 |
+| SMD 75MB (DISC-75MB) | 36,945 | 38,400 | 1,455 | 18,684 | 18,686 | **18,468** |
+| Winchester 74MB (Micropolis 1325, ST-506/MFM) | 36,396 | **36,864** | 468 | 18,428 | 18,430 | 18,198 |
+
+Notes:
+
+- **Floppies: only two formats exist.** ND-60.128.5 (`SET-FLOPPY-FORMAT`) states the SINTRAN
+  file system "can only be used with formats 0 and 17₈" — i.e. **154 and 616 pages**. Real
+  156- and 640-page images are *padded* 154/616 files, not formats.
+- **SMD bit block corrected** from 18,472 → **18,468** (see *Bit-file placement* below).
+- **Winchester device corrected** from 36,360 → **36,864**. The old 36,360 was *smaller than
+  the declared 36,396-page capacity*, so a created image's last 36 pages did not exist. The
+  real drive is a Micropolis 1325 (1024 cyl × 8 heads, ST-506/MFM), measured at 36,864 pages
+  = exactly 72.0 MiB across 7 real images.
+
+### Bit-file placement (`ALBIT` 137517B)
+
+SINTRAN branches on whether `@CREATE-DIRECTORY` was given an **explicit bit-file address** —
+**not** on device size. (The old "small disk vs big disk" layout switch was wrong: a small
+floppy created on the default path still lands mid-disk.)
+
+**Default path:**
+
+```
+bit_file = 9 * floor(floor(declared_pages / 2) / 9)
+```
+
+i.e. `floor(pages/2)` rounded **down to a multiple of 9** (`ALBIT` 137526B–137532B: ÷2 → ÷9
+→ ×9). Verified on every real disk: `36945 → 18468`, `616 → 306`, `61036 → 30510`. Plain
+`pages/2` gives 18472 for PACK-ONE — off by 4.
+
+The **9 is pages per track** (SMD: 18 sectors/track × 1024 B = 18,432 B = 9 pages of 2048),
+which is exactly why `@CREATE-DIRECTORY` documents the bit file as starting "at a track
+boundary". Note it is a hard-coded immediate (`SAT 11`), so SINTRAN rounds to 9 regardless
+of the actual drive.
+
+**Override path** (an address `BA` was supplied): `bit = BA`, `object = BA − 4`,
+`user = BA − 2`.
+
+The default-path **object/user base is approximate** — it comes from the `CRDIR` scan loop
+(137173B–137352B) and has no clean closed form (empirically `bit+216` on SMD, `bit+206` on
+SCSI, `bit+202` on floppy). Only bit-exactness with a SINTRAN-created image is affected; the
+reader is pointer-driven and reads any placement correctly.
+
+### The `|user − object| == 2` invariant
+
+The object and user index blocks are always **exactly 2 blocks apart** — but **not always
+`user = object + 2`**. On floppies and SMD/SCSI it is `+2`; on the real **Winchester**
+`WD0.img` it is `object = 32771, user = 32769`, i.e. **`−2`**. Code that tests for `+2`
+alone will falsely reject every Winchester volume.
 
 ### Block Placement Strategy
 

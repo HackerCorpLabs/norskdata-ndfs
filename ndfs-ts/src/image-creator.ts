@@ -18,6 +18,7 @@ import {
 } from './constants.js';
 import { writeUint16BE, writeUint32BE } from './endian.js';
 import { writeNdfsName } from './ndfs-name.js';
+import { MasterBlock } from './master-block.js';
 import { BlockPointer } from './block-pointer.js';
 import { PointerType, ImageTemplate, ImageCreationOptions } from './types.js';
 
@@ -57,24 +58,35 @@ function getTemplateSpec(template: ImageTemplate, customPages?: number): Templat
         isFloppy: true,
         includeExtendedInfo: false,
       };
+    // Drive geometries below are MEASURED from real ND disk images. Every real drive
+    // reserves a spare (bad-sector remap) region, so fileBlocks (the physical device) is
+    // always LARGER than ndfsPages (the declared, usable capacity) — never smaller.
+    // The spare size is a property of the DRIVE, not a percentage of capacity: the same
+    // 36396-page capacity has 468 spare on the Winchester and a different spare elsewhere.
     case ImageTemplate.Smd75MB:
       return {
-        ndfsPages: 36945,
-        fileBlocks: 38400,
+        ndfsPages: 36945, // DOCUMENTED: ND-30.003.007, "75 MB disk pack giving 36,945 pages"
+        fileBlocks: 38400, // real device (PACK-ONE / SMD0.IMG); spare = 1455
         objectFileBlock: 18684,
         userFileBlock: 18686,
-        bitFileBlock: 18472,
+        // KERNEL-CORRECTED (ALBIT 137526B): floor(36945/2)=18472 rounded DOWN to a multiple
+        // of 9 = 18468 — the true PACK-ONE bit_file_ptr. Plain pages/2 gave 18472, off by 4.
+        bitFileBlock: 18468,
         unreservedPages: 36945,
         isFloppy: false,
         includeExtendedInfo: true,
       };
     case ImageTemplate.Winchester74MB:
       return {
-        ndfsPages: 36396,
-        fileBlocks: 36360,
-        objectFileBlock: 32771,
-        userFileBlock: 32769,
-        bitFileBlock: 18198,
+        ndfsPages: 36396, // DOCUMENTED: ND-30.003.007 DEVICE-COPY, "Pages to copy: 36396"
+        // Real drive: a Micropolis 1325 (5.25" ST-506/MFM), measured across 7 real images —
+        // device 36864 pages = exactly 72.0 MiB, spare 468.
+        // fileBlocks used to be 36360, which was SMALLER than the declared capacity: the
+        // image's last 36 pages did not exist at all.
+        fileBlocks: 36864,
+        objectFileBlock: 18428, // real disk (1325.img)
+        userFileBlock: 18430, // = object + 2
+        bitFileBlock: 18198, // 9*floor(floor(36396/2)/9) = 18198 (ALBIT)
         unreservedPages: 36396,
         isFloppy: false,
         includeExtendedInfo: true,
@@ -84,21 +96,36 @@ function getTemplateSpec(template: ImageTemplate, customPages?: number): Templat
         throw new Error('Custom template requires at least 20 pages');
       }
       const pages = customPages;
+      // Floppies carry no valid extended-info block; that is what distinguishes them here.
       const isFloppy = pages <= 1000;
 
-      let objBlock: number;
-      let usrBlock: number;
-      let bitBlock: number;
+      // Placement — KERNEL-DERIVED from ALBIT (137517B).
+      //
+      // The old "small disk vs big disk" branch was WRONG: SINTRAN does not switch layout
+      // on device size. It branches on whether @CREATE-DIRECTORY was given an EXPLICIT
+      // bit-file address. A small floppy created on the DEFAULT path still lands mid-disk.
+      // (Two same-size 616-page floppies sit in opposite layouts for exactly this reason.)
+      //
+      // DEFAULT path:  bit_file = 9 * floor(floor(pages / 2) / 9)
+      //   i.e. floor(pages/2) rounded DOWN to a multiple of 9.
+      //   ALBIT 137526B-137532B: /2 -> /9 -> *9.
+      //   Verified on every real disk: 36945 -> 18468, 616 -> 306, 61036 -> 30510.
+      //   Plain pages/2 (18472 for PACK-ONE) is simply wrong.
+      //
+      // The "9" is PAGES PER TRACK (SMD: 18 sectors x 1024 B = 18432 B = 9 pages of 2048),
+      // which is why @CREATE-DIRECTORY says the bit file starts "at a track boundary".
+      //
+      // The object/user base is APPROXIMATE — it comes from the CRDIR scan loop
+      // (137173B-137352B) and has no clean closed form (empirically bit+216 on SMD,
+      // bit+206 on SCSI, bit+202 on floppy). We place object/user clear of the bitmap's own
+      // page span. Only bit-exactness with a SINTRAN-created image is affected; the reader
+      // is pointer-driven and reads any placement correctly.
+      const bitmapBytes = Math.ceil(pages / 8);
+      const bitmapPages = Math.ceil(bitmapBytes / NDFS_PAGE_SIZE);
 
-      if (isFloppy) {
-        objBlock = pages - 5;
-        usrBlock = pages - 3;
-        bitBlock = pages - 1;
-      } else {
-        bitBlock = Math.floor(pages / 2);
-        objBlock = Math.floor(pages * 0.85);
-        usrBlock = objBlock + 2;
-      }
+      const bitBlock = Math.floor(Math.floor(pages / 2) / 9) * 9;
+      const objBlock = bitBlock + bitmapPages;
+      const usrBlock = objBlock + 2;
 
       return {
         ndfsPages: pages,
@@ -178,10 +205,12 @@ export function createNdfsImage(options: ImageCreationOptions): Uint8Array {
     writeUint16BE(image, ext + 10, sysNum);
     writeUint32BE(image, ext + 12, pagesAvailable);
 
-    // Calculate checksum
+    // Kernel-correct checksum: a 16-bit ADDITIVE sum of the seven words following the
+    // checksum slot (reserved1-3 = 0, flag, system#, pages-hi, pages-lo). NOT XOR-then-add
+    // — see MasterBlock.computeExtChecksum (WXDIR 37702B / CHDSI 37763B).
     const pagesLo = pagesAvailable & 0xffff;
     const pagesHi = (pagesAvailable >>> 16) & 0xffff;
-    const checksum = ((pagesLo ^ pagesHi ^ flagWord ^ 0 ^ 0 ^ 0) + sysNum) & 0xffff;
+    const checksum = MasterBlock.computeExtChecksum(0, 0, 0, flagWord, sysNum, pagesHi, pagesLo);
     writeUint16BE(image, ext, checksum);
   }
 

@@ -53,9 +53,15 @@ export enum FileOperationType {
 }
 
 /** Checksum validation state for extended info. */
+/**
+ * Extended-info checksum state.
+ *
+ * NOTE: there is deliberately no `ValidLowByteOnly`. The SINTRAN kernel writes and
+ * compares the FULL 16-bit checksum (writer WXDIR 37702B, validator CHDSI 37763B);
+ * accepting a low-byte-only match was a reader-side heuristic SINTRAN never produces.
+ */
 export enum ChecksumValidation {
   Valid = 'valid',
-  ValidLowByteOnly = 'valid_low_byte',
   Invalid = 'invalid',
 }
 
