@@ -22,6 +22,7 @@ extern void run_object_entry_tests(void);
 extern void run_filesystem_tests(void);
 extern void run_image_creator_tests(void);
 extern void run_boot_loader_tests(void);
+extern void run_sintran_tests(void);
 extern void run_write_comprehensive_tests(void);
 extern void run_xat_tests(void);
 extern void run_xat_copy_tests(void);
@@ -44,6 +45,7 @@ int main(void)
     run_filesystem_tests();
     run_image_creator_tests();
     run_boot_loader_tests();
+    run_sintran_tests();
     run_write_comprehensive_tests();
     run_xat_tests();
     run_xat_copy_tests();

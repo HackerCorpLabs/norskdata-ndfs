@@ -12,7 +12,7 @@ HackerCorp Labs - https://github.com/HackerCorpLabs
 from __future__ import annotations
 
 import math
-from typing import Dict, List, NamedTuple, Optional, Tuple, Union
+from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple, Union
 
 from ndfs.constants import (
     NDFS_PAGE_SIZE,
@@ -36,6 +36,7 @@ from ndfs.user_friend import UserFriend
 from ndfs.object_entry import ObjectEntry, ACCESS_DEFAULT, FT_INDEXED
 from ndfs.types import PointerType, FileEntry, ImageCreationOptions, BootFormat, BootControllerType, BootCode
 from ndfs.xat import object_entry_to_xat, xat_to_object_entry
+from ndfs import sintran
 
 _BufType = Union[bytes, bytearray, memoryview]
 
@@ -670,6 +671,123 @@ class NdfsFileSystem:
     # ==================================================================
     #  Private implementation
     # ==================================================================
+
+    # -- SINTRAN initial commands -----------------------------------------
+
+    def get_file_blocks(self, path: str) -> List[int]:
+        """Return the ordered data-block IDs of a file (0 marks a sparse hole)."""
+        obj = self._find_object(path)
+        if obj is None:
+            raise FileNotFoundError(f"File not found: {path}")
+        blocks: List[int] = []
+        fp = obj.file_pointer
+        if fp is None or fp.block_id == 0:
+            return blocks
+        if fp.type == PointerType.Contiguous:
+            for i in range(obj.pages_in_file):
+                blocks.append(fp.block_id + i)
+        elif fp.type == PointerType.Indexed:
+            ib = self._read_page(fp.block_id)
+            for i in range(min(obj.pages_in_file, MAX_OBJECT_FILE_POINTERS)):
+                blocks.append(BlockPointer.from_bytes(ib, i * 4).block_id)
+        elif fp.type == PointerType.SubIndexed:
+            sib = self._read_page(fp.block_id)
+            remaining = obj.pages_in_file
+            for si in range(MAX_OBJECT_FILE_POINTERS):
+                if remaining <= 0:
+                    break
+                ip = BlockPointer.from_bytes(sib, si * 4)
+                if ip.block_id == 0:
+                    break
+                ib = self._read_page(ip.block_id)
+                for j in range(MAX_OBJECT_FILE_POINTERS):
+                    if remaining <= 0:
+                        break
+                    blocks.append(BlockPointer.from_bytes(ib, j * 4).block_id)
+                    remaining -= 1
+        return blocks
+
+    def patch_file_region(self, path: str, file_offset: int,
+                          data: Union[bytes, bytearray, memoryview]) -> None:
+        """Overwrite ``data`` at file-relative ``file_offset`` IN PLACE, touching
+        only the page(s) that overlap. The file's allocation never changes, so
+        this is safe on a large contiguous system file (e.g. SEGFIL0)."""
+        self._ensure_writable()
+        if not data:
+            return
+        blocks = self.get_file_blocks(path)
+        end = file_offset + len(data)
+        start_page = file_offset // NDFS_PAGE_SIZE
+        end_page = (end - 1) // NDFS_PAGE_SIZE
+        if end_page >= len(blocks):
+            raise IndexError("patch region extends past the file")
+        for pg in range(start_page, end_page + 1):
+            if blocks[pg] == 0:
+                raise IOError("patch region overlaps a sparse hole")
+            page = bytearray(self._read_page(blocks[pg]))
+            page_start = pg * NDFS_PAGE_SIZE
+            ov_start = max(file_offset, page_start)
+            ov_end = min(end, page_start + NDFS_PAGE_SIZE)
+            page[ov_start - page_start:ov_end - page_start] = \
+                data[ov_start - file_offset:ov_end - file_offset]
+            self._write_page(blocks[pg], page)
+
+    def _find_segfil_path(self) -> Optional[str]:
+        """Path (USER/NAME:TYPE) of the SEGFIL0/SEGFIL object, or None."""
+        for obj in self.get_object_entries():
+            if obj.object_name.upper() in ("SEGFIL0", "SEGFIL"):
+                t = (obj.type or "").rstrip("' ")
+                if t:
+                    return f"{obj.user_name}/{obj.object_name}:{t}"
+                return f"{obj.user_name}/{obj.object_name}"
+        return None
+
+    def read_initial_commands(self) -> Optional[sintran.InitialCommands]:
+        """Locate and decode the SINTRAN initial-command buffer, or None."""
+        path = self._find_segfil_path()
+        if path is None:
+            return None
+        seg = self.read_file(path)
+        return sintran.locate(seg)
+
+    def write_initial_commands(self, commands: Sequence[str]) -> bool:
+        """Replace the initial-command buffer and write it back to SEGFIL0 in
+        place. Returns False when the pack has no locatable buffer."""
+        self._ensure_writable()
+        path = self._find_segfil_path()
+        if path is None:
+            return False
+        loc = sintran.locate(self.read_file(path))
+        if loc is None:
+            return False
+        encoded, text_len = sintran.encode_buffer(commands)
+        region = sintran.build_region_image(encoded, text_len)
+        self.patch_file_region(path, loc.byte_offset, region)
+        return True
+
+    def repair_initial_commands(self, commands: Sequence[str]) -> Optional[Tuple[int, int]]:
+        """Repair a header-corrupted buffer the normal locator can no longer see,
+        by matching the surviving command text. Returns (byte_offset, score) or
+        None when no unambiguous target is found."""
+        self._ensure_writable()
+        path = self._find_segfil_path()
+        if path is None:
+            return None
+        target = sintran.locate_repair_target(self.read_file(path))
+        if target is None:
+            return None
+        byte_offset, score = target
+        encoded, text_len = sintran.encode_buffer(commands)
+        region = sintran.build_region_image(encoded, text_len)
+        self.patch_file_region(path, byte_offset, region)
+        return byte_offset, score
+
+    def diagnose_initial_commands(self) -> List[sintran.InitCmdCandidate]:
+        """Enumerate every INIBU-containing segment candidate (diagnostic)."""
+        path = self._find_segfil_path()
+        if path is None:
+            return []
+        return sintran.enumerate_candidates(self.read_file(path))
 
     def _read_page(self, block_id: int) -> memoryview:
         """Read a page from the image buffer."""

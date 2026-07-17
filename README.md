@@ -25,6 +25,7 @@ Three standalone libraries with identical APIs, plus a CLI tool:
 - **ND-100 even parity** (strip on read, set on write -- proper calculated parity per byte, not mark parity)
 - **XAT sidecar files** for preserving NDFS metadata (permissions, file types, dates) when copying to/from host filesystems
 - **Boot loader detection** (BPUN, FLOMON, Binary formats)
+- **SINTRAN initial commands** (read / write / repair the `@LIST-INITIAL-COMMANDS` buffer that lives at kernel symbol INIBU inside `SEGFIL0`)
 - **Filesystem check** (fsck: bitmap consistency, orphaned blocks, cross-links, quota verification)
 - **Interactive shell** (ndtool --shell: ls, cat, hexdump, edit, get, put, rm, mv, bitmap, fsck, stat, users, save)
 
@@ -78,6 +79,26 @@ ndfs_write_file_parity(fs, "SYSTEM/HELLO:TEXT",
 uint8_t *data; size_t size;
 ndfs_read_file_parity(fs, "SYSTEM/HELLO:TEXT",
     NDFS_PARITY_STRIP, &data, &size);
+```
+
+### SINTRAN initial commands
+
+The commands SINTRAN runs first at every restart (`@LIST-INITIAL-COMMANDS`) live
+at the kernel symbol INIBU inside `(SYSTEM)SEGFIL0:DATA` — no file form. Read,
+replace, or repair them offline (see [docs/SINTRAN-INITIAL-COMMANDS-SPEC.md](docs/SINTRAN-INITIAL-COMMANDS-SPEC.md)):
+
+```typescript
+const ic = ndfs.readInitialCommands();        // -> { version, byteOffset, commands, ... } | null
+ndfs.writeInitialCommands([                    // replace the whole buffer, in place
+  'ENTER-DIRECTORY,,DISC-SCSI-1,0', 'SET-AVAILABLE',
+]);
+// If the buffer header was clobbered so the locator can't see it:
+ndfs.repairInitialCommands([ 'ENTER-DIRECTORY,,DISC-SCSI-1,0', 'SET-AVAILABLE' ]);
+```
+
+```python
+ic = ndfs.read_initial_commands()             # -> InitialCommands | None
+ndfs.write_initial_commands(['ENTER-DIRECTORY,,DISC-SCSI-1,0', 'SET-AVAILABLE'])
 ```
 
 ### ndtool CLI

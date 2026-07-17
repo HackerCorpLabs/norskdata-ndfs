@@ -269,6 +269,21 @@ ndfs_error_t ndfs_get_file_blocks(const ndfs_filesystem_t *fs, const char *path,
                                   uint32_t **out_blocks, size_t *out_count);
 
 /**
+ * Overwrite @p len bytes at file-relative byte offset @p file_offset within an
+ * existing file, IN PLACE, touching only the page(s) that overlap the region.
+ * The file's allocation is never changed, so this is safe on a large contiguous
+ * system file (e.g. SEGFIL0) where a full rewrite could reallocate. The region
+ * may straddle a page boundary.
+ *
+ * Errors: NDFS_ERR_NOT_FOUND (no such file), NDFS_ERR_READ_ONLY,
+ * NDFS_ERR_OUT_OF_RANGE (region extends past the file), NDFS_ERR_CORRUPT
+ * (the region overlaps a sparse hole).
+ */
+ndfs_error_t ndfs_patch_file_region(ndfs_filesystem_t *fs, const char *path,
+                                    size_t file_offset,
+                                    const uint8_t *data, size_t len);
+
+/**
  * Set the 15-bit access word for a file and persist the change.
  * @param path         File path "USER/NAME:TYPE".
  * @param access_bits  New access word (3x5-bit OWN/FRIEND/PUBLIC tiers).

@@ -20,6 +20,7 @@ set(NDFS_SOURCES
     src/filesystem.c
     src/image_creator.c
     src/boot_loader.c
+    src/sintran.c
     src/xat.c
     src/parity.c
     src/wildmatch.c
@@ -55,6 +56,7 @@ set(TEST_SOURCES
     tests/test_filesystem.c
     tests/test_image_creator.c
     tests/test_boot_loader.c
+    tests/test_sintran.c
     tests/test_write_comprehensive.c
     tests/test_xat.c
     tests/test_xat_copy.c

@@ -22,6 +22,7 @@ import {
   NDFS_TYPE_MAX,
 } from './constants.js';
 import { readUint32BE, writeUint32BE } from './endian.js';
+import * as sintran from './sintran.js';
 import { BlockPointer } from './block-pointer.js';
 import { MasterBlock } from './master-block.js';
 import { BitFile } from './bit-file.js';
@@ -662,6 +663,119 @@ export class NdfsFileSystem {
   // ══════════════════════════════════════════════════════════════════
   //  Private implementation
   // ══════════════════════════════════════════════════════════════════
+
+  // -- SINTRAN initial commands ------------------------------------------
+
+  /** Return the ordered data-block IDs of a file (0 marks a sparse hole). */
+  getFileBlocks(path: string): number[] {
+    const obj = this.findObject(path);
+    if (!obj) throw new Error(`File not found: ${path}`);
+    const blocks: number[] = [];
+    const fp = obj.filePointer;
+    if (!fp || fp.blockId === 0) return blocks;
+    if (fp.type === PointerType.Contiguous) {
+      for (let i = 0; i < obj.pagesInFile; i++) blocks.push(fp.blockId + i);
+    } else if (fp.type === PointerType.Indexed) {
+      const ib = this.readPage(fp.blockId);
+      for (let i = 0; i < Math.min(obj.pagesInFile, MAX_OBJECT_FILE_POINTERS); i++) {
+        blocks.push(BlockPointer.fromBytes(ib, i * 4).blockId);
+      }
+    } else if (fp.type === PointerType.SubIndexed) {
+      const sib = this.readPage(fp.blockId);
+      let remaining = obj.pagesInFile;
+      for (let si = 0; si < MAX_OBJECT_FILE_POINTERS && remaining > 0; si++) {
+        const ip = BlockPointer.fromBytes(sib, si * 4);
+        if (ip.blockId === 0) break;
+        const ib = this.readPage(ip.blockId);
+        for (let j = 0; j < MAX_OBJECT_FILE_POINTERS && remaining > 0; j++) {
+          blocks.push(BlockPointer.fromBytes(ib, j * 4).blockId);
+          remaining--;
+        }
+      }
+    }
+    return blocks;
+  }
+
+  /**
+   * Overwrite `data` at file-relative `fileOffset` IN PLACE, touching only the
+   * page(s) that overlap. The file's allocation never changes, so this is safe
+   * on a large contiguous system file (e.g. SEGFIL0).
+   */
+  patchFileRegion(path: string, fileOffset: number, data: Uint8Array): void {
+    this.ensureWritable();
+    if (data.length === 0) return;
+    const blocks = this.getFileBlocks(path);
+    const end = fileOffset + data.length;
+    const startPage = Math.floor(fileOffset / NDFS_PAGE_SIZE);
+    const endPage = Math.floor((end - 1) / NDFS_PAGE_SIZE);
+    if (endPage >= blocks.length) throw new Error('patch region extends past the file');
+    for (let pg = startPage; pg <= endPage; pg++) {
+      if (blocks[pg] === 0) throw new Error('patch region overlaps a sparse hole');
+      const page = new Uint8Array(this.readPage(blocks[pg]));
+      const pageStart = pg * NDFS_PAGE_SIZE;
+      const ovStart = Math.max(fileOffset, pageStart);
+      const ovEnd = Math.min(end, pageStart + NDFS_PAGE_SIZE);
+      page.set(data.subarray(ovStart - fileOffset, ovEnd - fileOffset), ovStart - pageStart);
+      this.writePage(blocks[pg], page);
+    }
+  }
+
+  /** Path (USER/NAME:TYPE) of the SEGFIL0/SEGFIL object, or null. */
+  private findSegfilPath(): string | null {
+    for (const obj of this.getObjectEntries()) {
+      const name = obj.objectName.toUpperCase();
+      if (name === 'SEGFIL0' || name === 'SEGFIL') {
+        const t = (obj.type ?? '').replace(/['\s]+$/, '');
+        return t ? `${obj.userName}/${obj.objectName}:${t}` : `${obj.userName}/${obj.objectName}`;
+      }
+    }
+    return null;
+  }
+
+  /** Locate and decode the SINTRAN initial-command buffer, or null. */
+  readInitialCommands(): sintran.InitialCommands | null {
+    const path = this.findSegfilPath();
+    if (path === null) return null;
+    return sintran.locate(this.readFile(path));
+  }
+
+  /**
+   * Replace the initial-command buffer and write it back to SEGFIL0 in place.
+   * Returns false when the pack has no locatable buffer.
+   */
+  writeInitialCommands(commands: readonly string[]): boolean {
+    this.ensureWritable();
+    const path = this.findSegfilPath();
+    if (path === null) return false;
+    const loc = sintran.locate(this.readFile(path));
+    if (!loc) return false;
+    const { bytes, textLen } = sintran.encodeBuffer(commands);
+    this.patchFileRegion(path, loc.byteOffset, sintran.buildRegionImage(bytes, textLen));
+    return true;
+  }
+
+  /**
+   * Repair a header-corrupted buffer the normal locator can no longer see, by
+   * matching the surviving command text. Returns { byteOffset, score } or null
+   * when no unambiguous target is found.
+   */
+  repairInitialCommands(commands: readonly string[]): { byteOffset: number; score: number } | null {
+    this.ensureWritable();
+    const path = this.findSegfilPath();
+    if (path === null) return null;
+    const target = sintran.locateRepairTarget(this.readFile(path));
+    if (!target) return null;
+    const { bytes, textLen } = sintran.encodeBuffer(commands);
+    this.patchFileRegion(path, target.byteOffset, sintran.buildRegionImage(bytes, textLen));
+    return target;
+  }
+
+  /** Enumerate every INIBU-containing segment candidate (diagnostic). */
+  diagnoseInitialCommands(): sintran.InitCmdCandidate[] {
+    const path = this.findSegfilPath();
+    if (path === null) return [];
+    return sintran.enumerateCandidates(this.readFile(path));
+  }
 
   private readPage(blockId: number): Uint8Array {
     const offset = blockId * NDFS_PAGE_SIZE;

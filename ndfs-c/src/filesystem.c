@@ -2229,6 +2229,53 @@ ndfs_error_t ndfs_get_file_blocks(const ndfs_filesystem_t *fs, const char *path,
     return NDFS_OK;
 }
 
+ndfs_error_t ndfs_patch_file_region(ndfs_filesystem_t *fs, const char *path,
+                                    size_t file_offset,
+                                    const uint8_t *data, size_t len)
+{
+    uint32_t *blocks;
+    size_t count;
+    ndfs_error_t err;
+    size_t end, start_page, end_page, pg;
+
+    if (!fs || !path || !data) return NDFS_ERR_NULL_PTR;
+    if (fs->read_only) return NDFS_ERR_READ_ONLY;
+    if (len == 0) return NDFS_OK;
+
+    err = ndfs_get_file_blocks(fs, path, &blocks, &count);
+    if (err != NDFS_OK) return err;
+
+    end = file_offset + len;
+    start_page = file_offset / NDFS_PAGE_SIZE;
+    end_page = (end - 1) / NDFS_PAGE_SIZE;
+
+    /* Validate the whole span up front so an out-of-range region never leaves a
+     * partial write behind. */
+    if (end_page >= count) { free(blocks); return NDFS_ERR_OUT_OF_RANGE; }
+
+    for (pg = start_page; pg <= end_page; pg++) {
+        uint8_t *page;
+        size_t page_start, ov_start, ov_end;
+
+        if (pg >= count) { free(blocks); return NDFS_ERR_OUT_OF_RANGE; }
+        if (blocks[pg] == 0) { free(blocks); return NDFS_ERR_CORRUPT; }
+
+        page = write_page_ptr(fs, blocks[pg]);
+        if (!page) { free(blocks); return NDFS_ERR_CORRUPT; }
+
+        page_start = pg * NDFS_PAGE_SIZE;
+        ov_start = file_offset > page_start ? file_offset : page_start;
+        ov_end = end < page_start + NDFS_PAGE_SIZE ? end : page_start + NDFS_PAGE_SIZE;
+
+        memcpy(page + (ov_start - page_start),
+               data + (ov_start - file_offset),
+               ov_end - ov_start);
+    }
+
+    free(blocks);
+    return NDFS_OK;
+}
+
 ndfs_error_t ndfs_file_exists(const ndfs_filesystem_t *fs, const char *path,
                               bool *out_exists)
 {

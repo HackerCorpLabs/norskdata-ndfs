@@ -103,6 +103,7 @@ golden (byte-compare on-disk where applicable, plus semantic asserts).
 | I | Multi-version | `ls` shows `;1`,`;2`…; version chain pointers correct vs RC/SINTRAN |
 | J | XAT round-trip | export then import reproduces all metadata |
 | K | Quota add/remove, password set/clear | values + byte layout |
+| L | SINTRAN initial commands | locate via segment table + INIBU; **self-consistency guard** (reject coincidental parse); encode/parse round-trip (textLen 54/74); in-place `patch_file_region`; repair a header-corrupted buffer. C `test_sintran.c` / py `test_sintran.py` / ts `sintran.test.ts` all green. End-to-end vs a real pack validated in RFS; see [SINTRAN-INITIAL-COMMANDS-SPEC.md](SINTRAN-INITIAL-COMMANDS-SPEC.md) |
 
 **Exit criteria:** every cell green in all four implementations against RC.
 

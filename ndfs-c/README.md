@@ -245,6 +245,7 @@ All free functions are no-ops when passed NULL.
 - On-disk format (endian, block pointers, master block, entries)
 - Image creation (all 5 templates, pointer placement, bitmap)
 - Boot loader detection (BPUN, FLOMON, Binary, None)
+- SINTRAN initial-command buffer: read / write / repair (`ndfs_read_initial_commands`, `ndfs_write_initial_commands`, `ndfs_repair_initial_commands`; see [../../docs/SINTRAN-INITIAL-COMMANDS-SPEC.md](../../docs/SINTRAN-INITIAL-COMMANDS-SPEC.md))
 - Read/write operations (small, multi-page, overwrite, delete, rename)
 - Write persistence (export/reimport round-trips)
 - Sparse files, user management, bitmap queries
