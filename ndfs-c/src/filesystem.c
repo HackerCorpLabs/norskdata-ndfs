@@ -1939,6 +1939,27 @@ void ndfs_free_data(uint8_t *data)
 
 /* ── Write operations ────────────────────────────────────────────── */
 
+/* Commit all dirty pages to the backend NOW, folding in a prior error.
+ *
+ * Called at the tail of every public mutation so the on-disk image tracks each
+ * change immediately -- restoring RetroCore's immediate surgical-write model
+ * rather than deferring every write to ndfs_close(). Two wins over close-only
+ * flushing: (1) a crash between operations no longer loses committed writes,
+ * and (2) a backend write failure is REPORTED to the caller here instead of
+ * being silently swallowed by the void ndfs_close().
+ *
+ * If `prior` already indicates failure we return it unchanged and do NOT force
+ * a commit (a half-done mutation is left for ndfs_close to flush, exactly as a
+ * mid-operation failure behaves under the immediate-write reference too). On
+ * success the return is the flush result. Cheap when nothing is dirty: a single
+ * pass over NDFS_CACHE_SLOTS (8) slots writing only the pages actually touched;
+ * pages already flushed by a previous commit this session are clean and skipped. */
+static ndfs_error_t commit_writes(struct ndfs_filesystem *fs, ndfs_error_t prior)
+{
+    if (prior != NDFS_OK) return prior;
+    return cache_flush_all(fs);
+}
+
 ndfs_error_t ndfs_write_file_parity(ndfs_filesystem_t *fs,
                                     const char *path,
                                     const uint8_t *file_data,
@@ -2040,8 +2061,9 @@ ndfs_error_t ndfs_write_file(ndfs_filesystem_t *fs,
     }
 
     /* create_new_file / update_existing_file performed their own surgical
-     * metadata writes (object page, owner user page, bitmap). */
-    return err;
+     * metadata writes (object page, owner user page, bitmap); commit them (and
+     * the index/data pages) to the backend now. */
+    return commit_writes(fs, err);
 }
 
 ndfs_error_t ndfs_delete_file(ndfs_filesystem_t *fs, const char *path)
@@ -2098,7 +2120,7 @@ ndfs_error_t ndfs_delete_file(ndfs_filesystem_t *fs, const char *path)
         write_bit_file(fs);
     }
 
-    return NDFS_OK;
+    return commit_writes(fs, NDFS_OK);
 }
 
 ndfs_error_t ndfs_rename(ndfs_filesystem_t *fs,
@@ -2136,7 +2158,7 @@ ndfs_error_t ndfs_rename(ndfs_filesystem_t *fs,
     str_toupper(fs->objects[idx].type);
 
     /* Rename touches only this file's object entry. */
-    return write_object_page(fs, fs->objects[idx].object_index);
+    return commit_writes(fs, write_object_page(fs, fs->objects[idx].object_index));
 }
 
 /* ── User management ─────────────────────────────────────────────── */
@@ -2230,7 +2252,7 @@ ndfs_error_t ndfs_add_user(ndfs_filesystem_t *fs,
     write_user_page(fs, (uint32_t)slot);
     write_bit_file(fs);
 
-    return NDFS_OK;
+    return commit_writes(fs, NDFS_OK);
 }
 
 ndfs_error_t ndfs_remove_user(ndfs_filesystem_t *fs, uint8_t index)
@@ -2250,7 +2272,7 @@ ndfs_error_t ndfs_remove_user(ndfs_filesystem_t *fs, uint8_t index)
     fs->user_count--;
 
     /* Remove-user touches only this user's UserFile page (slot zeroed). */
-    return write_user_page(fs, index);
+    return commit_writes(fs, write_user_page(fs, index));
 }
 
 ndfs_error_t ndfs_update_user_quota(ndfs_filesystem_t *fs,
@@ -2267,7 +2289,7 @@ ndfs_error_t ndfs_update_user_quota(ndfs_filesystem_t *fs,
 
     fs->users[slot].pages_reserved = new_pages;
 
-    return write_user_page(fs, index);
+    return commit_writes(fs, write_user_page(fs, index));
 }
 
 ndfs_error_t ndfs_clear_user_password(ndfs_filesystem_t *fs, const char *name)
@@ -2282,7 +2304,7 @@ ndfs_error_t ndfs_clear_user_password(ndfs_filesystem_t *fs, const char *name)
 
     fs->users[slot].password = 0;
 
-    return write_user_page(fs, fs->users[slot].user_index);
+    return commit_writes(fs, write_user_page(fs, fs->users[slot].user_index));
 }
 
 ndfs_error_t ndfs_clear_user_password_by_index(ndfs_filesystem_t *fs,
@@ -2298,7 +2320,7 @@ ndfs_error_t ndfs_clear_user_password_by_index(ndfs_filesystem_t *fs,
 
     fs->users[slot].password = 0;
 
-    return write_user_page(fs, index);
+    return commit_writes(fs, write_user_page(fs, index));
 }
 
 /* ── Friends ─────────────────────────────────────────────────────── */
@@ -2443,7 +2465,7 @@ ndfs_error_t ndfs_add_friend(ndfs_filesystem_t *fs, const char *user_ref,
     if (!ndfs_ue_add_friend(&fs->users[owner_slot], friend_index, perm_bits))
         return NDFS_ERR_NO_SLOTS;
 
-    return write_user_page(fs, fs->users[owner_slot].user_index);
+    return commit_writes(fs, write_user_page(fs, fs->users[owner_slot].user_index));
 }
 
 ndfs_error_t ndfs_remove_friend(ndfs_filesystem_t *fs, const char *user_ref,
@@ -2465,7 +2487,7 @@ ndfs_error_t ndfs_remove_friend(ndfs_filesystem_t *fs, const char *user_ref,
     if (!ndfs_ue_remove_friend(&fs->users[owner_slot], friend_index))
         return NDFS_ERR_NOT_FOUND;
 
-    return write_user_page(fs, fs->users[owner_slot].user_index);
+    return commit_writes(fs, write_user_page(fs, fs->users[owner_slot].user_index));
 }
 
 /* ── Read operations (extended) ──────────────────────────────────── */
@@ -2575,7 +2597,8 @@ ndfs_error_t ndfs_patch_file_region(ndfs_filesystem_t *fs, const char *path,
     }
 
     free(blocks);
-    return NDFS_OK;
+    /* Commit the patched data pages to the backend immediately. */
+    return commit_writes(fs, NDFS_OK);
 }
 
 ndfs_error_t ndfs_file_exists(const ndfs_filesystem_t *fs, const char *path,
@@ -2603,7 +2626,7 @@ ndfs_error_t ndfs_set_file_access(ndfs_filesystem_t *fs, const char *path,
 
     fs->objects[idx].access_bits = access_bits & 0x7FFF;
     /* Access change touches only this file's object entry. */
-    return write_object_page(fs, fs->objects[idx].object_index);
+    return commit_writes(fs, write_object_page(fs, fs->objects[idx].object_index));
 }
 
 ndfs_error_t ndfs_get_metadata(const ndfs_filesystem_t *fs, const char *path,

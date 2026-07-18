@@ -12,6 +12,11 @@
  * A page is NDFS_PAGE_SIZE (2048) bytes.  Byte offset of page N in the
  * image is N * NDFS_PAGE_SIZE.  Everything is whole pages.
  *
+ * THREAD-SAFETY: an ndfs_filesystem_t handle carries a mutable page cache, so a
+ * single handle is NOT safe for concurrent use -- not even for concurrent
+ * readers (a read updates cache LRU/pin state). Give each thread/task its own
+ * handle by opening the image independently.
+ *
  * SPDX-License-Identifier: MIT
  * Copyright (c) 1985-2026 Ronny Hansen
  * HackerCorp Labs - https://github.com/HackerCorpLabs

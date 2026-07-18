@@ -263,6 +263,46 @@ static int test_open_block_failure_paths(void)
 }
 
 #ifdef NDFS_WITH_STDIO_BACKEND
+/* ── Test: writes are committed to the backend PER MUTATION, not just at close.
+ * Open a writable host-file handle, write a file, and -- WITHOUT closing that
+ * handle -- open a SECOND independent read-only handle on the same path. The
+ * new file must already be visible, proving ndfs_write_file flushed the dirty
+ * pages to disk when it returned (write-back committed per mutation), rather
+ * than deferring everything to ndfs_close. */
+static int test_hostfile_commit_per_mutation(void)
+{
+    uint8_t *ref = NULL;
+    size_t   ref_size = 0;
+    uint8_t  d[400];
+    size_t   i;
+    ndfs_filesystem_t *w = NULL, *r = NULL;
+    FILE    *f;
+
+    ref = build_reference_image(&ref_size);
+    TEST_ASSERT_NOT_NULL(ref);
+    f = fopen(STDIO_TMP_IMAGE, "wb");
+    TEST_ASSERT_NOT_NULL(f);
+    TEST_ASSERT_EQUAL(ref_size, fwrite(ref, 1, ref_size, f));
+    fclose(f);
+    free(ref);
+
+    for (i = 0; i < 400; i++) d[i] = (uint8_t)(i * 3 + 2);
+
+    /* Writable handle -- write a new file but DO NOT close it. */
+    TEST_ASSERT_OK(ndfs_open_file(STDIO_TMP_IMAGE, false, &w));
+    TEST_ASSERT_OK(ndfs_write_file(w, "SYSTEM/DDD:DAT", d, 400));
+
+    /* Second, independent read-only view of the same on-disk file must already
+     * see the committed write -- w is still open (no close-flush has run). */
+    TEST_ASSERT_OK(ndfs_open_file(STDIO_TMP_IMAGE, true, &r));
+    TEST_ASSERT_EQUAL(0, check_file(r, "SYSTEM/DDD:DAT", d, 400));
+    ndfs_close(r);
+
+    ndfs_close(w);
+    remove(STDIO_TMP_IMAGE);
+    return 0;
+}
+
 /* A sub-page host file (total_pages == 0) must fail without stranding the FILE*
  * the backend opened.  Before the fix ndfs_open_block returned early and leaked
  * both the FILE* and the ctx; now open_internal drives the destroy hook. */
@@ -293,6 +333,7 @@ void run_backend_stdio_tests(void)
 #ifdef NDFS_WITH_STDIO_BACKEND
     RUN_TEST(test_hostfile_equivalence);
     RUN_TEST(test_hostfile_write_persists);
+    RUN_TEST(test_hostfile_commit_per_mutation);
     RUN_TEST(test_hostfile_subpage_clean_fail);
 #endif
 }

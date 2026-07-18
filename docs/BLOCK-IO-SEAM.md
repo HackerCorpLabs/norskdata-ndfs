@@ -100,14 +100,28 @@ Two mechanisms keep pointers valid:
 
 The cache is **keyed by `page_id`** (a page occupies at most one slot), so a
 read and a write of the same page alias the *same* slot — preserving the in-place
-mutation the write path relies on. Writes are **write-back**: `write_page_ptr`
-marks the slot dirty; the dirty page is pushed to the backend via `write_block`
-on eviction, on unpin, and on `ndfs_close`.
+mutation the write path relies on. Writes are **write-back within an operation**:
+`write_page_ptr` marks the slot dirty, and the dirty page is pushed to the
+backend via `write_block` on eviction, and **committed at the end of every
+public mutation** (`ndfs_write_file`, `ndfs_delete_file`, the user/friend/access
+ops, `ndfs_patch_file_region`, …) by `commit_writes()`. `ndfs_close` performs a
+final flush as a safety net.
 
-> **Durability note.** Because writes are write-back, a writable handle must be
-> closed (`ndfs_close`) to guarantee all dirty pages reach the backend. Same-handle
-> reads and `ndfs_to_buffer` are always coherent (they see the dirty cache), so
-> only cross-handle persistence depends on the close-time flush.
+> **Durability & error reporting.** Each public mutation commits its touched
+> pages to the backend before returning, restoring RetroCore's immediate
+> surgical-write model — a crash *between* operations does not lose committed
+> writes. A backend write failure is now **returned** from the mutating call
+> (`NDFS_ERR_IO`) instead of being silently swallowed by the `void ndfs_close`.
+> Within a single operation, writes are still batched in the cache (so a crash
+> *mid-operation* can leave a partial update — same as the immediate-write
+> reference, which is likewise non-transactional).
+
+> **Concurrency.** An `ndfs_filesystem_t` handle now carries mutable cache state
+> (`read_page` updates LRU/pins even on the read path). A handle is therefore
+> **not safe for concurrent use** — not even for concurrent readers. Give each
+> thread/task its own handle (open the same image independently). This differs
+> from the pre-seam library, where reads were pure and a handle could be shared
+> read-only.
 
 ### Which functions pin (audit)
 
@@ -146,6 +160,12 @@ inner `read_page`/`write_page_ptr` calls, **pin it**.
   `read_block`/`write_block` are `fseek`+`fread`/`fwrite`, each write `fflush`ed.
   Opener: `ndfs_open_file(path, read_only, &fs)` (`rb` for read-only, `r+b`
   otherwise — the image must already exist).
+  **Size limit:** the offset is computed with `long` (`fseek`/`ftell`), which is
+  32-bit on LLP64 Windows, so the host-file backend supports images up to
+  ~2 GiB there — far above the SMD-75MB / Winchester-74MB templates. For images
+  beyond 2 GiB on Windows, switch `stdio_seek_page`/size probing to
+  `_fseeki64`/`_ftelli64` (or `fseeko`/`ftello` on POSIX). Consumers of larger
+  media use their own `ndfs_open_block` backend with 64-bit offsets.
 
 The **embedded backend is not shipped here** — the consumer fills `ndfs_block_io`
 with its own media routines and calls `ndfs_open_block`.
