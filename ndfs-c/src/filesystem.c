@@ -27,12 +27,55 @@
 #define NDFS_MAX_OBJECT_FILE_PAGES \
     ((uint32_t)NDFS_MAX_OBJECT_FILE_PTRS * (uint32_t)NDFS_MAX_OBJECT_FILE_PTRS)
 
+/* ── Page cache ──────────────────────────────────────────────────────
+ *
+ * The whole image is no longer resident: pages are pulled/pushed through
+ * fs->io (the ndfs_block_io seam) and only a handful are held in RAM at a
+ * time.  read_page()/write_page_ptr() hand out a pointer INTO a cache slot
+ * and callers keep using it, so a slot must not be reused while a live
+ * pointer references it.
+ *
+ * Two safety mechanisms, together:
+ *   1. LRU eviction only ever picks an UNPINNED slot.  A raw pointer deref
+ *      (e.g. ndfs_bp_from_bytes(page, ...)) does NOT refresh a slot's LRU
+ *      stamp, so a pointer held across N distinct read_page() calls survives
+ *      only while fewer than NDFS_CACHE_SLOTS-1 other pages are touched
+ *      in between.
+ *   2. Any pointer held across an UNBOUNDED loop of page loads (an outer
+ *      index page walked while reading its data pages) is explicitly pinned
+ *      with cache_pin()/cache_unpin() so LRU can never evict it.  The worst
+ *      real chain holds 3 pages live at once (sub-index + group-index +
+ *      data); at most 2 are ever pinned simultaneously.  8 slots gives
+ *      generous headroom and keeps short-lived (bounded) holders safe under
+ *      rule 1 without needing a pin.
+ *
+ * Writes are write-back: write_page_ptr() marks a slot dirty; the dirty page
+ * is pushed to the backend via write_block on eviction, on unpin, and on
+ * close.  Because the cache is keyed by page_id (a page occupies at most one
+ * slot), a read and a write of the same page alias the SAME slot, preserving
+ * the in-place aliasing the write path relies on. */
+
+#define NDFS_CACHE_SLOTS 8   /* 8 x 2048 = 16 KiB resident page window */
+
+typedef struct {
+    uint32_t page_id;   /* which page this slot holds (valid only if `valid`) */
+    bool     valid;     /* slot currently holds a loaded page */
+    bool     dirty;     /* holds unflushed writes; push to backend before reuse */
+    uint32_t pin;       /* >0: pointer still in use, never evict this slot */
+    uint32_t lru;       /* last-touch tick; lowest among unpinned slots is victim */
+    uint8_t  buf[NDFS_PAGE_SIZE];
+} ndfs_page_slot;
+
 struct ndfs_filesystem {
-    uint8_t            *data;
-    size_t              size;
+    ndfs_block_io       io;          /* the one storage path (backend vtable) */
+    uint32_t            total_pages; /* image size in whole pages */
+    size_t              size;        /* total_pages * NDFS_PAGE_SIZE (working size) */
     bool                read_only;
-    bool                owns_buffer;
     bool                unaligned;   /* image size was not a whole multiple of NDFS_PAGE_SIZE */
+
+    /* Page cache (see block above). */
+    ndfs_page_slot      cache[NDFS_CACHE_SLOTS];
+    uint32_t            lru_clock;
 
     ndfs_master_block_t master_block;
     ndfs_bit_file_t     bit_file;
@@ -93,18 +136,125 @@ static void persist_master_block(struct ndfs_filesystem *fs);
 
 /* ── Helpers ─────────────────────────────────────────────────────── */
 
-static const uint8_t *read_page(const struct ndfs_filesystem *fs, uint32_t block_id)
+/* Push a dirty slot back to the backend, then mark it clean. Returns false
+ * only if the backend's write_block fails (I/O error). A clean or invalid
+ * slot is a no-op success. */
+static bool cache_flush_slot(struct ndfs_filesystem *fs, ndfs_page_slot *slot)
 {
-    size_t offset = (size_t)block_id * NDFS_PAGE_SIZE;
-    if (offset + NDFS_PAGE_SIZE > fs->size) return NULL;
-    return fs->data + offset;
+    if (!slot->valid || !slot->dirty) return true;
+    if (!fs->io.write_block) return false;   /* read-only backend, can't flush */
+    if (!fs->io.write_block(fs->io.ctx, slot->page_id, slot->buf)) return false;
+    slot->dirty = false;
+    return true;
 }
 
+/* Flush every dirty slot (used by close and by ndfs_to_buffer). Returns the
+ * first error encountered, or NDFS_OK. */
+static ndfs_error_t cache_flush_all(struct ndfs_filesystem *fs)
+{
+    size_t i;
+    for (i = 0; i < NDFS_CACHE_SLOTS; i++) {
+        if (!cache_flush_slot(fs, &fs->cache[i])) return NDFS_ERR_IO;
+    }
+    return NDFS_OK;
+}
+
+/* Locate the slot already holding `page_id`, or NULL if not cached. */
+static ndfs_page_slot *cache_find(struct ndfs_filesystem *fs, uint32_t page_id)
+{
+    size_t i;
+    for (i = 0; i < NDFS_CACHE_SLOTS; i++) {
+        if (fs->cache[i].valid && fs->cache[i].page_id == page_id) {
+            return &fs->cache[i];
+        }
+    }
+    return NULL;
+}
+
+/* Choose an eviction victim: prefer an invalid slot, else the least-recently
+ * used UNPINNED slot. Returns NULL only if every slot is pinned (a caller
+ * release-discipline bug -- can't happen while max simultaneous pins << slots). */
+static ndfs_page_slot *cache_victim(struct ndfs_filesystem *fs)
+{
+    ndfs_page_slot *victim = NULL;
+    size_t i;
+    for (i = 0; i < NDFS_CACHE_SLOTS; i++) {
+        ndfs_page_slot *s = &fs->cache[i];
+        if (!s->valid) return s;                 /* free slot: best choice */
+        if (s->pin > 0) continue;                /* pinned: never evict */
+        if (!victim || s->lru < victim->lru) victim = s;
+    }
+    return victim;
+}
+
+/* Core cache access shared by read_page/write_page_ptr. Returns the slot
+ * holding `page_id` (loading it via the backend if needed), or NULL on I/O
+ * failure / exhausted cache. `for_write` marks the slot dirty. */
+static ndfs_page_slot *cache_get(struct ndfs_filesystem *fs, uint32_t page_id,
+                                 bool for_write)
+{
+    ndfs_page_slot *slot;
+
+    if (page_id >= fs->total_pages) return NULL;   /* out of range, as before */
+
+    slot = cache_find(fs, page_id);
+    if (!slot) {
+        slot = cache_victim(fs);
+        if (!slot) return NULL;                    /* all slots pinned: bug */
+        if (!cache_flush_slot(fs, slot)) return NULL;  /* evict old dirty page */
+        if (!fs->io.read_block(fs->io.ctx, page_id, slot->buf)) return NULL;
+        slot->page_id = page_id;
+        slot->valid   = true;
+        slot->dirty   = false;
+        slot->pin     = 0;
+    }
+    slot->lru = ++fs->lru_clock;                   /* touch: most-recently used */
+    if (for_write) slot->dirty = true;
+    return slot;
+}
+
+/* Fetch page `block_id` for reading. The returned pointer is valid until the
+ * slot is evicted; hold it across other page accesses only under a cache_pin
+ * (see the page-cache note above).
+ *
+ * Takes `const fs` because reading logically doesn't change the filesystem,
+ * but the page cache IS mutable state hung off the handle -- so we cast the
+ * const away to touch it, the way a C++ `mutable` member would. The handle is
+ * always a live heap object, never truly const, so this is safe. */
+static const uint8_t *read_page(const struct ndfs_filesystem *fs, uint32_t block_id)
+{
+    struct ndfs_filesystem *m = (struct ndfs_filesystem *)(uintptr_t)fs;
+    ndfs_page_slot *slot = cache_get(m, block_id, false);
+    return slot ? slot->buf : NULL;
+}
+
+/* Fetch page `block_id` for writing (marks it dirty; flushed to the backend
+ * on eviction/unpin/close). Same page_id as a concurrent read_page returns the
+ * SAME slot, so in-place mutation followed by a re-read is coherent. */
 static uint8_t *write_page_ptr(struct ndfs_filesystem *fs, uint32_t block_id)
 {
-    size_t offset = (size_t)block_id * NDFS_PAGE_SIZE;
-    if (offset + NDFS_PAGE_SIZE > fs->size) return NULL;
-    return fs->data + offset;
+    ndfs_page_slot *slot = cache_get(fs, block_id, true);
+    return slot ? slot->buf : NULL;
+}
+
+/* Pin the slot holding `page_id` so LRU cannot evict it while a caller keeps
+ * a live pointer into it across an unbounded loop of other page accesses.
+ * The page must already be resident (call right after read_page/write_page_ptr
+ * of the same id). No-op if not found (defensive). */
+static void cache_pin(const struct ndfs_filesystem *fs, uint32_t page_id)
+{
+    struct ndfs_filesystem *m = (struct ndfs_filesystem *)(uintptr_t)fs;
+    ndfs_page_slot *slot = cache_find(m, page_id);
+    if (slot) slot->pin++;
+}
+
+/* Release a pin taken by cache_pin. Dirty pages are NOT flushed here -- they
+ * stay dirty until eviction/close, which keeps surgical writes cheap. */
+static void cache_unpin(const struct ndfs_filesystem *fs, uint32_t page_id)
+{
+    struct ndfs_filesystem *m = (struct ndfs_filesystem *)(uintptr_t)fs;
+    ndfs_page_slot *slot = cache_find(m, page_id);
+    if (slot && slot->pin > 0) slot->pin--;
 }
 
 static void str_toupper(char *s)
@@ -299,6 +449,9 @@ static ndfs_error_t load_structures(struct ndfs_filesystem *fs)
     if (ndfs_bp_is_valid(&mb->user_file_ptr)) {
         const uint8_t *index_page = read_page(fs, mb->user_file_ptr.block_id);
         if (!index_page) return NDFS_ERR_CORRUPT;
+        /* index_page is held across the data-page reads below (up to 8 of
+         * them) -- pin it so LRU can't evict its slot mid-loop. */
+        cache_pin(fs, mb->user_file_ptr.block_id);
 
         /* Read up to 8 pointers from the index block */
         for (i = 0; i < NDFS_MAX_USER_FILE_PTRS; i++) {
@@ -323,6 +476,7 @@ static ndfs_error_t load_structures(struct ndfs_filesystem *fs)
                 }
             }
         }
+        cache_unpin(fs, mb->user_file_ptr.block_id);
     }
 
     /* Load object file */
@@ -331,6 +485,8 @@ static ndfs_error_t load_structures(struct ndfs_filesystem *fs)
             const uint8_t *idx_page = read_page(fs, mb->object_file_ptr.block_id);
             uint32_t global_idx = 0;
             if (!idx_page) return NDFS_ERR_CORRUPT;
+            /* idx_page held across up to 512 data-page reads -- pin it. */
+            cache_pin(fs, mb->object_file_ptr.block_id);
 
             for (i = 0; i < NDFS_MAX_OBJECT_FILE_PTRS; i++) {
                 ndfs_block_pointer_t ptr = ndfs_bp_from_bytes(idx_page, i * 4);
@@ -359,10 +515,13 @@ static ndfs_error_t load_structures(struct ndfs_filesystem *fs)
                 }
                 global_idx += NDFS_ENTRIES_PER_PAGE;
             }
+            cache_unpin(fs, mb->object_file_ptr.block_id);
         } else if (mb->object_file_ptr.type == NDFS_PTR_SUBINDEXED) {
             const uint8_t *sub_idx_page = read_page(fs, mb->object_file_ptr.block_id);
             uint32_t global_idx = 0;
             if (!sub_idx_page) return NDFS_ERR_CORRUPT;
+            /* sub_idx_page held across the whole walk -- pin it. */
+            cache_pin(fs, mb->object_file_ptr.block_id);
 
             for (i = 0; i < NDFS_MAX_OBJECT_FILE_PTRS; i++) {
                 ndfs_block_pointer_t idx_ptr = ndfs_bp_from_bytes(sub_idx_page, i * 4);
@@ -372,6 +531,9 @@ static ndfs_error_t load_structures(struct ndfs_filesystem *fs)
 
                 idx_page = read_page(fs, idx_ptr.block_id);
                 if (!idx_page) continue;
+                /* idx_page held across its 512 data-page reads -- pin it too
+                 * (sub_idx + idx + data = the deepest 3-page live chain). */
+                cache_pin(fs, idx_ptr.block_id);
 
                 for (k = 0; k < NDFS_MAX_OBJECT_FILE_PTRS; k++) {
                     ndfs_block_pointer_t ptr = ndfs_bp_from_bytes(idx_page, k * 4);
@@ -399,7 +561,9 @@ static ndfs_error_t load_structures(struct ndfs_filesystem *fs)
                     }
                     global_idx += NDFS_ENTRIES_PER_PAGE;
                 }
+                cache_unpin(fs, idx_ptr.block_id);
             }
+            cache_unpin(fs, mb->object_file_ptr.block_id);
         }
     }
 
@@ -463,6 +627,8 @@ static ndfs_error_t read_indexed_data(const struct ndfs_filesystem *fs,
     size_t i;
 
     if (!index_page) return NDFS_ERR_CORRUPT;
+    /* index_page held across up to 512 data-page reads -- pin it. */
+    cache_pin(fs, index_block_id);
 
     for (i = 0; i < NDFS_MAX_OBJECT_FILE_PTRS && bytes_read < bytes_in_file; i++) {
         ndfs_block_pointer_t ptr = ndfs_bp_from_bytes(index_page, i * 4);
@@ -474,11 +640,12 @@ static ndfs_error_t read_indexed_data(const struct ndfs_filesystem *fs,
             bytes_read += to_copy;
         } else {
             const uint8_t *page = read_page(fs, ptr.block_id);
-            if (!page) return NDFS_ERR_CORRUPT;
+            if (!page) { cache_unpin(fs, index_block_id); return NDFS_ERR_CORRUPT; }
             memcpy(result + bytes_read, page, to_copy);
             bytes_read += to_copy;
         }
     }
+    cache_unpin(fs, index_block_id);
     return NDFS_OK;
 }
 
@@ -492,6 +659,9 @@ static ndfs_error_t read_subindexed_data(const struct ndfs_filesystem *fs,
     size_t si, i;
 
     if (!sub_page) return NDFS_ERR_CORRUPT;
+    /* sub_page held across the whole walk; idx_page across each inner loop.
+     * These two + the transient data page are the deepest 3-page live chain. */
+    cache_pin(fs, sub_index_block_id);
 
     for (si = 0; si < NDFS_MAX_OBJECT_FILE_PTRS && bytes_read < bytes_in_file; si++) {
         ndfs_block_pointer_t idx_ptr = ndfs_bp_from_bytes(sub_page, si * 4);
@@ -500,6 +670,7 @@ static ndfs_error_t read_subindexed_data(const struct ndfs_filesystem *fs,
 
         idx_page = read_page(fs, idx_ptr.block_id);
         if (!idx_page) continue;
+        cache_pin(fs, idx_ptr.block_id);
 
         for (i = 0; i < NDFS_MAX_OBJECT_FILE_PTRS && bytes_read < bytes_in_file; i++) {
             ndfs_block_pointer_t data_ptr = ndfs_bp_from_bytes(idx_page, i * 4);
@@ -510,12 +681,18 @@ static ndfs_error_t read_subindexed_data(const struct ndfs_filesystem *fs,
                 bytes_read += to_copy;
             } else {
                 const uint8_t *page = read_page(fs, data_ptr.block_id);
-                if (!page) return NDFS_ERR_CORRUPT;
+                if (!page) {
+                    cache_unpin(fs, idx_ptr.block_id);
+                    cache_unpin(fs, sub_index_block_id);
+                    return NDFS_ERR_CORRUPT;
+                }
                 memcpy(result + bytes_read, page, to_copy);
                 bytes_read += to_copy;
             }
         }
+        cache_unpin(fs, idx_ptr.block_id);
     }
+    cache_unpin(fs, sub_index_block_id);
     return NDFS_OK;
 }
 
@@ -587,6 +764,8 @@ static void free_file_blocks(struct ndfs_filesystem *fs,
         const uint8_t *sub_page = read_page(fs, obj->file_pointer.block_id);
         size_t si;
         if (sub_page) {
+            /* sub_page held across each group-index read -- pin it. */
+            cache_pin(fs, obj->file_pointer.block_id);
             for (si = 0; si < NDFS_MAX_OBJECT_FILE_PTRS; si++) {
                 ndfs_block_pointer_t idx_ptr = ndfs_bp_from_bytes(sub_page, si * 4);
                 const uint8_t *idx_page;
@@ -600,6 +779,7 @@ static void free_file_blocks(struct ndfs_filesystem *fs,
                 }
                 ndfs_bf_mark_free(&fs->bit_file, idx_ptr.block_id);
             }
+            cache_unpin(fs, obj->file_pointer.block_id);
         }
         ndfs_bf_mark_free(&fs->bit_file, obj->file_pointer.block_id);
     }
@@ -647,6 +827,8 @@ static uint32_t count_real_data_pages_in_object(const struct ndfs_filesystem *fs
         const uint8_t *sub_page = read_page(fs, obj->file_pointer.block_id);
         size_t si;
         if (sub_page) {
+            /* sub_page held across each group-index read -- pin it. */
+            cache_pin(fs, obj->file_pointer.block_id);
             for (si = 0; si < NDFS_MAX_OBJECT_FILE_PTRS; si++) {
                 ndfs_block_pointer_t idx_ptr = ndfs_bp_from_bytes(sub_page, si * 4);
                 const uint8_t *idx_page;
@@ -659,6 +841,7 @@ static uint32_t count_real_data_pages_in_object(const struct ndfs_filesystem *fs
                     }
                 }
             }
+            cache_unpin(fs, obj->file_pointer.block_id);
         }
     }
     return count;
@@ -838,9 +1021,12 @@ static uint32_t ensure_user_dir_page(struct ndfs_filesystem *fs, uint32_t user_i
     memset(dp, 0, NDFS_PAGE_SIZE);
     newp.block_id = blk;
     newp.type = NDFS_PTR_CONTIGUOUS;
-    /* Re-fetch the index page pointer before writing the link, matching
-     * ensure_object_dir_page's style (both point into the same fs->data
-     * buffer, but re-fetching keeps this robust if that ever changes). */
+    /* Re-fetch the index page after allocating the data block above, rather
+     * than reusing the earlier pointer. With the block-IO page cache this
+     * re-fetch returns the SAME cache slot (the cache is keyed by page_id), so
+     * it is coherent and needs no pin -- and it stays correct no matter how the
+     * backend stores pages. (Previously both pointers were fixed offsets into
+     * the one resident fs->data image buffer.) */
     index_page = write_page_ptr(fs, mb->user_file_ptr.block_id);
     if (!index_page) return 0;
     ndfs_bp_to_bytes(&newp, index_page, page_idx * 4);
@@ -990,11 +1176,17 @@ static ndfs_error_t allocate_and_write_data(struct ndfs_filesystem *fs,
         if (!index_page_buf) return NDFS_ERR_CORRUPT;
         memset(index_page_buf, 0, NDFS_PAGE_SIZE);
 
+        /* index_page_buf is written into after each data page is allocated
+         * (write_data_page_to_index does write_page_ptr on the data block, then
+         * ndfs_bp_to_bytes into this buffer) -- pin it so its dirty slot can't
+         * be evicted mid-loop and its pointer stays live. */
+        cache_pin(fs, index_block_id);
         for (i = 0; i < data_pages; i++) {
             err = write_data_page_to_index(fs, file_data, file_size, i,
                                            index_page_buf, i);
-            if (err != NDFS_OK) return err;
+            if (err != NDFS_OK) { cache_unpin(fs, index_block_id); return err; }
         }
+        cache_unpin(fs, index_block_id);
 
         *out_top_block_id = index_block_id;
         *out_pointer_type = NDFS_PTR_INDEXED;
@@ -1016,13 +1208,15 @@ static ndfs_error_t allocate_and_write_data(struct ndfs_filesystem *fs,
         if (err != NDFS_OK) return NDFS_ERR_NO_SPACE;
         ndfs_bf_mark_used(&fs->bit_file, sub_index_block_id);
 
-        /* write_page_ptr() returns a pointer straight into fs->data, which is
-         * a fixed-size buffer for the lifetime of the filesystem (never
-         * reallocated), so this pointer stays valid across the allocations
-         * below -- no need to re-fetch it after allocating group blocks. */
+        /* sub_index_buf is held and written into across EVERY group-index and
+         * data-page allocation below (ndfs_bp_to_bytes at si*4 each loop), so
+         * its slot must survive the whole walk -- pin it. (Before the block-IO
+         * seam this pointer was a fixed offset into the resident image buffer
+         * and needed no protection; now it lives in an evictable cache slot.) */
         sub_index_buf = write_page_ptr(fs, sub_index_block_id);
         if (!sub_index_buf) return NDFS_ERR_CORRUPT;
         memset(sub_index_buf, 0, NDFS_PAGE_SIZE);
+        cache_pin(fs, sub_index_block_id);
 
         for (si = 0; si < num_index_blocks; si++) {
             uint32_t idx_block_id;
@@ -1035,7 +1229,7 @@ static ndfs_error_t allocate_and_write_data(struct ndfs_filesystem *fs,
             if (end_page > data_pages) end_page = data_pages;
 
             err = ndfs_bf_find_free(&fs->bit_file, &idx_block_id);
-            if (err != NDFS_OK) return NDFS_ERR_NO_SPACE;
+            if (err != NDFS_OK) { cache_unpin(fs, sub_index_block_id); return NDFS_ERR_NO_SPACE; }
             ndfs_bf_mark_used(&fs->bit_file, idx_block_id);
             struct_pages++;
 
@@ -1044,15 +1238,24 @@ static ndfs_error_t allocate_and_write_data(struct ndfs_filesystem *fs,
             ndfs_bp_to_bytes(&idx_ptr, sub_index_buf, si * 4);
 
             idx_page_buf = write_page_ptr(fs, idx_block_id);
-            if (!idx_page_buf) return NDFS_ERR_CORRUPT;
+            if (!idx_page_buf) { cache_unpin(fs, sub_index_block_id); return NDFS_ERR_CORRUPT; }
             memset(idx_page_buf, 0, NDFS_PAGE_SIZE);
+            /* idx_page_buf held across its data-page allocations -- pin it too
+             * (sub_index + group-index + data = the deepest 3-page chain). */
+            cache_pin(fs, idx_block_id);
 
             for (p = start_page; p < end_page; p++) {
                 err = write_data_page_to_index(fs, file_data, file_size, p,
                                                idx_page_buf, p - start_page);
-                if (err != NDFS_OK) return err;
+                if (err != NDFS_OK) {
+                    cache_unpin(fs, idx_block_id);
+                    cache_unpin(fs, sub_index_block_id);
+                    return err;
+                }
             }
+            cache_unpin(fs, idx_block_id);
         }
+        cache_unpin(fs, sub_index_block_id);
 
         *out_top_block_id = sub_index_block_id;
         *out_pointer_type = NDFS_PTR_SUBINDEXED;
@@ -1383,96 +1586,192 @@ static ndfs_error_t write_object_page(struct ndfs_filesystem *fs, uint32_t objec
  *  Public API
  * ══════════════════════════════════════════════════════════════════ */
 
-static ndfs_error_t open_internal(uint8_t *data, size_t size,
-                                  bool read_only, bool owns_buffer,
+/* ── Built-in buffer backend ─────────────────────────────────────────
+ *
+ * Wraps a flat in-RAM image; read_block/write_block are plain memcpy in/out.
+ * This is the library's historical behaviour, kept as one backend so the whole
+ * host test-suite drives the block-IO seam on every run.  ndfs_open_buffer /
+ * ndfs_open_buffer_copy install it; the only difference is who owns `data`. */
+typedef struct {
+    uint8_t *data;
+    size_t   size;   /* whole-page working size = total_pages * NDFS_PAGE_SIZE */
+    bool     owns;   /* true => free(data) on destroy (the _copy opener) */
+} ndfs_buffer_ctx;
+
+static bool buffer_read_block(void *ctx, uint32_t page_id, uint8_t *out)
+{
+    ndfs_buffer_ctx *b = (ndfs_buffer_ctx *)ctx;
+    size_t off = (size_t)page_id * NDFS_PAGE_SIZE;
+    if (off + NDFS_PAGE_SIZE > b->size) return false;
+    memcpy(out, b->data + off, NDFS_PAGE_SIZE);
+    return true;
+}
+
+static bool buffer_write_block(void *ctx, uint32_t page_id, const uint8_t *in)
+{
+    ndfs_buffer_ctx *b = (ndfs_buffer_ctx *)ctx;
+    size_t off = (size_t)page_id * NDFS_PAGE_SIZE;
+    if (off + NDFS_PAGE_SIZE > b->size) return false;
+    memcpy(b->data + off, in, NDFS_PAGE_SIZE);
+    return true;
+}
+
+static void buffer_destroy(void *ctx)
+{
+    ndfs_buffer_ctx *b = (ndfs_buffer_ctx *)ctx;
+    if (!b) return;
+    if (b->owns) free(b->data);
+    free(b);
+}
+
+/* Common open path: bind a block backend + page count, parse the master block
+ * and load the directory structures.  Takes the ndfs_block_io by value and
+ * OWNS it from here on: on any failure it invokes io.destroy (if set) so the
+ * caller never has to clean up a backend it already handed over. */
+static ndfs_error_t open_internal(ndfs_block_io io, uint32_t total_pages,
+                                  bool unaligned, bool read_only,
                                   ndfs_filesystem_t **out_fs)
 {
     struct ndfs_filesystem *fs;
     const uint8_t *page0;
     ndfs_error_t err;
 
-    size_t pages;
-
-    if (!data || !out_fs) return NDFS_ERR_NULL_PTR;
-    if (size < NDFS_PAGE_SIZE) return NDFS_ERR_TOO_SMALL;
-
-    /* Tolerate images that aren't a whole multiple of the page size (a common
-       dump artefact): work on whole pages only and drop the trailing partial
-       page, exactly as the reference ndfs does (floor(size / pagesize)). */
-    pages = size / NDFS_PAGE_SIZE;
+    if (!io.read_block || !out_fs) {
+        if (io.destroy) io.destroy(io.ctx);
+        return NDFS_ERR_NULL_PTR;
+    }
+    if (total_pages == 0) {
+        if (io.destroy) io.destroy(io.ctx);
+        return NDFS_ERR_TOO_SMALL;
+    }
 
     fs = (struct ndfs_filesystem *)calloc(1, sizeof(*fs));
-    if (!fs) return NDFS_ERR_ALLOC;
+    if (!fs) {
+        if (io.destroy) io.destroy(io.ctx);
+        return NDFS_ERR_ALLOC;
+    }
 
-    fs->data        = data;
-    fs->size        = pages * NDFS_PAGE_SIZE;   /* working size: whole pages only */
-    fs->unaligned   = (size % NDFS_PAGE_SIZE != 0);
-    /* Refuse mutation of an unaligned image: writing whole pages would not
-       round-trip the dropped tail.  Reads always work. */
-    fs->read_only   = read_only || fs->unaligned;
-    fs->owns_buffer = owns_buffer;
+    fs->io          = io;                                   /* fs now owns the backend */
+    fs->total_pages = total_pages;
+    fs->size        = (size_t)total_pages * NDFS_PAGE_SIZE; /* whole pages only */
+    fs->unaligned   = unaligned;
+    /* Refuse mutation of an unaligned image (writing whole pages would not
+       round-trip the dropped tail) or of a backend with no write_block.
+       Reads always work.  calloc left the cache all-invalid. */
+    fs->read_only   = read_only || unaligned || (io.write_block == NULL);
 
-    /* Parse master block */
+    /* From here every failure goes through ndfs_close(), which flushes (nothing
+       dirty yet), frees the bit file/objects, and calls the backend destroy. */
     page0 = read_page(fs, 0);
-    err = ndfs_mb_parse(page0, &fs->master_block);
-    if (err != NDFS_OK) { free(fs); return err; }
+    err = page0 ? ndfs_mb_parse(page0, &fs->master_block) : NDFS_ERR_IO;
+    if (err != NDFS_OK) { ndfs_close(fs); return err; }
 
     if (!ndfs_mb_is_valid(&fs->master_block)) {
-        free(fs);
+        ndfs_close(fs);
         return NDFS_ERR_INVALID_IMAGE;
     }
-    fs->master_block.image_size = (uint32_t)pages;
+    fs->master_block.image_size = total_pages;
 
-    /* Load structures */
     err = load_structures(fs);
-    if (err != NDFS_OK) {
-        ndfs_bf_destroy(&fs->bit_file);
-        free(fs->objects);
-        free(fs);
-        return err;
-    }
+    if (err != NDFS_OK) { ndfs_close(fs); return err; }
 
     *out_fs = fs;
     return NDFS_OK;
+}
+
+ndfs_error_t ndfs_open_block(const ndfs_block_io *io, uint32_t total_pages,
+                             bool read_only, ndfs_filesystem_t **out_fs)
+{
+    /* `io` itself must be non-NULL so we can dereference it (and reach any
+       destroy hook).  EVERY other check -- NULL read_block, zero total_pages,
+       NULL out_fs -- is delegated to open_internal precisely because it invokes
+       io.destroy on failure.  Handling them here with a bare `return` would
+       leak a backend that had already opened a resource: e.g. ndfs_open_file on
+       a sub-page image (total_pages == 0) would strand its FILE* and ctx. */
+    if (!io) return NDFS_ERR_NULL_PTR;
+    /* Block backends always deal in whole pages, so never "unaligned".  The
+       vtable is copied by value; the caller keeps ownership of io->ctx unless
+       it supplied a destroy hook. */
+    return open_internal(*io, total_pages, false, read_only, out_fs);
 }
 
 ndfs_error_t ndfs_open_buffer(const uint8_t *data, size_t size,
                               bool read_only,
                               ndfs_filesystem_t **out_fs)
 {
-    /* Cast away const: caller guarantees buffer stays alive.
-       We mark read_only or trust the caller for writes. */
-    return open_internal((uint8_t *)(uintptr_t)data, size,
-                         read_only, false, out_fs);
+    ndfs_buffer_ctx *ctx;
+    ndfs_block_io io;
+    uint32_t total_pages;
+    bool unaligned;
+
+    if (!data || !out_fs) return NDFS_ERR_NULL_PTR;
+    if (size < NDFS_PAGE_SIZE) return NDFS_ERR_TOO_SMALL;
+
+    /* Tolerate images that aren't a whole multiple of the page size (a common
+       dump artefact): work on whole pages only, exactly as before. */
+    total_pages = (uint32_t)(size / NDFS_PAGE_SIZE);
+    unaligned   = (size % NDFS_PAGE_SIZE != 0);
+
+    ctx = (ndfs_buffer_ctx *)malloc(sizeof(*ctx));
+    if (!ctx) return NDFS_ERR_ALLOC;
+    /* Cast away const: caller guarantees the buffer stays alive; we never free
+       it (owns = false).  read_only, if set, still gates every write. */
+    ctx->data = (uint8_t *)(uintptr_t)data;
+    ctx->size = (size_t)total_pages * NDFS_PAGE_SIZE;
+    ctx->owns = false;
+
+    io.read_block  = buffer_read_block;
+    io.write_block = buffer_write_block;
+    io.destroy     = buffer_destroy;
+    io.ctx         = ctx;
+
+    return open_internal(io, total_pages, unaligned, read_only, out_fs);
 }
 
 ndfs_error_t ndfs_open_buffer_copy(const uint8_t *data, size_t size,
                                    bool read_only,
                                    ndfs_filesystem_t **out_fs)
 {
+    ndfs_buffer_ctx *ctx;
+    ndfs_block_io io;
+    uint32_t total_pages;
+    bool unaligned;
     uint8_t *copy;
 
-    if (!data) return NDFS_ERR_NULL_PTR;
+    if (!data || !out_fs) return NDFS_ERR_NULL_PTR;
+    if (size < NDFS_PAGE_SIZE) return NDFS_ERR_TOO_SMALL;
+
+    total_pages = (uint32_t)(size / NDFS_PAGE_SIZE);
+    unaligned   = (size % NDFS_PAGE_SIZE != 0);
 
     copy = (uint8_t *)malloc(size);
     if (!copy) return NDFS_ERR_ALLOC;
     memcpy(copy, data, size);
 
-    {
-        ndfs_error_t err = open_internal(copy, size, read_only, true, out_fs);
-        if (err != NDFS_OK) {
-            free(copy);
-        }
-        return err;
-    }
+    ctx = (ndfs_buffer_ctx *)malloc(sizeof(*ctx));
+    if (!ctx) { free(copy); return NDFS_ERR_ALLOC; }
+    ctx->data = copy;
+    ctx->size = (size_t)total_pages * NDFS_PAGE_SIZE;
+    ctx->owns = true;   /* library owns the copy; buffer_destroy frees it */
+
+    io.read_block  = buffer_read_block;
+    io.write_block = buffer_write_block;
+    io.destroy     = buffer_destroy;
+    io.ctx         = ctx;
+
+    /* On failure open_internal calls buffer_destroy, which frees copy + ctx. */
+    return open_internal(io, total_pages, unaligned, read_only, out_fs);
 }
 
 void ndfs_close(ndfs_filesystem_t *fs)
 {
     if (!fs) return;
+    /* Write-back cache: push any unflushed pages to the backend before teardown.
+       (For read-only handles and the in-RAM buffer this is effectively free.) */
+    cache_flush_all(fs);
     ndfs_bf_destroy(&fs->bit_file);
     free(fs->objects);
-    if (fs->owns_buffer) free(fs->data);
+    if (fs->io.destroy) fs->io.destroy(fs->io.ctx);
     free(fs);
 }
 
@@ -2209,19 +2508,22 @@ ndfs_error_t ndfs_get_file_blocks(const ndfs_filesystem_t *fs, const char *path,
         uint32_t remaining = obj->pages_in_file;
         uint32_t si;
         if (!sib) { free(blocks); return NDFS_ERR_CORRUPT; }
+        /* sib held across each group-index read -- pin it. */
+        cache_pin(fs, obj->file_pointer.block_id);
         for (si = 0; si < 512 && remaining > 0; si++) {
             ndfs_block_pointer_t ip = ndfs_bp_from_bytes(sib, si * 4);
             const uint8_t *ib;
             uint32_t j;
             if (ip.block_id == 0) break;
             ib = read_page(fs, ip.block_id);
-            if (!ib) { free(blocks); return NDFS_ERR_CORRUPT; }
+            if (!ib) { cache_unpin(fs, obj->file_pointer.block_id); free(blocks); return NDFS_ERR_CORRUPT; }
             for (j = 0; j < 512 && remaining > 0; j++) {
                 ndfs_block_pointer_t dp = ndfs_bp_from_bytes(ib, j * 4);
                 blocks[n++] = dp.block_id;
                 remaining--;
             }
         }
+        cache_unpin(fs, obj->file_pointer.block_id);
     }
 
     *out_blocks = blocks;
@@ -2773,12 +3075,23 @@ ndfs_error_t ndfs_to_buffer(const ndfs_filesystem_t *fs,
                             size_t *out_size)
 {
     uint8_t *copy;
+    uint32_t i;
 
     if (!fs || !out_data || !out_size) return NDFS_ERR_NULL_PTR;
 
     copy = (uint8_t *)malloc(fs->size);
     if (!copy) return NDFS_ERR_ALLOC;
-    memcpy(copy, fs->data, fs->size);
+
+    /* Read every page through the seam rather than memcpy'ing a resident image
+       (there no longer is one).  read_page returns the current contents of each
+       page -- a dirty cache slot if the page was written this session, else a
+       fresh backend load -- so the snapshot reflects all pending writes. Each
+       returned pointer is used and dropped immediately (no pin needed). */
+    for (i = 0; i < fs->total_pages; i++) {
+        const uint8_t *page = read_page(fs, i);
+        if (!page) { free(copy); return NDFS_ERR_IO; }
+        memcpy(copy + (size_t)i * NDFS_PAGE_SIZE, page, NDFS_PAGE_SIZE);
+    }
 
     *out_data = copy;
     *out_size = fs->size;
@@ -2819,6 +3132,7 @@ const char *ndfs_strerror(ndfs_error_t err)
         case NDFS_ERR_HAS_FILES:    return "User has files";
         case NDFS_ERR_ALLOC:        return "Memory allocation failed";
         case NDFS_ERR_CORRUPT:      return "Filesystem data corrupt";
+        case NDFS_ERR_IO:           return "Block backend I/O failed";
         default:                    return "Unknown error";
     }
 }

@@ -14,13 +14,18 @@
 #include "user_entry.h"
 #include "object_entry.h"
 #include "xat.h"
+#include "block_io.h"   /* ndfs_block_io, ndfs_open_block, ndfs_open_file */
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/** Opaque filesystem handle. */
+/** Opaque filesystem handle.
+ *  (Guard matches block_io.h so the shared typedef appears once under C99.) */
+#ifndef NDFS_FILESYSTEM_T_DEFINED
+#define NDFS_FILESYSTEM_T_DEFINED
 typedef struct ndfs_filesystem ndfs_filesystem_t;
+#endif
 
 /* ── Lifecycle ───────────────────────────────────────────────────── */
 

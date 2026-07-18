@@ -20,6 +20,7 @@
 #include "parity.h"
 #include "wildmatch.h"
 #include "xat.h"
+#include "block_io.h"
 #include "filesystem.h"
 #include "image_creator.h"
 #include "boot_loader.h"

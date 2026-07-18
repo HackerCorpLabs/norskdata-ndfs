@@ -116,9 +116,30 @@ if (err == NDFS_OK) {
 |----------|-------------|
 | `ndfs_open_buffer(data, size, ro, &fs)` | Open from caller-owned buffer (no copy) |
 | `ndfs_open_buffer_copy(data, size, ro, &fs)` | Open by copying the buffer |
+| `ndfs_open_file(path, ro, &fs)` | Open straight from a host file (streams; host builds only) |
+| `ndfs_open_block(&io, total_pages, ro, &fs)` | Open over a custom block backend (see below) |
 | `ndfs_create_image(&fs, &opts)` | Create new image from template |
 | `ndfs_close(fs)` | Close and free all resources |
 | `ndfs_to_buffer(fs, &data, &size)` | Export image as malloc'd buffer |
+
+### Storage backends (the block-IO seam)
+
+The library never touches a flat image buffer directly — every page is fetched
+and stored through one small vtable (`ndfs_block_io`), so the *same* filesystem
+logic runs over three backends:
+
+| Backend | Opener | Use |
+|---------|--------|-----|
+| In-RAM buffer | `ndfs_open_buffer` / `ndfs_open_buffer_copy` | Fast host use; whole image in RAM |
+| Host file | `ndfs_open_file` | Streams a big image page-by-page from disk (host builds) |
+| Custom / embedded | `ndfs_open_block` | Consumer supplies `read_block`/`write_block` (e.g. an SD card) |
+
+Internally a small **pinned page cache** (16 KiB, 8 pages) keeps only a handful
+of pages resident, so an image far larger than RAM can be mounted. Writes are
+write-back and flushed on `ndfs_close`. The host-file backend is compiled only
+when `NDFS_WITH_STDIO_BACKEND` is defined (default **ON** for host builds, OFF
+for freestanding targets). See **[docs/BLOCK-IO-SEAM.md](../docs/BLOCK-IO-SEAM.md)**
+for the backend contract and a worked example.
 
 ### Read Operations
 

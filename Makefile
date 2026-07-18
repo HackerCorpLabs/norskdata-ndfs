@@ -15,6 +15,10 @@
 # ── Configuration ───────────────────────────────────────────────────
 C_DIR      := ndfs-c
 BUILD_DIR  := $(C_DIR)/build
+# Separate build trees for the sanitizer / valgrind runs so their special
+# compile flags never contaminate the normal Release build (and vice versa).
+SANE_DIR   := $(C_DIR)/build_sane
+VG_DIR     := $(C_DIR)/build_vg
 
 # Resolve cmake to an ABSOLUTE path up front. Under WSL the full Windows PATH
 # is appended (e.g. /mnt/c/Program Files/CMake/bin), and GNU make's direct
@@ -43,7 +47,7 @@ else
 endif
 
 .DEFAULT_GOAL := all
-.PHONY: all build release ndtool test test-c test-ts test-py \
+.PHONY: all build release ndtool test test-c test-asan test-valgrind test-ts test-py \
         ts py install clean distclean format help
 
 # ── Primary targets ─────────────────────────────────────────────────
@@ -80,6 +84,30 @@ test-c:
 	"$(CMAKE)" --build $(BUILD_DIR) --target ndfs_tests
 	"$(CTEST)" --test-dir $(BUILD_DIR) --output-on-failure
 
+## test-asan: build + run the C unit tests under AddressSanitizer + UBSan (Linux/WSL)
+# Instruments every C target (lib, tests, ndtool) via CMAKE_C_FLAGS -- which
+# CMake also places on the executable link line, so libasan/libubsan link in.
+# LeakSanitizer (part of ASan on Linux) is enabled with detect_leaks=1 so a
+# leaked malloc/FILE* fails the run; abort_on_error + halt_on_error make any
+# finding a non-zero exit. Uses its own build tree ($(SANE_DIR)).
+test-asan:
+	"$(CMAKE)" -S $(C_DIR) -B $(SANE_DIR) -G "$(GENERATOR)" -DCMAKE_BUILD_TYPE=Debug \
+		-DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+	"$(CMAKE)" --build $(SANE_DIR) --target ndfs_tests
+	ASAN_OPTIONS=detect_leaks=1:abort_on_error=1:detect_stack_use_after_return=1 \
+	UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+		./$(SANE_DIR)/ndfs_tests
+
+## test-valgrind: build (Debug) + run the C unit tests under Valgrind memcheck (Linux/WSL)
+# Do NOT combine with ASan -- Valgrind runs an UNinstrumented Debug build. Any
+# leak or invalid access makes valgrind exit non-zero (--error-exitcode=1).
+test-valgrind:
+	"$(CMAKE)" -S $(C_DIR) -B $(VG_DIR) -G "$(GENERATOR)" -DCMAKE_BUILD_TYPE=Debug
+	"$(CMAKE)" --build $(VG_DIR) --target ndfs_tests
+	valgrind --leak-check=full --show-leak-kinds=all --track-origins=yes \
+		--errors-for-leak-kinds=definite,indirect --error-exitcode=1 \
+		./$(VG_DIR)/ndfs_tests
+
 ## test-ts: run the TypeScript test suite
 test-ts ts:
 	cd ndfs-ts && npm install && npm test
@@ -96,9 +124,9 @@ install: ndtool
 	install -d "$(DESTDIR)$(PREFIX)/bin"
 	install -m 0755 "$(NDTOOL)" "$(DESTDIR)$(PREFIX)/bin/"
 
-## clean: remove the C build directory
+## clean: remove the C build directories (normal + sanitizer + valgrind)
 clean:
-	rm -rf $(BUILD_DIR)
+	rm -rf $(BUILD_DIR) $(SANE_DIR) $(VG_DIR)
 
 ## distclean: clean everything, including node_modules and Python caches
 distclean: clean

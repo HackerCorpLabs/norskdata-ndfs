@@ -35,6 +35,7 @@ typedef int ndfs_error_t;
 #define NDFS_ERR_HAS_FILES      -12
 #define NDFS_ERR_ALLOC          -13
 #define NDFS_ERR_CORRUPT        -14
+#define NDFS_ERR_IO             -15   /* block backend read/write failed */
 
 /* ── Constants ───────────────────────────────────────────────────── */
 

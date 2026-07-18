@@ -29,6 +29,7 @@ extern void run_xat_copy_tests(void);
 extern void run_parity_tests(void);
 extern void run_wildmatch_tests(void);
 extern void run_golden_tests(void);
+extern void run_backend_stdio_tests(void);
 
 int main(void)
 {
@@ -52,6 +53,7 @@ int main(void)
     run_parity_tests();
     run_wildmatch_tests();
     run_golden_tests();
+    run_backend_stdio_tests();
 
     TEST_SUITE_REPORT();
 

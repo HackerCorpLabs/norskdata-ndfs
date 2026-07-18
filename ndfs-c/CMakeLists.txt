@@ -7,6 +7,11 @@ set(CMAKE_C_EXTENSIONS OFF)
 
 # ── Library ──────────────────────────────────────────────────────────
 
+# Host-file (stdio) block backend: PC-only convenience opener ndfs_open_file().
+# ON for host builds; an embedded/freestanding target turns this OFF and
+# supplies its own backend through ndfs_open_block().
+option(NDFS_WITH_STDIO_BACKEND "Build the host-file (stdio) block backend" ON)
+
 set(NDFS_SOURCES
     src/endian_util.c
     src/nd_time.c
@@ -18,6 +23,7 @@ set(NDFS_SOURCES
     src/user_entry.c
     src/object_entry.c
     src/filesystem.c
+    src/backend_stdio.c
     src/image_creator.c
     src/boot_loader.c
     src/sintran.c
@@ -27,6 +33,13 @@ set(NDFS_SOURCES
 )
 
 add_library(ndfs STATIC ${NDFS_SOURCES})
+
+# Gate the stdio backend. When ON, the definition reaches both the library
+# (backend_stdio.c compiles its body) and consumers (ndfs_open_file is declared
+# in block_io.h) -- hence PUBLIC.
+if(NDFS_WITH_STDIO_BACKEND)
+    target_compile_definitions(ndfs PUBLIC NDFS_WITH_STDIO_BACKEND)
+endif()
 
 target_include_directories(ndfs
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -63,6 +76,7 @@ set(TEST_SOURCES
     tests/test_parity.c
     tests/test_wildmatch.c
     tests/test_golden.c
+    tests/test_backend_stdio.c
 )
 
 add_executable(ndfs_tests ${TEST_SOURCES})
