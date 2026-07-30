@@ -35,17 +35,43 @@ export const XAT_KEYS = {
   LAST_WRITE_DATE: 'ndfs.last_write_date',
 } as const;
 
+/**
+ * Ascending list of the file's sparse holes, as LOGICAL page indices. Empty when
+ * the file is solid; absent when the holes were not determined.
+ *
+ * Deliberately NOT part of XAT_KEYS. Those are the keys every sidecar carries,
+ * and this one is conditional - an ObjectEntry alone cannot know where the holes
+ * are, because they live in the file's index. Emitting an empty list in that case
+ * would assert the file is solid, a claim the caller cannot make.
+ *
+ * Nothing else in the sidecar can express WHERE the holes are. `pagesInFile` and
+ * `bytesInFile` together reveal THAT a file is sparse - if `bytesInFile / 2048`
+ * exceeds `pagesInFile` there must be holes - but not their positions. Without
+ * this a sparse file copied out to a host and back returns with a different
+ * layout from the one it left with.
+ *
+ * It also preserves a distinction the data alone cannot carry: a hole and a page
+ * of genuine zeros read back identically, but they differ on disk.
+ */
+export const XAT_KEY_HOLES = 'ndfs.holes';
+
 /** XAT property bag: string-keyed record of primitives. */
-export type XatProperties = Record<string, string | number | boolean>;
+export type XatProperties = Record<string, string | number | boolean | number[]>;
 
 /** XAT file extension. */
 export const XAT_EXTENSION = '.xat';
 
 /**
- * Serialize an ObjectEntry to XAT properties.
- * Captures all NDFS metadata fields.
+ * Serialize an ObjectEntry to XAT properties. Captures all NDFS metadata fields.
+ *
+ * @param entry Entry to serialize.
+ * @param holes Ascending logical page indices of the file's sparse holes, or
+ *   undefined when the caller cannot determine them. The entry alone cannot: the
+ *   holes live in the file's index, so only the filesystem can supply them. When
+ *   undefined the key is omitted rather than guessed at, so an empty array means
+ *   "checked, none" while a missing key means "not checked".
  */
-export function objectEntryToXat(entry: ObjectEntry): XatProperties {
+export function objectEntryToXat(entry: ObjectEntry, holes?: number[]): XatProperties {
   const props: XatProperties = {};
   props[XAT_KEYS.OBJECT_NAME] = entry.objectName;
   props[XAT_KEYS.TYPE] = entry.type;
@@ -62,6 +88,9 @@ export function objectEntryToXat(entry: ObjectEntry): XatProperties {
   props[XAT_KEYS.DATE_CREATED] = entry.dateCreated;
   props[XAT_KEYS.LAST_READ_DATE] = entry.lastDateRead;
   props[XAT_KEYS.LAST_WRITE_DATE] = entry.lastDateWritten;
+  if (holes !== undefined) {
+    props[XAT_KEY_HOLES] = [...holes];
+  }
   return props;
 }
 
@@ -111,6 +140,11 @@ export function xatToObjectEntry(xat: XatProperties, entry: ObjectEntry): void {
   if (XAT_KEYS.LAST_READ_DATE in xat && typeof xat[XAT_KEYS.LAST_READ_DATE] === 'number') {
     entry.lastDateRead = xat[XAT_KEYS.LAST_READ_DATE] as number;
   }
+  // HOLES: recorded for fidelity but NOT applied here, for the same reason as the
+  // version pointers - an ObjectEntry has nowhere to put them. The holes live in
+  // the file's index, which only the write path can build. A writer that wants to
+  // honour them must force a hole at each listed page instead of relying on
+  // all-zero detection, which cannot tell a hole from a page of real zeros.
   if (XAT_KEYS.LAST_WRITE_DATE in xat && typeof xat[XAT_KEYS.LAST_WRITE_DATE] === 'number') {
     entry.lastDateWritten = xat[XAT_KEYS.LAST_WRITE_DATE] as number;
   }

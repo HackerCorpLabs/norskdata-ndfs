@@ -149,14 +149,24 @@ ndfs_error_t ndfs_xat_serialize(const ndfs_xat_properties_t *xat,
 {
     char *buf;
     int len;
+    size_t cap;
+    uint32_t total_holes = 0;
+    uint16_t r;
 
     if (!xat || !out_json) return NDFS_ERR_NULL_PTR;
 
-    /* Allocate generous buffer */
-    buf = (char *)malloc(1536);
+    /* The hole list is emitted as a flat ascending array of page indices, so all
+     * four implementations produce the same JSON. Size the buffer for it: up to
+     * 12 characters per index ("4294967295, "), plus the fixed part. */
+    for (r = 0; r < xat->hole_run_count; r++) {
+        total_holes += xat->hole_runs[r].page_count;
+    }
+
+    cap = 1536 + (size_t)total_holes * 12u;
+    buf = (char *)malloc(cap);
     if (!buf) return NDFS_ERR_ALLOC;
 
-    len = snprintf(buf, 1536,
+    len = snprintf(buf, cap,
         "{\n"
         "  \"ndfs.object_name\": \"%s\",\n"
         "  \"ndfs.type\": \"%s\",\n"
@@ -172,8 +182,7 @@ ndfs_error_t ndfs_xat_serialize(const ndfs_xat_properties_t *xat,
         "  \"ndfs.bytes_in_file\": %u,\n"
         "  \"ndfs.date_created\": %u,\n"
         "  \"ndfs.last_read_date\": %u,\n"
-        "  \"ndfs.last_write_date\": %u\n"
-        "}",
+        "  \"ndfs.last_write_date\": %u",
         xat->object_name,
         xat->type,
         xat->user_name,
@@ -195,7 +204,76 @@ ndfs_error_t ndfs_xat_serialize(const ndfs_xat_properties_t *xat,
         return NDFS_ERR_INVALID_ARG;
     }
 
+    /* Append the hole list, expanding the runs into the flat form the other
+     * implementations use. Omitted entirely when the holes were not determined,
+     * so a missing key means "not checked" and an empty array means "none". */
+    if (xat->hole_runs_valid) {
+        int n = snprintf(buf + len, cap - (size_t)len, ",\n  \"ndfs.holes\": [");
+        if (n < 0) { free(buf); return NDFS_ERR_INVALID_ARG; }
+        len += n;
+
+        {
+            uint32_t emitted = 0;
+            for (r = 0; r < xat->hole_run_count; r++) {
+                uint32_t i;
+                for (i = 0; i < xat->hole_runs[r].page_count; i++) {
+                    n = snprintf(buf + len, cap - (size_t)len, "%s%u",
+                                 emitted ? ", " : "",
+                                 (unsigned)(xat->hole_runs[r].first_page + i));
+                    if (n < 0) { free(buf); return NDFS_ERR_INVALID_ARG; }
+                    len += n;
+                    emitted++;
+                }
+            }
+        }
+
+        n = snprintf(buf + len, cap - (size_t)len, "]\n}");
+        if (n < 0) { free(buf); return NDFS_ERR_INVALID_ARG; }
+    } else {
+        if (snprintf(buf + len, cap - (size_t)len, "\n}") < 0) {
+            free(buf);
+            return NDFS_ERR_INVALID_ARG;
+        }
+    }
+
     *out_json = buf;
+    return NDFS_OK;
+}
+
+ndfs_error_t ndfs_xat_set_holes(ndfs_xat_properties_t *xat,
+                                const uint32_t *pages, size_t count)
+{
+    size_t i;
+
+    if (!xat) return NDFS_ERR_NULL_PTR;
+    if (count && !pages) return NDFS_ERR_NULL_PTR;
+
+    xat->hole_run_count = 0;
+    xat->hole_runs_truncated = 0;
+    xat->hole_runs_valid = 1;
+
+    for (i = 0; i < count; i++) {
+        /* Extend the current run when this page continues it, else start a new
+         * one. Input must be ascending; anything else starts a fresh run, which
+         * still round-trips through the flat JSON form. */
+        if (xat->hole_run_count > 0) {
+            ndfs_xat_hole_run_t *last = &xat->hole_runs[xat->hole_run_count - 1];
+            if (pages[i] == last->first_page + last->page_count) {
+                last->page_count++;
+                continue;
+            }
+        }
+
+        if (xat->hole_run_count >= NDFS_XAT_MAX_HOLE_RUNS) {
+            xat->hole_runs_truncated = 1;
+            break;
+        }
+
+        xat->hole_runs[xat->hole_run_count].first_page = pages[i];
+        xat->hole_runs[xat->hole_run_count].page_count = 1;
+        xat->hole_run_count++;
+    }
+
     return NDFS_OK;
 }
 

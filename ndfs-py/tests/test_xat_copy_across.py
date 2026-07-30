@@ -212,7 +212,12 @@ class TestSparseFileWithXat:
         fs1.write_file("SYSTEM/SPARSE:DATA", bytes(content))
 
         data, properties = fs1.read_file_with_properties("SYSTEM/SPARSE:DATA")
-        assert properties[XAT_PAGES_IN_FILE] == 4
+        # pages_in_file counts the pages ACTUALLY ALLOCATED, not the logical extent:
+        # pages 0 and 2 hold data, pages 1 and 3 are sparse holes occupying no disk.
+        # Was 4 before the 2026-07-30 correction, which matched SINTRAN -- a real pack
+        # records 89 for a file whose index spans 99 slots with 10 holes. The logical
+        # extent is not lost, it is ceil(bytes_in_file / NDFS_PAGE_SIZE).
+        assert properties[XAT_PAGES_IN_FILE] == 2
         assert properties[XAT_BYTES_IN_FILE] == file_size
 
         fs2 = create_fs()
@@ -247,7 +252,10 @@ class TestLargeSparseFileXat:
         fs1.write_file("SYSTEM/BIGSPARSE:DATA", bytes(content))
 
         data, properties = fs1.read_file_with_properties("SYSTEM/BIGSPARSE:DATA")
-        assert properties[XAT_PAGES_IN_FILE] == 10
+        # Only the first and last pages hold data; the 8 in between are sparse holes
+        # occupying no disk. pages_in_file counts allocated pages, so 2 -- see the note
+        # in the sparse round-trip test above.
+        assert properties[XAT_PAGES_IN_FILE] == 2
 
         read_back = fs1.read_file("SYSTEM/BIGSPARSE:DATA")
         assert len(read_back) == file_size

@@ -73,6 +73,37 @@ describe('UserEntry', () => {
       expect(parsed!.pagesUsed).toBe(100);
       expect(parsed!.password).toBe(0xabcd);
     });
+
+    // A real pack may set bits in byte 0 beyond the 0x81 pair fromBytes tests
+    // on. toBytes used to hardcode 0x81, so any read/modify/write destroyed
+    // them -- and the user-file writer re-serializes every slot in the page,
+    // not just the edited one.
+    it('round-trips unmodelled flag bits in byte 0', () => {
+      const raw = new Uint8Array(ENTRY_SIZE);
+      raw[0] = 0xc1; // valid user (0x81) + an unmodelled bit 6
+      raw[2] = 'S'.charCodeAt(0);
+      raw[3] = 'Y'.charCodeAt(0);
+      raw[4] = NDFS_NAME_TERMINATOR;
+      raw[37] = 7;
+
+      const entry = UserEntry.fromBytes(raw, 0);
+      expect(entry).not.toBeNull();
+      expect(entry!.uf).toBe(0xc1);
+
+      expect(entry!.toBytes()[0]).toBe(0xc1);
+    });
+
+    // An entry built from scratch must still be marked valid, or fromBytes
+    // rejects the slot on the next mount and the user vanishes.
+    it('marks a freshly built entry valid', () => {
+      const user = new UserEntry();
+      user.userName = 'FRESH';
+
+      const bytes = user.toBytes();
+
+      expect(bytes[0] & USER_ENTRY_FLAG).toBe(USER_ENTRY_FLAG);
+      expect(UserEntry.fromBytes(bytes, 0)).not.toBeNull();
+    });
   });
 
   describe('quota', () => {

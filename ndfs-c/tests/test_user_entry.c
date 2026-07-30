@@ -217,9 +217,55 @@ static int test_parse_permissions(void)
     return 0;
 }
 
+/* A real pack may set bits in byte 0 beyond the 0x81 pair from_bytes tests on.
+ * to_bytes used to hardcode 0x81, so any read/modify/write destroyed them --
+ * and the user-file writer re-serializes every slot in the page, not just the
+ * edited one, so one password change flattened all 32 users. */
+static int test_flags_byte_roundtrip(void)
+{
+    ndfs_user_entry_t ue;
+    uint8_t raw[NDFS_ENTRY_SIZE];
+    uint8_t buf[NDFS_ENTRY_SIZE];
+
+    memset(raw, 0, sizeof(raw));
+    raw[0] = 0xC1;              /* valid user (0x81) + an unmodelled bit 6 */
+    raw[2] = 'S';
+    raw[3] = 'Y';
+    raw[4] = 0x27;              /* name terminator */
+    raw[37] = 7;                /* user index */
+
+    TEST_ASSERT_OK(ndfs_ue_from_bytes(raw, NDFS_ENTRY_SIZE, 0, &ue));
+    TEST_ASSERT_EQUAL(0xC1, ue.uf);
+
+    ndfs_ue_to_bytes(&ue, buf);
+    TEST_ASSERT_EQUAL(0xC1, buf[0]);
+    return 0;
+}
+
+/* An entry built from scratch must still be marked valid, or from_bytes
+ * rejects the slot on the next mount and the user vanishes. */
+static int test_fresh_entry_is_marked_valid(void)
+{
+    ndfs_user_entry_t ue, ue2;
+    uint8_t buf[NDFS_ENTRY_SIZE];
+
+    ndfs_ue_init(&ue);
+    TEST_ASSERT_EQUAL(NDFS_USER_ENTRY_FLAG, ue.uf);
+
+    strcpy(ue.user_name, "FRESH");
+    ndfs_ue_to_bytes(&ue, buf);
+
+    TEST_ASSERT_EQUAL(NDFS_USER_ENTRY_FLAG,
+                      buf[0] & NDFS_USER_ENTRY_FLAG);
+    TEST_ASSERT_OK(ndfs_ue_from_bytes(buf, NDFS_ENTRY_SIZE, 0, &ue2));
+    return 0;
+}
+
 void run_user_entry_tests(void)
 {
     TEST_SUITE_BEGIN("UserEntry Tests");
+    RUN_TEST(test_flags_byte_roundtrip);
+    RUN_TEST(test_fresh_entry_is_marked_valid);
     RUN_TEST(test_access_and_friend_offsets);
     RUN_TEST(test_init);
     RUN_TEST(test_roundtrip);

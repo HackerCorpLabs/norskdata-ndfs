@@ -16,7 +16,7 @@ HackerCorp Labs - https://github.com/HackerCorpLabs
 from __future__ import annotations
 
 import json
-from typing import Dict, Optional, Union
+from typing import Dict, List, Optional, Union
 
 from ndfs.object_entry import ObjectEntry
 
@@ -37,6 +37,19 @@ XAT_DATE_CREATED = "ndfs.date_created"
 XAT_LAST_READ_DATE = "ndfs.last_read_date"
 XAT_LAST_WRITE_DATE = "ndfs.last_write_date"
 
+# Ascending list of the file's sparse holes, as LOGICAL page indices. Empty when
+# the file is solid.
+#
+# Why it is needed: nothing else in the sidecar can express WHERE the holes are.
+# pages_in_file and bytes_in_file together reveal THAT a file is sparse -- if
+# bytes_in_file / 2048 exceeds pages_in_file there must be holes -- but not their
+# positions. Without this key a sparse file copied out to a host and back returns
+# with a different layout from the one it left with.
+#
+# It also preserves a distinction the data alone cannot carry: a hole and a page
+# of genuine zeros read back identically, but they are not the same thing on disk.
+XAT_HOLES = "ndfs.holes"
+
 ALL_XAT_KEYS = [
     XAT_OBJECT_NAME,
     XAT_TYPE,
@@ -55,15 +68,33 @@ ALL_XAT_KEYS = [
     XAT_LAST_WRITE_DATE,
 ]
 
+# Keys that appear only when the writer could determine them. XAT_HOLES is not in
+# ALL_XAT_KEYS on purpose: those are the keys every sidecar carries, and this one
+# is conditional. Emitting an empty list when the holes were never looked up would
+# assert the file is solid, which is a claim the caller cannot make from an object
+# entry alone.
+OPTIONAL_XAT_KEYS = [
+    XAT_HOLES,
+]
+
 XAT_EXTENSION = ".xat"
 
 
-def object_entry_to_xat(entry: ObjectEntry) -> dict:
+def object_entry_to_xat(entry: ObjectEntry, holes: Optional[List[int]] = None) -> dict:
     """Serialize an ObjectEntry to XAT properties dict.
 
     Captures all NDFS metadata fields.
+
+    Args:
+        entry: the object entry to serialize.
+        holes: ascending logical page indices of the file's sparse holes, or None
+            when the caller cannot determine them. The object entry alone cannot:
+            the holes live in the file's index, so only the filesystem can supply
+            them. When None the key is omitted rather than guessed at, so an empty
+            list means "checked, and there are none" while a missing key means
+            "not checked".
     """
-    props: Dict[str, Union[str, int, bool]] = {}
+    props: Dict[str, Union[str, int, bool, List[int]]] = {}
     props[XAT_OBJECT_NAME] = entry.object_name
     props[XAT_TYPE] = entry.type
     props[XAT_USER_NAME] = entry.user_name
@@ -79,6 +110,8 @@ def object_entry_to_xat(entry: ObjectEntry) -> dict:
     props[XAT_DATE_CREATED] = entry.date_created
     props[XAT_LAST_READ_DATE] = entry.last_date_read
     props[XAT_LAST_WRITE_DATE] = entry.last_date_written
+    if holes is not None:
+        props[XAT_HOLES] = list(holes)
     return props
 
 
@@ -115,6 +148,11 @@ def xat_to_object_entry(xat: dict, entry: ObjectEntry) -> None:
         entry.last_date_read = xat[XAT_LAST_READ_DATE]
     if XAT_LAST_WRITE_DATE in xat and isinstance(xat[XAT_LAST_WRITE_DATE], int):
         entry.last_date_written = xat[XAT_LAST_WRITE_DATE]
+    # holes: recorded for fidelity but NOT applied here, for the same reason as the
+    # version pointers -- an ObjectEntry has nowhere to put them. The holes live in
+    # the file's index, which only the write path can build. A writer that wants to
+    # honour them must force a hole at each listed page instead of relying on the
+    # all-zero detection, which cannot tell a hole from a page of real zeros.
 
 
 def serialize_xat(props: dict) -> str:

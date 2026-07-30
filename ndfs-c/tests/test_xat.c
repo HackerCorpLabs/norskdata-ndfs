@@ -475,6 +475,161 @@ static int test_xat_device_and_version(void)
     return 0;
 }
 
+/* ---- Sparse-hole map ----
+ *
+ * The sidecar records WHERE a file's holes are. pages_in_file and bytes_in_file
+ * together reveal THAT a file is sparse, but not the positions, so without this
+ * a sparse file copied out to a host and back returns with a different layout.
+ *
+ * Holes are held internally as runs, because real files hole out in blocks
+ * rather than singly -- every sparse file measured on a live pack had exactly
+ * one run. The JSON form is a flat ascending list of page indices, matching the
+ * Python, TypeScript and C# ports so all four sidecars are comparable. */
+
+static int test_xat_holes_absent_when_not_determined(void)
+{
+    ndfs_object_entry_t entry;
+    ndfs_xat_properties_t xat;
+    char *json = NULL;
+
+    ndfs_oe_init(&entry);
+    strcpy(entry.object_name, "LONE");
+    strcpy(entry.type, "DATA");
+
+    /* from_object alone cannot know the holes: they live in the file's index,
+     * not in the object entry. The key must be omitted, which says "not
+     * checked" -- a different claim from an empty list. */
+    TEST_ASSERT_OK(ndfs_xat_from_object(&entry, &xat));
+    TEST_ASSERT(xat.hole_runs_valid == 0);
+
+    TEST_ASSERT_OK(ndfs_xat_serialize(&xat, &json));
+    TEST_ASSERT(strstr(json, "ndfs.holes") == NULL);
+    free(json);
+    return 0;
+}
+
+static int test_xat_holes_empty_list_when_solid(void)
+{
+    ndfs_object_entry_t entry;
+    ndfs_xat_properties_t xat;
+    char *json = NULL;
+
+    ndfs_oe_init(&entry);
+    strcpy(entry.object_name, "SOLID");
+
+    TEST_ASSERT_OK(ndfs_xat_from_object(&entry, &xat));
+    TEST_ASSERT_OK(ndfs_xat_set_holes(&xat, NULL, 0));
+
+    TEST_ASSERT(xat.hole_runs_valid == 1);
+    TEST_ASSERT(xat.hole_run_count == 0);
+
+    TEST_ASSERT_OK(ndfs_xat_serialize(&xat, &json));
+    TEST_ASSERT(strstr(json, "\"ndfs.holes\": []") != NULL);
+    free(json);
+    return 0;
+}
+
+static int test_xat_holes_compress_into_runs(void)
+{
+    ndfs_object_entry_t entry;
+    ndfs_xat_properties_t xat;
+    /* One consecutive run, as on the real pack (S3-CONFIG-E01:PROG, 54..63). */
+    uint32_t pages[] = { 54, 55, 56, 57, 58, 59, 60, 61, 62, 63 };
+
+    ndfs_oe_init(&entry);
+    TEST_ASSERT_OK(ndfs_xat_from_object(&entry, &xat));
+    TEST_ASSERT_OK(ndfs_xat_set_holes(&xat, pages, 10));
+
+    TEST_ASSERT(xat.hole_run_count == 1);
+    TEST_ASSERT(xat.hole_runs[0].first_page == 54);
+    TEST_ASSERT(xat.hole_runs[0].page_count == 10);
+    TEST_ASSERT(xat.hole_runs_truncated == 0);
+    return 0;
+}
+
+static int test_xat_holes_separate_runs_stay_separate(void)
+{
+    ndfs_object_entry_t entry;
+    ndfs_xat_properties_t xat;
+    uint32_t pages[] = { 1, 2, 7, 9, 10 };
+
+    ndfs_oe_init(&entry);
+    TEST_ASSERT_OK(ndfs_xat_from_object(&entry, &xat));
+    TEST_ASSERT_OK(ndfs_xat_set_holes(&xat, pages, 5));
+
+    TEST_ASSERT(xat.hole_run_count == 3);
+    TEST_ASSERT(xat.hole_runs[0].first_page == 1 && xat.hole_runs[0].page_count == 2);
+    TEST_ASSERT(xat.hole_runs[1].first_page == 7 && xat.hole_runs[1].page_count == 1);
+    TEST_ASSERT(xat.hole_runs[2].first_page == 9 && xat.hole_runs[2].page_count == 2);
+    return 0;
+}
+
+static int test_xat_holes_serialize_flat_in_json(void)
+{
+    ndfs_object_entry_t entry;
+    ndfs_xat_properties_t xat;
+    uint32_t pages[] = { 1, 2, 3, 4 };
+    char *json = NULL;
+
+    ndfs_oe_init(&entry);
+    TEST_ASSERT_OK(ndfs_xat_from_object(&entry, &xat));
+    TEST_ASSERT_OK(ndfs_xat_set_holes(&xat, pages, 4));
+
+    /* Runs internally, flat list on disk -- this is what keeps the four ports
+     * byte-comparable. */
+    TEST_ASSERT(xat.hole_run_count == 1);
+    TEST_ASSERT_OK(ndfs_xat_serialize(&xat, &json));
+    TEST_ASSERT(strstr(json, "\"ndfs.holes\": [1, 2, 3, 4]") != NULL);
+    free(json);
+    return 0;
+}
+
+static int test_xat_holes_truncate_flag_when_too_many_runs(void)
+{
+    ndfs_object_entry_t entry;
+    ndfs_xat_properties_t xat;
+    uint32_t pages[NDFS_XAT_MAX_HOLE_RUNS + 8];
+    size_t i;
+
+    /* Every other page is a hole, so each is its own run and they overflow. */
+    for (i = 0; i < sizeof(pages) / sizeof(pages[0]); i++) {
+        pages[i] = (uint32_t)(i * 2);
+    }
+
+    ndfs_oe_init(&entry);
+    TEST_ASSERT_OK(ndfs_xat_from_object(&entry, &xat));
+    TEST_ASSERT_OK(ndfs_xat_set_holes(&xat, pages, sizeof(pages) / sizeof(pages[0])));
+
+    /* Truncation must be reported, never silent. */
+    TEST_ASSERT(xat.hole_run_count == NDFS_XAT_MAX_HOLE_RUNS);
+    TEST_ASSERT(xat.hole_runs_truncated == 1);
+    return 0;
+}
+
+static int test_xat_holes_large_run_serializes_fully(void)
+{
+    ndfs_object_entry_t entry;
+    ndfs_xat_properties_t xat;
+    uint32_t pages[400];
+    char *json = NULL;
+    uint32_t i;
+
+    /* One long run: the serializer sizes its buffer from the expanded index
+     * count, so a run far bigger than the fixed part must still fit. */
+    for (i = 0; i < 400; i++) pages[i] = 100 + i;
+
+    ndfs_oe_init(&entry);
+    TEST_ASSERT_OK(ndfs_xat_from_object(&entry, &xat));
+    TEST_ASSERT_OK(ndfs_xat_set_holes(&xat, pages, 400));
+
+    TEST_ASSERT(xat.hole_run_count == 1);
+    TEST_ASSERT_OK(ndfs_xat_serialize(&xat, &json));
+    TEST_ASSERT(strstr(json, "100, 101") != NULL);
+    TEST_ASSERT(strstr(json, "499]") != NULL);
+    free(json);
+    return 0;
+}
+
 void run_xat_tests(void)
 {
     TEST_SUITE_BEGIN("XAT Tests");
@@ -496,4 +651,12 @@ void run_xat_tests(void)
     RUN_TEST(test_xat_is_xat_edge_cases);
     RUN_TEST(test_xat_null_safety);
     RUN_TEST(test_xat_get_file_properties_integration);
+
+    RUN_TEST(test_xat_holes_absent_when_not_determined);
+    RUN_TEST(test_xat_holes_empty_list_when_solid);
+    RUN_TEST(test_xat_holes_compress_into_runs);
+    RUN_TEST(test_xat_holes_separate_runs_stay_separate);
+    RUN_TEST(test_xat_holes_serialize_flat_in_json);
+    RUN_TEST(test_xat_holes_truncate_flag_when_too_many_runs);
+    RUN_TEST(test_xat_holes_large_run_serializes_fully);
 }

@@ -197,7 +197,12 @@ describe('XAT Copy-Across Scenarios', () => {
     fs1.writeFile('SYSTEM/SPARSE:DATA', content);
 
     const { data, properties } = fs1.readFileWithProperties('SYSTEM/SPARSE:DATA');
-    expect(properties[XAT_KEYS.PAGES_IN_FILE]).toBe(4);
+    // pagesInFile counts the pages ACTUALLY ALLOCATED, not the logical extent: pages 0
+    // and 2 hold data, pages 1 and 3 are sparse holes that occupy no disk. Was 4 before
+    // the 2026-07-30 correction, which matched SINTRAN -- a real pack records 89 for a
+    // file whose index spans 99 slots with 10 holes. The logical extent is not lost, it
+    // is ceil(bytesInFile / NDFS_PAGE_SIZE).
+    expect(properties[XAT_KEYS.PAGES_IN_FILE]).toBe(2);
     expect(properties[XAT_KEYS.BYTES_IN_FILE]).toBe(fileSize);
 
     // Copy to new image
@@ -241,7 +246,10 @@ describe('XAT Copy-Across Scenarios', () => {
     fs1.writeFile('SYSTEM/BIGSPARSE:DATA', content);
 
     const { data, properties } = fs1.readFileWithProperties('SYSTEM/BIGSPARSE:DATA');
-    expect(properties[XAT_KEYS.PAGES_IN_FILE]).toBe(10);
+    // Only the first and last pages hold data; the 8 in between are sparse holes
+    // occupying no disk. pagesInFile counts allocated pages, so 2 -- see the note in the
+    // sparse round-trip test above.
+    expect(properties[XAT_KEYS.PAGES_IN_FILE]).toBe(2);
 
     // Read back and verify zeros in middle
     const readBack = fs1.readFile('SYSTEM/BIGSPARSE:DATA');

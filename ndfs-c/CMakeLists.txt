@@ -71,6 +71,7 @@ set(TEST_SOURCES
     tests/test_boot_loader.c
     tests/test_sintran.c
     tests/test_write_comprehensive.c
+    tests/test_contiguous_files.c
     tests/test_xat.c
     tests/test_xat_copy.c
     tests/test_parity.c

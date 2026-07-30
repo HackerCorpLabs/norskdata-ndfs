@@ -34,6 +34,13 @@ import { readNdfsName, writeNdfsName } from './ndfs-name.js';
 import { UserFriend } from './user-friend.js';
 
 export class UserEntry {
+  /** Byte 0, the flags byte, kept whole. fromBytes only requires the
+   * USER_ENTRY_FLAG bits (bit 7 "entry used" + bit 0 "user entry"), so a real
+   * pack may carry other bits here that we do not model; toBytes writes this
+   * back verbatim rather than re-hardcoding 0x81, which would destroy them on
+   * every read/modify/write. A fresh entry must keep it set, or the next
+   * fromBytes reads the slot as free. */
+  uf: number = USER_ENTRY_FLAG;
   userIndex: number = 0;
   userName: string = '';
   password: number = 0;
@@ -70,6 +77,10 @@ export class UserEntry {
 
     const entry = new UserEntry();
     entry.raw = data.slice(offset, offset + ENTRY_SIZE);
+    // Keep the WHOLE flags byte, not just the 0x81 bits tested above. Anything
+    // else set here is a flag we do not model yet, and toBytes writes it
+    // straight back out.
+    entry.uf = data[offset];
     entry.enterCount = data[offset + 1];
     entry.userName = readNdfsName(data, offset + 2, NDFS_NAME_MAX);
     entry.password = readUint16BE(data, offset + 18);
@@ -97,7 +108,11 @@ export class UserEntry {
       buf.set(this.raw, 0);
     }
 
-    buf[0] = USER_ENTRY_FLAG;
+    // Flags byte written verbatim so unmodelled bits survive a read/modify/
+    // write. This used to be a hardcoded USER_ENTRY_FLAG, which silently
+    // cleared every other bit in byte 0 of every user in the page - the
+    // user-file writer re-serializes all slots, not just the edited one.
+    buf[0] = this.uf & 0xff;
     buf[1] = this.enterCount & 0xff;
 
     writeNdfsName(buf, 2, this.userName, NDFS_NAME_MAX);

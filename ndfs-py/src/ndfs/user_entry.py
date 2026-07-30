@@ -42,6 +42,7 @@ class UserEntry:
     """A single NDFS user record (64 bytes on disk)."""
 
     __slots__ = (
+        "uf",
         "user_index",
         "user_name",
         "password",
@@ -57,6 +58,13 @@ class UserEntry:
     )
 
     def __init__(self) -> None:
+        # Byte 0, the flags byte, kept whole. from_bytes only requires the
+        # USER_ENTRY_FLAG bits (bit 7 "entry used" + bit 0 "user entry"), so a
+        # real pack may carry other bits here that we do not model; to_bytes
+        # writes this back verbatim rather than re-hardcoding 0x81, which would
+        # destroy them on every read/modify/write. A fresh entry must keep it
+        # set, or the next from_bytes reads the slot as free.
+        self.uf: int = USER_ENTRY_FLAG
         self.user_index: int = 0
         self.user_name: str = ""
         self.password: int = 0
@@ -89,6 +97,10 @@ class UserEntry:
 
         entry = cls()
         entry.raw = bytes(data[offset:offset + ENTRY_SIZE])
+        # Keep the WHOLE flags byte, not just the 0x81 bits tested above.
+        # Anything else set here is a flag we do not model yet, and to_bytes
+        # writes it straight back out.
+        entry.uf = data[offset]
         entry.enter_count = data[offset + 1]
         entry.user_name = read_ndfs_name(data, offset + 2, NDFS_NAME_MAX)
         entry.password = read_uint16_be(data, offset + 18)
@@ -113,7 +125,11 @@ class UserEntry:
         if self.raw is not None and len(self.raw) == ENTRY_SIZE:
             buf[0:ENTRY_SIZE] = self.raw
 
-        buf[0] = USER_ENTRY_FLAG
+        # Flags byte written verbatim so unmodelled bits survive a read/modify/
+        # write. This used to be a hardcoded USER_ENTRY_FLAG, which silently
+        # cleared every other bit in byte 0 of every user in the page - the
+        # user-file writer re-serializes all slots, not just the edited one.
+        buf[0] = self.uf & 0xFF
         buf[1] = self.enter_count & 0xFF
 
         write_ndfs_name(buf, 2, self.user_name, NDFS_NAME_MAX)

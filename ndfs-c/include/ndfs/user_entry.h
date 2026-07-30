@@ -2,7 +2,7 @@
  * NDFS user entry: 64-byte record in the user file.
  *
  * Byte offsets:
- *   0:     Flag (0x81 = valid user)
+ *   0:     Flags (bit 7 = entry used, bit 0 = user entry; 0x81 = valid user)
  *   1:     Enter count
  *   2-17:  User name (16 bytes, terminated by 0x27)
  *   18-19: Password (16-bit, big-endian)
@@ -35,6 +35,14 @@ extern "C" {
 
 /** 64-byte user entry. */
 typedef struct {
+    /* Byte 0, the flags byte, kept whole. from_bytes only requires the
+     * NDFS_USER_ENTRY_FLAG bits (bit 7 "entry used" + bit 0 "user entry"), so a
+     * real pack may carry other bits here that we do not model; to_bytes writes
+     * this field back verbatim rather than re-hardcoding 0x81, which would
+     * destroy them on every read/modify/write. Set it to NDFS_USER_ENTRY_FLAG
+     * when building an entry from scratch - a zero byte 0 makes from_bytes
+     * reject the slot and the user disappears. */
+    uint8_t            uf;
     uint8_t            user_index;
     char               user_name[NDFS_NAME_MAX + 1];
     uint16_t           password;

@@ -241,7 +241,13 @@ static int test_xat_copy_sparse_file(void)
     TEST_ASSERT_OK(ndfs_write_file(fs, "SYSTEM/SPARSE:DATA", content, file_size));
     TEST_ASSERT_OK(ndfs_get_file_properties(fs, "SYSTEM/SPARSE:DATA", &xat));
 
-    TEST_ASSERT_EQUAL(4, (long)xat.pages_in_file);
+    /* pages_in_file counts the pages ACTUALLY ALLOCATED, not the logical extent:
+     * pages 0 and 2 hold data, pages 1 and 3 are sparse holes that occupy no
+     * disk. Was 4 before the 2026-07-30 correction, which matched SINTRAN --
+     * a real pack records 89 for a file whose index spans 99 slots with 10
+     * holes. The logical extent is not lost, it is
+     * ceil(bytes_in_file / NDFS_PAGE_SIZE), asserted on the next line. */
+    TEST_ASSERT_EQUAL(2, (long)xat.pages_in_file);
     TEST_ASSERT_EQUAL((long)file_size, (long)xat.bytes_in_file);
 
     /* Read back and verify */
@@ -292,7 +298,10 @@ static int test_xat_copy_large_sparse(void)
     TEST_ASSERT_OK(ndfs_write_file(fs, "SYSTEM/BIGSPARSE:DATA", content, file_size));
     TEST_ASSERT_OK(ndfs_get_file_properties(fs, "SYSTEM/BIGSPARSE:DATA", &xat));
 
-    TEST_ASSERT_EQUAL(10, (long)xat.pages_in_file);
+    /* Only the first and last pages hold data; the 8 in between are sparse
+     * holes occupying no disk. pages_in_file counts allocated pages, so 2 --
+     * see the note in test_xat_copy_sparse_file. */
+    TEST_ASSERT_EQUAL(2, (long)xat.pages_in_file);
 
     TEST_ASSERT_OK(ndfs_read_file(fs, "SYSTEM/BIGSPARSE:DATA", &read_data, &read_size));
     TEST_ASSERT_EQUAL((long)file_size, (long)read_size);

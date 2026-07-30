@@ -33,7 +33,7 @@ from ndfs.user_file import UserFile
 from ndfs.object_file import ObjectFile
 from ndfs.user_entry import UserEntry
 from ndfs.user_friend import UserFriend
-from ndfs.object_entry import ObjectEntry, ACCESS_DEFAULT, FT_INDEXED
+from ndfs.object_entry import ObjectEntry, ACCESS_DEFAULT, FT_INDEXED, FT_CONTIGUOUS
 from ndfs.types import PointerType, FileEntry, ImageCreationOptions, BootFormat, BootControllerType, BootCode
 from ndfs.xat import object_entry_to_xat, xat_to_object_entry
 from ndfs import sintran
@@ -255,7 +255,14 @@ class NdfsFileSystem:
 
         # Determine additional pages needed
         additional_needed = total_required
-        if existing is not None:
+        if existing is not None and (existing.file_type_flags & FT_CONTIGUOUS):
+            # A contiguous file already owns every page it will ever have, so a write can
+            # never need more. Skipping the quota step matters: the check below would
+            # otherwise expand the user's reservation for pages that are never allocated,
+            # and it would do so before _update_existing_contiguous_file rejects an
+            # oversized write.
+            additional_needed = 0
+        elif existing is not None:
             existing_total = self._count_real_data_pages_for_object(existing)
             additional_needed = total_required - existing_total if total_required > existing_total else 0
 
@@ -616,7 +623,7 @@ class NdfsFileSystem:
         obj = self._find_object(path)
         if obj is None:
             return None
-        return object_entry_to_xat(obj)
+        return object_entry_to_xat(obj, self._find_holes(path))
 
     def read_file_with_properties(self, path: str) -> Tuple[bytes, dict]:
         """Read a file's data along with its XAT properties.
@@ -631,8 +638,16 @@ class NdfsFileSystem:
         if obj is None:
             raise FileNotFoundError(f"File not found: {path}")
         data = bytes(self._read_object_data(obj))
-        properties = object_entry_to_xat(obj)
+        properties = object_entry_to_xat(obj, self._find_holes(path))
         return data, properties
+
+    def _find_holes(self, path: str) -> List[int]:
+        """Return the ascending logical page indices of a file's sparse holes.
+
+        Empty for a solid file. Contiguous files are solid by construction, so
+        this is only ever non-empty for Indexed and SubIndexed ones.
+        """
+        return [i for i, block in enumerate(self.get_file_blocks(path)) if block == 0]
 
     def write_file_with_properties(
         self,
@@ -675,7 +690,30 @@ class NdfsFileSystem:
     # -- SINTRAN initial commands -----------------------------------------
 
     def get_file_blocks(self, path: str) -> List[int]:
-        """Return the ordered data-block IDs of a file (0 marks a sparse hole)."""
+        """Return the ordered data-block IDs of a file (0 marks a sparse hole).
+
+        The list is indexed by LOGICAL page, so a hole keeps its own position and
+        the pages after it are not shifted.
+
+        FIXED 2026-07-30. This used to walk the index for ``pages_in_file`` slots.
+        That is wrong for a sparse file: ``pages_in_file`` counts the pages really
+        allocated, while the index is as long as the file's logical extent, holes
+        included. Measured on ``(SYSTEM)S3-CONFIG-E01:PROG`` in
+        ``BIGDISK0-K-103.IMG``: ``pages_in_file`` is 89, the last used index slot
+        is 98, and slots 54 to 63 are holes. Walking only 89 slots stopped at 88,
+        so it dropped the last 10 real pages AND reported the 10 holes, returning
+        79 real blocks instead of 89 -- truncated, and every page past slot 53 at
+        the wrong offset.
+
+        The logical extent comes from ``bytes_in_file`` rather than the page
+        count. For that file 202752 / 2048 is exactly 99, which matches. The main
+        read paths in the C library and in RetroFS already bound themselves this
+        way; only these block-listing helpers did not.
+
+        Confirmed independently on real hardware: transferring that file from one
+        ND-100 to another sends 89 messages carrying page numbers 0..53 then
+        64..98 -- one gap, exactly the holes above.
+        """
         obj = self._find_object(path)
         if obj is None:
             raise FileNotFoundError(f"File not found: {path}")
@@ -683,16 +721,21 @@ class NdfsFileSystem:
         fp = obj.file_pointer
         if fp is None or fp.block_id == 0:
             return blocks
+
+        # Logical extent, holes included. Contiguous files have no holes, so their
+        # own page count is the honest bound and is kept.
+        logical_pages = (obj.bytes_in_file + NDFS_PAGE_SIZE - 1) // NDFS_PAGE_SIZE
+
         if fp.type == PointerType.Contiguous:
             for i in range(obj.pages_in_file):
                 blocks.append(fp.block_id + i)
         elif fp.type == PointerType.Indexed:
             ib = self._read_page(fp.block_id)
-            for i in range(min(obj.pages_in_file, MAX_OBJECT_FILE_POINTERS)):
+            for i in range(min(logical_pages, MAX_OBJECT_FILE_POINTERS)):
                 blocks.append(BlockPointer.from_bytes(ib, i * 4).block_id)
         elif fp.type == PointerType.SubIndexed:
             sib = self._read_page(fp.block_id)
-            remaining = obj.pages_in_file
+            remaining = logical_pages
             for si in range(MAX_OBJECT_FILE_POINTERS):
                 if remaining <= 0:
                     break
@@ -1306,7 +1349,17 @@ class NdfsFileSystem:
         entry.type = file_type.upper()[:NDFS_TYPE_MAX]
         entry.user_index = user.user_index
         entry.user_name = user.user_name
-        entry.pages_in_file = data_pages
+        # pages_in_file counts the pages ACTUALLY ALLOCATED, not the logical extent.
+        #
+        # Corrected 2026-07-30 to match SINTRAN. On a real pack, (SYSTEM)S3-CONFIG-E01:PROG
+        # records 89 while its index spans 99 slots with 10 holes, and the machine itself
+        # reports "No of pages in file: 89" while transferring page numbers 0..53 then
+        # 64..98. Writing the logical extent here charged the user quota for holes that
+        # occupy no disk, and produced packs that disagreed with SINTRAN-written ones.
+        #
+        # The logical extent is not lost - it is ceil(bytes_in_file / NDFS_PAGE_SIZE), and
+        # get_file_blocks uses exactly that to walk the index.
+        entry.pages_in_file = self._count_real_data_pages_in_buffer(file_data)
         entry.bytes_in_file = len(file_data) if len(file_data) > 0 else 1
         entry.file_pointer = BlockPointer(top_block_id, top_pointer_type)
         # New-file defaults: owner+friend full rights; indexed allocation flag
@@ -1333,6 +1386,159 @@ class NdfsFileSystem:
         self._write_bit_file()
         self._persist_master_block()
 
+    def create_contiguous_file(self, path: str, pages: int) -> None:
+        """Create an empty contiguous file occupying a fixed run of `pages` pages.
+
+        This is SINTRAN's ``@CREATE-FILE name pages`` -- the form that produces a file the
+        machine reports as ``CONTINUOUS FILE``. Every page is allocated up front and the
+        pages are consecutive on the pack, but the file itself is created empty.
+
+        The reservation is fixed for the life of the file. A later write of more than
+        `pages` pages raises instead of growing the file or converting it to an indexed
+        one, because the pages following the run belong to other files and cannot be
+        claimed -- SINTRAN cannot grow a continuous file either.
+
+        Args:
+            path: "USERNAME/FILENAME:TYPE" or "FILENAME:TYPE".
+            pages: Number of pages to reserve. Must be at least 1.
+
+        Raises:
+            ValueError: The path carries no file name, `pages` is below 1, or the named
+                user does not exist.
+            FileExistsError: A file of that name already exists for the user.
+            IOError: No free run of `pages` consecutive pages exists, or the user's
+                object table is full.
+        """
+        self._ensure_writable()
+
+        if pages < 1:
+            raise ValueError("A contiguous file needs at least one page")
+
+        user_name, object_name, file_type = self._parse_path(path)
+        if not object_name:
+            raise ValueError("Invalid path: filename required")
+
+        user = self._resolve_user(user_name)
+        if user is None:
+            raise ValueError(f"User not found: {user_name or '(default)'}")
+
+        if self._object_file.find_object(object_name, user.user_name) is not None:
+            raise FileExistsError(f"File already exists: {path}")
+
+        # Every page of a contiguous file is real disk, so the whole run is charged to the
+        # user's quota at once -- there are no holes to discount, unlike an indexed file.
+        available_to_user = user.pages_reserved - user.pages_used
+        if available_to_user < pages:
+            expansion = pages - available_to_user
+            free_on_disk = self._bit_file.get_free_pages()
+            if free_on_disk < expansion:
+                raise IOError(
+                    f"Insufficient disk space: need {expansion} more pages for the quota, "
+                    f"only {free_on_disk} available"
+                )
+            user.pages_reserved += expansion
+
+        obj_index = self._object_file.find_free_user_slot(user.user_index)
+        if obj_index < 0:
+            raise IOError("User object table is full")
+        self._ensure_object_dir_page(obj_index)
+
+        # The defining property: one run, no index block. find_free_block_range is the
+        # only allocator that can promise consecutive blocks -- the sparse allocator picks
+        # each page independently and would scatter them.
+        start_block = self._bit_file.find_free_block_range(pages)
+        if start_block < 0:
+            raise IOError(f"No contiguous run of {pages} free pages is available on this pack")
+
+        self._bit_file.allocate_blocks(start_block, pages)
+
+        # Zero the run. A freshly created file must not expose whatever a deleted file left
+        # behind on those pages.
+        empty_page = bytes(NDFS_PAGE_SIZE)
+        for i in range(pages):
+            self._write_page(start_block + i, empty_page)
+
+        entry = ObjectEntry()
+        entry.object_index = obj_index
+        entry.object_name = object_name.upper()[:NDFS_NAME_MAX]
+        entry.type = file_type.upper()[:NDFS_TYPE_MAX]
+        entry.user_index = user.user_index
+        entry.user_name = user.user_name
+
+        # Unlike an indexed file, allocated and logical extent are the same here, and both
+        # equal the reservation -- there are no holes in a contiguous run.
+        entry.pages_in_file = pages
+
+        # Created empty: the pages exist, but no byte of them is file content yet.
+        entry.bytes_in_file = 0
+
+        # Points straight at the first data page. There is no index block to walk: page N
+        # of the file is simply block (file_pointer.block_id + N).
+        entry.file_pointer = BlockPointer(start_block, PointerType.Contiguous)
+        entry.access_bits = ACCESS_DEFAULT
+
+        # Contiguous, not indexed -- this is the flag SINTRAN prints as "CONTINUOUS FILE".
+        entry.file_type_flags = FT_CONTIGUOUS
+        entry.disk_object_index = obj_index
+        entry.next_version = obj_index
+        entry.prev_version = obj_index
+        self._object_file.add_object(entry)
+
+        user.pages_used += pages
+
+        self._write_object_page(entry.object_index)
+        self._write_user_page(user.user_index)
+        self._write_bit_file()
+        self._persist_master_block()
+
+    def _update_existing_contiguous_file(
+        self,
+        existing: ObjectEntry,
+        file_data: Union[bytes, bytearray, memoryview],
+    ) -> None:
+        """Write into an existing contiguous file, in place and within its reservation.
+
+        The run is never reallocated, so unlike the indexed path this neither frees nor
+        claims blocks, and the user's page count does not move: the pages were charged at
+        creation and stay charged until the file is deleted.
+
+        Raises:
+            IOError: `file_data` needs more pages than the file reserved, or the file has
+                no allocated run.
+        """
+        reserved_pages = existing.pages_in_file
+        needed_pages = math.ceil(len(file_data) / NDFS_PAGE_SIZE)
+
+        if needed_pages > reserved_pages:
+            raise IOError(
+                f"Cannot write {len(file_data)} bytes ({needed_pages} pages) to contiguous "
+                f"file '{existing.object_name}': it reserved {reserved_pages} pages and a "
+                "contiguous file cannot grow."
+            )
+
+        if existing.file_pointer is None or existing.file_pointer.block_id == 0:
+            raise IOError(f"Contiguous file '{existing.object_name}' has no allocated run")
+
+        start_block = existing.file_pointer.block_id
+        data = bytes(file_data)
+
+        # Write the run straight through. Every page of the reservation is rewritten, not
+        # just the pages the data covers, so bytes left over from a previous longer write
+        # cannot reappear past the new end of file.
+        for i in range(reserved_pages):
+            offset = i * NDFS_PAGE_SIZE
+            chunk = data[offset:offset + NDFS_PAGE_SIZE]
+            if len(chunk) < NDFS_PAGE_SIZE:
+                chunk = chunk + bytes(NDFS_PAGE_SIZE - len(chunk))
+            self._write_page(start_block + i, chunk)
+
+        existing.bytes_in_file = len(data)
+
+        # pages_in_file stays at the reservation. For a contiguous file the pages are
+        # allocated whether or not the data reaches them, so counting only the written
+        # pages would under-report the disk this file actually holds.
+        self._write_object_page(existing.object_index)
+
     def _update_existing_file(
         self,
         existing: ObjectEntry,
@@ -1340,6 +1546,13 @@ class NdfsFileSystem:
         file_data: Union[bytes, bytearray, memoryview],
     ) -> None:
         """Update an existing file with new data."""
+        # A contiguous file keeps the run it was created with. It is never converted to an
+        # indexed file behind the caller's back, and it never grows: SINTRAN cannot grow a
+        # CONTINUOUS file either, because the pages after the run belong to someone else.
+        if existing.file_type_flags & FT_CONTIGUOUS:
+            self._update_existing_contiguous_file(existing, file_data)
+            return
+
         # Count the REAL (non-sparse) data pages the old file was charged for
         # BEFORE freeing its blocks (structural index/sub-index blocks are
         # never part of this count -- they were never charged against the
@@ -1371,7 +1584,8 @@ class NdfsFileSystem:
         )
 
         # Update existing entry
-        existing.pages_in_file = data_pages
+        # Allocated count, not the logical extent - see the note at the create site.
+        existing.pages_in_file = self._count_real_data_pages_in_buffer(file_data)
         existing.bytes_in_file = len(file_data) if len(file_data) > 0 else 1
         existing.file_pointer = BlockPointer(top_block_id, top_pointer_type)
 

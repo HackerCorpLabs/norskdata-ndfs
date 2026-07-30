@@ -78,6 +78,35 @@ class TestUserEntryToBytesRoundTrip:
         assert parsed.pages_used == 100
         assert parsed.password == 0xABCD
 
+    def test_round_trips_unmodelled_flag_bits_in_byte_0(self):
+        # A real pack may set bits in byte 0 beyond the 0x81 pair from_bytes
+        # tests on. to_bytes used to hardcode 0x81, so any read/modify/write
+        # destroyed them -- and the user-file writer re-serializes every slot
+        # in the page, not just the edited one.
+        raw = bytearray(ENTRY_SIZE)
+        raw[0] = 0xC1  # valid user (0x81) + an unmodelled bit 6
+        raw[2] = ord("S")
+        raw[3] = ord("Y")
+        raw[4] = NDFS_NAME_TERMINATOR
+        raw[37] = 7
+
+        entry = UserEntry.from_bytes(raw, 0)
+        assert entry is not None
+        assert entry.uf == 0xC1
+
+        assert entry.to_bytes()[0] == 0xC1
+
+    def test_fresh_entry_is_marked_valid(self):
+        # An entry built from scratch must still be marked valid, or from_bytes
+        # rejects the slot on the next mount and the user vanishes.
+        user = UserEntry()
+        user.user_name = "FRESH"
+
+        raw = user.to_bytes()
+
+        assert raw[0] & USER_ENTRY_FLAG == USER_ENTRY_FLAG
+        assert UserEntry.from_bytes(raw, 0) is not None
+
 
 class TestUserEntryQuota:
     def test_detects_over_quota(self):

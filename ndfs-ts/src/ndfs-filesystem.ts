@@ -256,7 +256,13 @@ export class NdfsFileSystem {
     // Determine additional pages needed, comparing against the existing
     // file's real (non-sparse) page count — not its logical page count.
     let additionalNeeded = requiredRealPages;
-    if (existing) {
+    if (existing && (existing.fileTypeFlags & FT_CONTIGUOUS) !== 0) {
+      // A contiguous file already owns every page it will ever have, so a write can never
+      // need more. Skipping the quota step matters: the check below would otherwise
+      // expand the user's reservation for pages that are never allocated, and it would do
+      // so before updateExistingContiguousFile rejects an oversized write.
+      additionalNeeded = 0;
+    } else if (existing) {
       const existingRealPages = this.countRealDataPagesInList(this.resolveDataPointers(existing));
       additionalNeeded = requiredRealPages > existingRealPages ? requiredRealPages - existingRealPages : 0;
     }
@@ -609,7 +615,23 @@ export class NdfsFileSystem {
   getFileProperties(path: string): XatProperties | null {
     const obj = this.findObject(path);
     if (!obj) return null;
-    return objectEntryToXat(obj);
+    return objectEntryToXat(obj, this.findHoles(path));
+  }
+
+  /**
+   * Ascending logical page indices of a file's sparse holes; empty when solid.
+   *
+   * Contiguous files are solid by construction, so this is only ever non-empty
+   * for Indexed and SubIndexed ones.
+   * @param path - "USERNAME/FILENAME:TYPE" or "FILENAME:TYPE"
+   */
+  private findHoles(path: string): number[] {
+    const blocks = this.getFileBlocks(path);
+    const holes: number[] = [];
+    for (let i = 0; i < blocks.length; i++) {
+      if (blocks[i] === 0) holes.push(i);
+    }
+    return holes;
   }
 
   /**
@@ -620,7 +642,7 @@ export class NdfsFileSystem {
     const obj = this.findObject(path);
     if (!obj) throw new Error(`File not found: ${path}`);
     const data = this.readObjectData(obj);
-    const properties = objectEntryToXat(obj);
+    const properties = objectEntryToXat(obj, this.findHoles(path));
     return { data, properties };
   }
 
@@ -666,23 +688,45 @@ export class NdfsFileSystem {
 
   // -- SINTRAN initial commands ------------------------------------------
 
-  /** Return the ordered data-block IDs of a file (0 marks a sparse hole). */
+  /**
+   * Return the ordered data-block IDs of a file (0 marks a sparse hole).
+   *
+   * The list is indexed by LOGICAL page, so a hole keeps its own position and
+   * the pages after it are not shifted.
+   *
+   * FIXED 2026-07-30. This used to walk the index for `pagesInFile` slots. That
+   * is wrong for a sparse file: `pagesInFile` counts the pages really allocated,
+   * while the index is as long as the file's logical extent, holes included.
+   * Measured on `(SYSTEM)S3-CONFIG-E01:PROG` in `BIGDISK0-K-103.IMG`:
+   * `pagesInFile` is 89, the last used index slot is 98, and slots 54..63 are
+   * holes. Walking only 89 slots stopped at 88, dropping the last 10 real pages
+   * while still reporting the 10 holes -- 79 real blocks instead of 89, with
+   * every page past slot 53 at the wrong offset.
+   *
+   * Confirmed independently on real hardware: transferring that file between two
+   * ND-100s sends 89 messages carrying page numbers 0..53 then 64..98.
+   */
   getFileBlocks(path: string): number[] {
     const obj = this.findObject(path);
     if (!obj) throw new Error(`File not found: ${path}`);
     const blocks: number[] = [];
     const fp = obj.filePointer;
     if (!fp || fp.blockId === 0) return blocks;
+
+    // Logical extent, holes included. Contiguous files have no holes, so their
+    // own page count is the honest bound and is kept.
+    const logicalPages = Math.ceil(obj.bytesInFile / NDFS_PAGE_SIZE);
+
     if (fp.type === PointerType.Contiguous) {
       for (let i = 0; i < obj.pagesInFile; i++) blocks.push(fp.blockId + i);
     } else if (fp.type === PointerType.Indexed) {
       const ib = this.readPage(fp.blockId);
-      for (let i = 0; i < Math.min(obj.pagesInFile, MAX_OBJECT_FILE_POINTERS); i++) {
+      for (let i = 0; i < Math.min(logicalPages, MAX_OBJECT_FILE_POINTERS); i++) {
         blocks.push(BlockPointer.fromBytes(ib, i * 4).blockId);
       }
     } else if (fp.type === PointerType.SubIndexed) {
       const sib = this.readPage(fp.blockId);
-      let remaining = obj.pagesInFile;
+      let remaining = logicalPages;
       for (let si = 0; si < MAX_OBJECT_FILE_POINTERS && remaining > 0; si++) {
         const ip = BlockPointer.fromBytes(sib, si * 4);
         if (ip.blockId === 0) break;
@@ -1141,7 +1185,16 @@ export class NdfsFileSystem {
     entry.type = fileType.toUpperCase().substring(0, NDFS_TYPE_MAX);
     entry.userIndex = user.userIndex;
     entry.userName = user.userName;
-    entry.pagesInFile = dataPages;
+    // pagesInFile counts the pages ACTUALLY ALLOCATED, not the logical extent.
+    //
+    // Corrected 2026-07-30 to match SINTRAN. On a real pack (SYSTEM)S3-CONFIG-E01:PROG
+    // records 89 while its index spans 99 slots with 10 holes, and the machine itself
+    // reports "No of pages in file: 89" while transferring page numbers 0..53 then 64..98.
+    // Writing the logical extent charged the user quota for holes that occupy no disk.
+    //
+    // The logical extent remains ceil(bytesInFile / NDFS_PAGE_SIZE), which is what
+    // getFileBlocks uses to walk the index.
+    entry.pagesInFile = this.countRealDataPages(fileData);
     entry.bytesInFile = fileData.length > 0 ? fileData.length : 1;
     entry.filePointer = new BlockPointer(topBlockId, pointerType);
     // New-file defaults: owner+friend full rights; allocation flag; and a
@@ -1168,11 +1221,167 @@ export class NdfsFileSystem {
     this.writeBitFile();
   }
 
+  /**
+   * Create an empty contiguous file occupying a fixed run of `pages` pages.
+   *
+   * This is SINTRAN's `@CREATE-FILE name pages` -- the form that produces a file the
+   * machine reports as CONTINUOUS FILE. Every page is allocated up front and the pages
+   * are consecutive on the pack, but the file itself is created empty.
+   *
+   * The reservation is fixed for the life of the file. A later write of more than
+   * `pages` pages throws instead of growing the file or converting it to an indexed one,
+   * because the pages following the run belong to other files and cannot be claimed --
+   * SINTRAN cannot grow a continuous file either.
+   *
+   * @param path  "USERNAME/FILENAME:TYPE" or "FILENAME:TYPE".
+   * @param pages Number of pages to reserve. Must be at least 1.
+   */
+  createContiguousFile(path: string, pages: number): void {
+    this.ensureWritable();
+
+    if (!Number.isInteger(pages) || pages < 1) {
+      throw new Error('A contiguous file needs at least one page');
+    }
+
+    const { userName, objectName, fileType } = this.parsePath(path);
+    if (!objectName) throw new Error('Invalid path: filename required');
+
+    const user = this.resolveUser(userName);
+    if (!user) throw new Error(`User not found: ${userName || '(default)'}`);
+
+    if (this.objectFile.findObject(objectName, user.userName)) {
+      throw new Error(`File already exists: ${path}`);
+    }
+
+    // Every page of a contiguous file is real disk, so the whole run is charged to the
+    // user's quota at once -- there are no holes to discount, unlike an indexed file.
+    const availableToUser = user.pagesReserved - user.pagesUsed;
+    if (availableToUser < pages) {
+      const expansion = pages - availableToUser;
+      const freeOnDisk = this.bitFile.getFreePages();
+      if (freeOnDisk < expansion) {
+        throw new Error(
+          `Insufficient disk space: need ${expansion} more pages for the quota, ` +
+            `only ${freeOnDisk} available`,
+        );
+      }
+      user.pagesReserved += expansion;
+    }
+
+    const slot = this.objectFile.findFreeUserSlot(user.userIndex);
+    if (slot < 0) throw new Error(`User ${user.userName} object table is full`);
+    this.ensureObjectDirPage(slot);
+
+    // The defining property: one run, no index block. findFreeBlockRange is the only
+    // allocator that can promise consecutive blocks -- the sparse allocator picks each
+    // page independently and would scatter them.
+    const startBlock = this.bitFile.findFreeBlockRange(pages);
+    if (startBlock < 0) {
+      throw new Error(`No contiguous run of ${pages} free pages is available on this pack`);
+    }
+
+    this.bitFile.allocateBlocks(startBlock, pages);
+
+    // Zero the run. A freshly created file must not expose whatever a deleted file left
+    // behind on those pages.
+    const emptyPage = new Uint8Array(NDFS_PAGE_SIZE);
+    for (let i = 0; i < pages; i++) {
+      this.writePage(startBlock + i, emptyPage);
+    }
+
+    const entry = new ObjectEntry();
+    entry.objectIndex = slot;
+    entry.objectName = objectName.toUpperCase().substring(0, NDFS_NAME_MAX);
+    entry.type = fileType.toUpperCase().substring(0, NDFS_TYPE_MAX);
+    entry.userIndex = user.userIndex;
+    entry.userName = user.userName;
+
+    // Unlike an indexed file, allocated and logical extent are the same here, and both
+    // equal the reservation -- a contiguous run has no holes.
+    entry.pagesInFile = pages;
+
+    // Created empty: the pages exist, but no byte of them is file content yet. This is
+    // what the live machine reports for a freshly created contiguous file.
+    entry.bytesInFile = 0;
+
+    // Points straight at the first data page. There is no index block to walk: page N of
+    // the file is simply block (filePointer.blockId + N).
+    entry.filePointer = new BlockPointer(startBlock, PointerType.Contiguous);
+    entry.accessBits = ACCESS_DEFAULT;
+
+    // Contiguous, not indexed -- the flag SINTRAN prints as "CONTINUOUS FILE".
+    entry.fileTypeFlags = FT_CONTIGUOUS;
+    entry.diskObjectIndex = entry.objectIndex;
+    entry.nextVersion = entry.objectIndex;
+    entry.prevVersion = entry.objectIndex;
+    this.objectFile.addObject(entry);
+
+    user.pagesUsed += pages;
+
+    this.writeObjectPage(entry.objectIndex);
+    this.writeUserPage(user.userIndex);
+    this.writeBitFile();
+    this.persistMasterBlock();
+  }
+
+  /**
+   * Write into an existing contiguous file, in place and within its reservation.
+   *
+   * The run is never reallocated, so unlike the indexed path this neither frees nor
+   * claims blocks, and the user's page count does not move: the pages were charged at
+   * creation and stay charged until the file is deleted.
+   */
+  private updateExistingContiguousFile(existing: ObjectEntry, fileData: Uint8Array): void {
+    const reservedPages = existing.pagesInFile;
+    const neededPages = Math.ceil(fileData.length / NDFS_PAGE_SIZE);
+
+    if (neededPages > reservedPages) {
+      throw new Error(
+        `Cannot write ${fileData.length} bytes (${neededPages} pages) to contiguous file ` +
+          `'${existing.objectName}': it reserved ${reservedPages} pages and a contiguous ` +
+          'file cannot grow.',
+      );
+    }
+
+    if (!existing.filePointer || existing.filePointer.blockId === 0) {
+      throw new Error(`Contiguous file '${existing.objectName}' has no allocated run`);
+    }
+
+    const startBlock = existing.filePointer.blockId;
+
+    // Write the run straight through. EVERY page of the reservation is rewritten, not
+    // just the pages the data covers, so bytes left over from a previous longer write
+    // cannot reappear past the new end of file.
+    for (let i = 0; i < reservedPages; i++) {
+      const page = new Uint8Array(NDFS_PAGE_SIZE);
+      const offset = i * NDFS_PAGE_SIZE;
+      if (offset < fileData.length) {
+        page.set(fileData.subarray(offset, Math.min(offset + NDFS_PAGE_SIZE, fileData.length)));
+      }
+      this.writePage(startBlock + i, page);
+    }
+
+    existing.bytesInFile = fileData.length;
+
+    // pagesInFile stays at the reservation. For a contiguous file the pages are allocated
+    // whether or not the data reaches them, so counting only the written pages would
+    // under-report the disk this file actually holds.
+    this.writeObjectPage(existing.objectIndex);
+  }
+
   private updateExistingFile(
     existing: ObjectEntry,
     user: UserEntry,
     fileData: Uint8Array,
   ): void {
+    // A contiguous file keeps the run it was created with. It is never converted to an
+    // indexed file behind the caller's back, and it never grows: SINTRAN cannot grow a
+    // CONTINUOUS file either, because the pages after the run belong to someone else.
+    if ((existing.fileTypeFlags & FT_CONTIGUOUS) !== 0) {
+      this.updateExistingContiguousFile(existing, fileData);
+      return;
+    }
+
     // Resolve the OLD file's real (non-sparse) data-block pointers BEFORE
     // freeing them, so the refund below counts exactly which old pages were
     // real vs. sparse (never the index/sub-index structural blocks that
@@ -1192,7 +1401,8 @@ export class NdfsFileSystem {
     const { topBlockId, pointerType } = this.allocateAndWriteData(fileData, dataPages);
 
     // Update existing entry
-    existing.pagesInFile = dataPages;
+    // Allocated count, not the logical extent - see the note at the create site.
+    existing.pagesInFile = this.countRealDataPages(fileData);
     existing.bytesInFile = fileData.length > 0 ? fileData.length : 1;
     existing.filePointer = new BlockPointer(topBlockId, pointerType);
 

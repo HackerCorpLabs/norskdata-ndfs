@@ -1320,7 +1320,17 @@ static ndfs_error_t create_new_file(struct ndfs_filesystem *fs,
     }
     entry.user_index = fs->users[user_slot].user_index;
     memcpy(entry.user_name, fs->users[user_slot].user_name, NDFS_NAME_MAX + 1);
-    entry.pages_in_file = data_pages;
+    /* pages_in_file counts the pages ACTUALLY ALLOCATED, not the logical extent.
+     *
+     * Corrected 2026-07-30 to match SINTRAN. On a real pack (SYSTEM)S3-CONFIG-E01:PROG
+     * records 89 while its index spans 99 slots with 10 holes, and the machine itself
+     * reports "No of pages in file: 89" while transferring page numbers 0..53 then
+     * 64..98. Writing the logical extent charged the user quota for holes that occupy
+     * no disk, and produced packs disagreeing with SINTRAN-written ones.
+     *
+     * The logical extent is still ceil(bytes_in_file / NDFS_PAGE_SIZE), which is what
+     * ndfs_get_file_blocks uses to walk the index. */
+    entry.pages_in_file = count_real_data_pages_in_buffer(file_data, file_size, data_pages);
     entry.bytes_in_file = file_size > 0 ? (uint32_t)file_size : 1;
     entry.file_pointer.block_id = top_block_id;
     entry.file_pointer.type = pointer_type;
@@ -1357,11 +1367,75 @@ static ndfs_error_t create_new_file(struct ndfs_filesystem *fs,
     return NDFS_OK;
 }
 
+/* Write into an existing contiguous file, in place and within its original
+ * reservation.
+ *
+ * The run is never reallocated, so unlike the indexed path this neither frees
+ * nor claims blocks, and the user's page count does not move: the pages were
+ * charged at creation and stay charged until the file is deleted.
+ *
+ * Returns NDFS_ERR_NO_SPACE when the data needs more pages than the file
+ * reserved -- a contiguous file cannot grow, because the pages after the run
+ * belong to other files. SINTRAN behaves the same way. */
+static ndfs_error_t update_existing_contiguous_file(struct ndfs_filesystem *fs,
+                                                    ndfs_object_entry_t *existing,
+                                                    const uint8_t *file_data,
+                                                    size_t file_size)
+{
+    uint32_t reserved_pages = existing->pages_in_file;
+    uint32_t needed_pages =
+        (uint32_t)((file_size + NDFS_PAGE_SIZE - 1) / NDFS_PAGE_SIZE);
+    uint32_t start_block;
+    uint32_t i;
+
+    if (needed_pages > reserved_pages) return NDFS_ERR_NO_SPACE;
+    if (existing->file_pointer.block_id == 0) return NDFS_ERR_CORRUPT;
+
+    start_block = existing->file_pointer.block_id;
+
+    /* Write the run straight through. EVERY page of the reservation is
+     * rewritten, not just the pages the data covers, so bytes left over from a
+     * previous longer write cannot reappear past the new end of file. */
+    for (i = 0; i < reserved_pages; i++) {
+        uint8_t *page = write_page_ptr(fs, start_block + i);
+        size_t offset = (size_t)i * NDFS_PAGE_SIZE;
+        size_t count = 0;
+
+        if (!page) return NDFS_ERR_IO;
+
+        memset(page, 0, NDFS_PAGE_SIZE);
+        if (offset < file_size) {
+            count = file_size - offset;
+            if (count > NDFS_PAGE_SIZE) count = NDFS_PAGE_SIZE;
+            memcpy(page, file_data + offset, count);
+        }
+    }
+
+    existing->bytes_in_file = (uint32_t)file_size;
+
+    /* pages_in_file stays at the reservation. For a contiguous file the pages
+     * are allocated whether or not the data reaches them, so counting only the
+     * written pages would under-report the disk this file actually holds. */
+    write_object_page(fs, existing->object_index);
+
+    return NDFS_OK;
+}
+
 static ndfs_error_t update_existing_file(struct ndfs_filesystem *fs,
                                          int obj_idx, int user_slot,
                                          const uint8_t *file_data, size_t file_size)
 {
     ndfs_object_entry_t *existing = &fs->objects[obj_idx];
+
+    /* A contiguous file keeps the run it was created with. It is never
+     * converted to an indexed file behind the caller's back, and it never
+     * grows. Checked before anything else is computed, and written as a
+     * declaration initialiser so the block below stays a pure declaration
+     * list -- the file is compiled with declaration-after-statement warnings
+     * on. The pages were charged when the run was allocated, so user_slot
+     * plays no part on this path. */
+    const bool is_contiguous = (existing->file_type_flags & NDFS_FT_CONTIGUOUS) != 0;
+
     /* Real (non-sparse) pages actually charged against quota for the file's
      * OLD contents -- computed BEFORE anything is freed or reallocated,
      * since free_file_blocks()/allocate_and_write_data() below can overwrite
@@ -1377,6 +1451,12 @@ static ndfs_error_t update_existing_file(struct ndfs_filesystem *fs,
     ndfs_pointer_type_t pointer_type;
     uint32_t struct_pages;
     ndfs_error_t err;
+
+    if (is_contiguous) {
+        (void)old_real_pages;
+        (void)user_slot;
+        return update_existing_contiguous_file(fs, existing, file_data, file_size);
+    }
 
     /* Validate the new size BEFORE freeing the old blocks, so a rejected
      * write leaves the existing file (and its accounting) untouched. */
@@ -1397,7 +1477,8 @@ static ndfs_error_t update_existing_file(struct ndfs_filesystem *fs,
     if (err != NDFS_OK) return err;
 
     /* Update existing entry */
-    existing->pages_in_file = data_pages;
+    /* Allocated count, not the logical extent - see the note at the create site. */
+    existing->pages_in_file = count_real_data_pages_in_buffer(file_data, file_size, data_pages);
     existing->bytes_in_file = file_size > 0 ? (uint32_t)file_size : 1;
     existing->file_pointer.block_id = top_block_id;
     existing->file_pointer.type = pointer_type;
@@ -2041,6 +2122,16 @@ ndfs_error_t ndfs_write_file(ndfs_filesystem_t *fs,
 
         additional_needed = new_real_pages > existing_real_pages
             ? new_real_pages - existing_real_pages : 0;
+
+        /* A contiguous file already owns every page it will ever have, so a
+         * write can never need more. Skipping the quota step matters: the
+         * check below would otherwise expand the user's reservation for pages
+         * that are never allocated, and it would do so before
+         * update_existing_contiguous_file() rejects an oversized write. */
+        if (existing_idx >= 0 &&
+            (fs->objects[existing_idx].file_type_flags & NDFS_FT_CONTIGUOUS)) {
+            additional_needed = 0;
+        }
     }
 
     /* Check and expand quota if needed */
@@ -2064,6 +2155,134 @@ ndfs_error_t ndfs_write_file(ndfs_filesystem_t *fs,
      * metadata writes (object page, owner user page, bitmap); commit them (and
      * the index/data pages) to the backend now. */
     return commit_writes(fs, err);
+}
+
+ndfs_error_t ndfs_create_contiguous_file(ndfs_filesystem_t *fs,
+                                         const char *path,
+                                         uint32_t pages)
+{
+    char user_name[NDFS_NAME_MAX + 1];
+    char obj_name[NDFS_NAME_MAX + 1];
+    char file_type[NDFS_TYPE_MAX + 1];
+    int user_slot;
+    int slot;
+    uint32_t obj_index;
+    uint32_t start_block;
+    uint32_t i;
+    ndfs_user_entry_t *user;
+    ndfs_object_entry_t entry;
+    ndfs_error_t err;
+
+    if (!fs || !path) return NDFS_ERR_NULL_PTR;
+    if (fs->read_only) return NDFS_ERR_READ_ONLY;
+    if (pages == 0) return NDFS_ERR_INVALID_ARG;
+
+    parse_path(path, user_name, sizeof(user_name),
+               obj_name, sizeof(obj_name),
+               file_type, sizeof(file_type));
+
+    if (obj_name[0] == '\0') return NDFS_ERR_INVALID_ARG;
+
+    if (user_name[0] != '\0') {
+        user_slot = find_user_by_name(fs, user_name);
+    } else {
+        /* Default to the first user, same rule as ndfs_write_file(). */
+        size_t u;
+        user_slot = -1;
+        for (u = 0; u < MAX_INTERNAL_USERS; u++) {
+            if (fs->user_valid[u]) { user_slot = (int)u; break; }
+        }
+    }
+    if (user_slot < 0) return NDFS_ERR_NOT_FOUND;
+    user = &fs->users[user_slot];
+
+    if (find_object(fs, path) >= 0) return NDFS_ERR_ALREADY_EXISTS;
+
+    /* Every page of a contiguous file is real disk, so the whole run is
+     * charged to the user's quota at once -- there are no holes to discount,
+     * unlike an indexed file. */
+    {
+        int32_t avail = (int32_t)user->pages_reserved - (int32_t)user->pages_used;
+        if (avail < (int32_t)pages) {
+            uint32_t expansion = pages - (avail > 0 ? (uint32_t)avail : 0);
+            if (ndfs_bf_count_free(&fs->bit_file) < expansion) return NDFS_ERR_NO_SPACE;
+            user->pages_reserved += expansion;
+        }
+    }
+
+    slot = find_free_user_slot(fs, user->user_index);
+    if (slot < 0) return NDFS_ERR_NO_SPACE;
+    obj_index = (uint32_t)slot;
+    if (ensure_object_dir_page(fs, obj_index) == 0) return NDFS_ERR_NO_SPACE;
+
+    /* The defining property: one run, no index block. ndfs_bf_find_free_range()
+     * is the only allocator that can promise consecutive blocks -- the sparse
+     * allocator picks each page independently and would scatter them. */
+    err = ndfs_bf_find_free_range(&fs->bit_file, pages, &start_block);
+    if (err != NDFS_OK) return NDFS_ERR_NO_SPACE;
+
+    err = ndfs_bf_allocate(&fs->bit_file, start_block, pages);
+    if (err != NDFS_OK) return err;
+
+    /* Zero the run. A freshly created file must not expose whatever a deleted
+     * file left behind on those pages. */
+    for (i = 0; i < pages; i++) {
+        uint8_t *page = write_page_ptr(fs, start_block + i);
+        if (!page) {
+            ndfs_bf_free_range(&fs->bit_file, start_block, pages);
+            return NDFS_ERR_IO;
+        }
+        memset(page, 0, NDFS_PAGE_SIZE);
+    }
+
+    ndfs_oe_init(&entry);
+    entry.object_index = obj_index;
+    {
+        size_t nlen = strlen(obj_name);
+        if (nlen > NDFS_NAME_MAX) nlen = NDFS_NAME_MAX;
+        memcpy(entry.object_name, obj_name, nlen);
+        entry.object_name[nlen] = '\0';
+        str_toupper(entry.object_name);
+    }
+    {
+        size_t tlen = strlen(file_type);
+        if (tlen > NDFS_TYPE_MAX) tlen = NDFS_TYPE_MAX;
+        memcpy(entry.type, file_type, tlen);
+        entry.type[tlen] = '\0';
+        str_toupper(entry.type);
+    }
+    entry.user_index = user->user_index;
+    memcpy(entry.user_name, user->user_name, NDFS_NAME_MAX + 1);
+
+    /* Unlike an indexed file, allocated and logical extent are the same here,
+     * and both equal the reservation -- a contiguous run has no holes. */
+    entry.pages_in_file = pages;
+
+    /* Created empty: the pages exist, but no byte of them is file content yet.
+     * This is what the live machine reports for a fresh contiguous file. */
+    entry.bytes_in_file = 0;
+
+    /* Points straight at the first data page. There is no index block to walk:
+     * page N of the file is simply block (file_pointer.block_id + N). */
+    entry.file_pointer.block_id = start_block;
+    entry.file_pointer.type = NDFS_PTR_CONTIGUOUS;
+    entry.access_bits = NDFS_ACCESS_DEFAULT;
+
+    /* Contiguous, not indexed -- the flag SINTRAN prints as "CONTINUOUS FILE". */
+    entry.file_type_flags = NDFS_FT_CONTIGUOUS;
+    entry.disk_object_index = (uint16_t)obj_index;
+    entry.next_version = (uint16_t)obj_index;
+    entry.prev_version = (uint16_t)obj_index;
+
+    add_object(fs, &entry);
+
+    user->pages_used += pages;
+
+    write_object_page(fs, obj_index);
+    write_user_page(fs, user->user_index);
+    write_bit_file(fs);
+
+    return commit_writes(fs, NDFS_OK);
 }
 
 ndfs_error_t ndfs_delete_file(ndfs_filesystem_t *fs, const char *path)
@@ -2498,6 +2717,7 @@ ndfs_error_t ndfs_get_file_blocks(const ndfs_filesystem_t *fs, const char *path,
     int idx;
     const ndfs_object_entry_t *obj;
     uint32_t *blocks;
+    uint32_t logical_pages;
     size_t cap, n = 0;
 
     if (!fs || !path || !out_blocks || !out_count) return NDFS_ERR_NULL_PTR;
@@ -2508,12 +2728,32 @@ ndfs_error_t ndfs_get_file_blocks(const ndfs_filesystem_t *fs, const char *path,
     if (idx < 0) return NDFS_ERR_NOT_FOUND;
     obj = &fs->objects[idx];
 
-    cap = obj->pages_in_file ? obj->pages_in_file : 1;
+    /* Bound the walk by the file's LOGICAL extent, holes included -- not by
+     * pages_in_file, which counts only the pages really allocated.
+     *
+     * FIXED 2026-07-30. Measured on (SYSTEM)S3-CONFIG-E01:PROG in
+     * BIGDISK0-K-103.IMG: pages_in_file is 89, the last used index slot is 98,
+     * and slots 54..63 are holes. Walking 89 slots stopped at 88, dropping the
+     * last 10 real pages while still reporting the 10 holes -- 79 real blocks
+     * instead of 89, and every page past slot 53 at the wrong offset. Confirmed
+     * on real hardware: an ND-100 transferring that file sends 89 messages
+     * carrying page numbers 0..53 then 64..98.
+     *
+     * The read paths above (ndfs_read_file and friends) already bound themselves
+     * by bytes_in_file and were never affected; only this block-listing helper
+     * was. The allocation is sized from the same logical extent -- sizing it from
+     * pages_in_file while writing logical_pages entries would overrun the heap. */
+    logical_pages = (uint32_t)((obj->bytes_in_file + NDFS_PAGE_SIZE - 1) / NDFS_PAGE_SIZE);
+
+    cap = logical_pages ? logical_pages : 1;
+    if (obj->pages_in_file > cap) cap = obj->pages_in_file;
     blocks = (uint32_t *)malloc(cap * sizeof(uint32_t));
     if (!blocks) return NDFS_ERR_ALLOC;
 
     if (obj->file_pointer.type == NDFS_PTR_CONTIGUOUS) {
         uint32_t i;
+        /* A contiguous run has no holes, so its own page count is the honest
+         * bound and is kept. */
         for (i = 0; i < obj->pages_in_file; i++) {
             blocks[n++] = obj->file_pointer.block_id + i;
         }
@@ -2521,13 +2761,13 @@ ndfs_error_t ndfs_get_file_blocks(const ndfs_filesystem_t *fs, const char *path,
         const uint8_t *ib = read_page(fs, obj->file_pointer.block_id);
         uint32_t i;
         if (!ib) { free(blocks); return NDFS_ERR_CORRUPT; }
-        for (i = 0; i < obj->pages_in_file && i < 512; i++) {
+        for (i = 0; i < logical_pages && i < 512; i++) {
             ndfs_block_pointer_t p = ndfs_bp_from_bytes(ib, i * 4);
             blocks[n++] = p.block_id;
         }
     } else if (obj->file_pointer.type == NDFS_PTR_SUBINDEXED) {
         const uint8_t *sib = read_page(fs, obj->file_pointer.block_id);
-        uint32_t remaining = obj->pages_in_file;
+        uint32_t remaining = logical_pages;
         uint32_t si;
         if (!sib) { free(blocks); return NDFS_ERR_CORRUPT; }
         /* sib held across each group-index read -- pin it. */
@@ -3128,13 +3368,46 @@ ndfs_error_t ndfs_get_file_properties(const ndfs_filesystem_t *fs,
                                       ndfs_xat_properties_t *out)
 {
     int idx;
+    ndfs_error_t err;
 
     if (!fs || !path || !out) return NDFS_ERR_NULL_PTR;
 
     idx = find_object(fs, path);
     if (idx < 0) return NDFS_ERR_NOT_FOUND;
 
-    return ndfs_xat_from_object(&fs->objects[idx], out);
+    err = ndfs_xat_from_object(&fs->objects[idx], out);
+    if (err != NDFS_OK) return err;
+
+    /* Record where the sparse holes are. Only the filesystem can: they live in
+     * the file's index, not in the object entry. Without this the sidecar says a
+     * file IS sparse (bytes / 2048 exceeds pages_in_file) but not where, so a
+     * copy out and back would return it with a different layout. */
+    {
+        uint32_t *blocks = NULL;
+        size_t count = 0;
+
+        if (ndfs_get_file_blocks(fs, path, &blocks, &count) == NDFS_OK) {
+            uint32_t *holes = NULL;
+            size_t holes_n = 0, i;
+
+            if (count) {
+                holes = (uint32_t *)malloc(count * sizeof(uint32_t));
+                if (!holes) { free(blocks); return NDFS_ERR_ALLOC; }
+            }
+            for (i = 0; i < count; i++) {
+                if (blocks[i] == 0) holes[holes_n++] = (uint32_t)i;
+            }
+
+            ndfs_xat_set_holes(out, holes, holes_n);
+
+            free(holes);
+            free(blocks);
+        }
+        /* On failure the hole list stays "not determined" and the key is omitted,
+         * rather than claiming the file is solid. */
+    }
+
+    return NDFS_OK;
 }
 
 const char *ndfs_strerror(ndfs_error_t err)

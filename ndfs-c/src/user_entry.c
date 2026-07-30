@@ -15,6 +15,9 @@ void ndfs_ue_init(ndfs_user_entry_t *entry)
 {
     int i;
     memset(entry, 0, sizeof(*entry));
+    /* A fresh entry must still be marked as a used user entry, or the next
+     * ndfs_ue_from_bytes reads the slot as free. */
+    entry->uf = NDFS_USER_ENTRY_FLAG;
     entry->default_file_access = 0x04FF;
     for (i = 0; i < NDFS_MAX_FRIENDS; i++) {
         entry->friends[i].bits = 0;
@@ -40,6 +43,10 @@ ndfs_error_t ndfs_ue_from_bytes(const uint8_t *data, size_t data_len,
     memcpy(out->raw, data + offset, NDFS_ENTRY_SIZE);
     out->has_raw = true;
 
+    /* Keep the WHOLE flags byte, not just the 0x81 bits tested above. Anything
+     * else set here is a flag we do not model yet, and to_bytes writes it
+     * straight back out. */
+    out->uf                = data[offset];
     out->enter_count       = data[offset + 1];
     ndfs_read_name(data, offset + 2, NDFS_NAME_MAX, out->user_name);
     out->password          = ndfs_read_u16be(data, offset + 18);
@@ -73,7 +80,11 @@ void ndfs_ue_to_bytes(const ndfs_user_entry_t *entry, uint8_t *buf)
         memset(buf, 0, NDFS_ENTRY_SIZE);
     }
 
-    buf[0] = NDFS_USER_ENTRY_FLAG;
+    /* Flags byte written verbatim so unmodelled bits survive a read/modify/
+     * write. This used to be a hardcoded NDFS_USER_ENTRY_FLAG, which silently
+     * cleared every other bit in byte 0 of every user in the page - the
+     * user-file writer re-serializes all slots, not just the edited one. */
+    buf[0] = entry->uf;
     buf[1] = entry->enter_count;
 
     ndfs_write_name(buf, 2, entry->user_name, NDFS_NAME_MAX);

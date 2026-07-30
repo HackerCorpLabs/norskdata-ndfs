@@ -137,6 +137,30 @@ ndfs_error_t ndfs_write_file(ndfs_filesystem_t *fs,
                              size_t file_size);
 
 /**
+ * Create an empty contiguous file occupying a fixed run of `pages` pages.
+ *
+ * This is SINTRAN's "@CREATE-FILE name pages" -- the form that produces a file
+ * the machine reports as CONTINUOUS FILE. Every page is allocated up front and
+ * the pages are consecutive on the pack, but the file itself is created empty
+ * (bytes_in_file is 0).
+ *
+ * The reservation is fixed for the life of the file. A later write of more
+ * than `pages` pages returns NDFS_ERR_NO_SPACE instead of growing the file or
+ * converting it to an indexed one: the pages following the run belong to other
+ * files and cannot be claimed, which is why SINTRAN cannot grow one either.
+ *
+ * @param path   "USERNAME/FILENAME:TYPE" or "FILENAME:TYPE"
+ * @param pages  Number of pages to reserve. Must be at least 1.
+ * @return NDFS_OK, NDFS_ERR_INVALID_ARG (no file name, or pages == 0),
+ *         NDFS_ERR_ALREADY_EXISTS, NDFS_ERR_NOT_FOUND (no such user),
+ *         NDFS_ERR_NO_SPACE (no free run that long, or the object table is
+ *         full), or NDFS_ERR_READ_ONLY.
+ */
+ndfs_error_t ndfs_create_contiguous_file(ndfs_filesystem_t *fs,
+                                         const char *path,
+                                         uint32_t pages);
+
+/**
  * Write (create or overwrite) a file with parity handling.
  * @param path       "USERNAME/FILENAME:TYPE" or "FILENAME:TYPE"
  * @param file_data  The raw bytes to write.
