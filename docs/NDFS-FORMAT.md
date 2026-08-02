@@ -168,8 +168,16 @@ Offset  Size  Field              Format
 48      16    Friends            8 x 2-byte entries, big-endian
 ```
 
-**Verified against real images** (`DefaultFileAccess`@40 reads 0x04FF/0x03FF;
-friends@48). Loaders identify the owning user by the stored **User Index byte
+**Offsets verified against real images** (`DefaultFileAccess`@40 reads 0x04FF/0x03FF;
+friends@48).
+
+> **The BIT LAYOUTS above are carried by ND documentation, not by that check
+> (clarified 2026-08-02).** Reading a value at an offset tests the offset, not a bit split:
+> `0x04FF` is an equally readable number under any partition, so nothing there could have
+> failed. The friend word (bit 15 exists, 12 directory, 11 common, 10 append, 9 write, 8 read,
+> 7-0 index) is stated bit by bit in `ND-860228-2` appendix C and corroborated by
+> `ND-30.003.007`'s FRIEND TABLE. The access tiers are 14-10 public / 9-5 friend / 4-0 own,
+> five bits each, proved by ND's `002377` worked example. Loaders identify the owning user by the stored **User Index byte
 (offset 37)**, not by physical position; users are placed at physical slot
 `userIndex % 32` in page `userIndex / 32` (8 pages × 32 = 256 users max).
 
