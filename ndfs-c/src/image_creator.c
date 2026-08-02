@@ -95,7 +95,7 @@ static void build_custom_spec(uint32_t pages, ndfs_template_spec_t *out)
      * WD0.img it is object - 2; the invariant that actually holds everywhere is
      * |user - object| == 2. We emit +2 here.) */
     {
-        uint32_t bitmap_bytes = (pages + 7) / 8;
+        uint32_t bitmap_bytes = (((pages + 7) / 8) + 1) & ~1u;
         uint32_t bitmap_pages = (bitmap_bytes + NDFS_PAGE_SIZE - 1) / NDFS_PAGE_SIZE;
         uint32_t half         = pages / 2;
 
@@ -129,6 +129,23 @@ void ndfs_image_options_init(ndfs_image_options_t *opts)
     opts->include_extended_info = false;
     opts->system_number = 0;
     opts->flag_word = 0;
+}
+
+/* Mark one page as allocated in a raw bit-file image.
+ *
+ * The addressing MUST match ndfs_bf_* in bit_file.c: page N is bit N%16 of the 16-bit
+ * big-endian word N/16, which on a byte array means byte (N>>3)^1, bit N&7. See the
+ * comment above bf_byte_index() for the SINTRAN manual reference.
+ *
+ * This used to be six inline copies of "bm[b/8] |= 1u << (b%8)". When the bit order was
+ * corrected, copies like that are exactly what gets left behind - and a freshly created
+ * image would then have its reserved pages marked in one convention and read back in the
+ * other, so the allocator would hand out the object file's own index page to the first
+ * file written. One function, one place to be wrong.
+ */
+static void mark_page_used(uint8_t *bitmap, uint32_t page)
+{
+    bitmap[(page >> 3) ^ 1u] |= (uint8_t)(1u << (page & 7u));
 }
 
 ndfs_error_t ndfs_create_image(ndfs_filesystem_t **out_fs,
@@ -223,7 +240,7 @@ ndfs_error_t ndfs_create_image(ndfs_filesystem_t **out_fs,
     }
 
     /* ---- Bitmap ---- */
-    bitmap_bytes = (spec->ndfs_pages + 7) / 8;
+    bitmap_bytes = (((spec->ndfs_pages + 7) / 8) + 1) & ~1u;
     bitmap_pages = (bitmap_bytes + NDFS_PAGE_SIZE - 1) / NDFS_PAGE_SIZE;
 
     /* Mark system pages as used in the bitmap.
@@ -233,29 +250,29 @@ ndfs_error_t ndfs_create_image(ndfs_filesystem_t **out_fs,
         uint8_t *bm = img + (size_t)spec->bit_file_block * NDFS_PAGE_SIZE;
 
         /* Mark page 0 */
-        bm[0] |= (uint8_t)(1u << 0);
+        mark_page_used(bm, 0);
 
         /* Mark user file index block and its data page */
         b = spec->user_file_block;
-        bm[b / 8] |= (uint8_t)(1u << (b % 8));
+        mark_page_used(bm, b);
         b = spec->user_file_block + 1;
         if (b < spec->ndfs_pages) {
-            bm[b / 8] |= (uint8_t)(1u << (b % 8));
+            mark_page_used(bm, b);
         }
 
         /* Mark object file index block and its data page */
         b = spec->object_file_block;
-        bm[b / 8] |= (uint8_t)(1u << (b % 8));
+        mark_page_used(bm, b);
         b = spec->object_file_block + 1;
         if (b < spec->ndfs_pages) {
-            bm[b / 8] |= (uint8_t)(1u << (b % 8));
+            mark_page_used(bm, b);
         }
 
         /* Mark bitmap pages */
         for (i = 0; i < bitmap_pages; i++) {
             b = spec->bit_file_block + i;
             if (b < spec->ndfs_pages) {
-                bm[b / 8] |= (uint8_t)(1u << (b % 8));
+                mark_page_used(bm, b);
             }
         }
     }

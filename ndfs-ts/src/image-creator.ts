@@ -120,7 +120,7 @@ function getTemplateSpec(template: ImageTemplate, customPages?: number): Templat
       // bit+206 on SCSI, bit+202 on floppy). We place object/user clear of the bitmap's own
       // page span. Only bit-exactness with a SINTRAN-created image is affected; the reader
       // is pointer-driven and reads any placement correctly.
-      const bitmapBytes = Math.ceil(pages / 8);
+      const bitmapBytes = (Math.ceil(pages / 8) + 1) & ~1;
       const bitmapPages = Math.ceil(bitmapBytes / NDFS_PAGE_SIZE);
 
       const bitBlock = Math.floor(Math.floor(pages / 2) / 9) * 9;
@@ -220,7 +220,12 @@ export function createNdfsImage(options: ImageCreationOptions): Uint8Array {
   // Helper to mark a block used in bitmap
   const markUsed = (blockId: number): void => {
     if (blockId >= spec.fileBlocks) return;
-    const byteIdx = blockId >>> 3;
+    // Must match BitFile.bitPosition: page N is bit N%16 of the 16-bit big-endian word
+    // N/16, i.e. byte (N>>3)^1 on a byte array. This was a second, independent copy of
+    // the arithmetic; when the bit order was corrected the copy would otherwise have
+    // been left behind, marking a new image's reserved pages in one convention while
+    // reading them back in the other.
+    const byteIdx = (blockId >>> 3) ^ 1;
     const bitIdx = blockId & 7;
     image[bitmapOff + byteIdx] |= (1 << bitIdx);
   };

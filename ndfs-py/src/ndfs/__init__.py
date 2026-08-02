@@ -48,6 +48,11 @@ from ndfs.bit_file import BitFile
 from ndfs.user_friend import UserFriend
 from ndfs.user_entry import UserEntry
 from ndfs.user_file import UserFile
+from ndfs.errors import (
+    NdfsError,
+    ObjectBlockCollisionError,
+    ObjectBlockLimitError,
+)
 from ndfs.object_entry import ObjectEntry
 from ndfs.object_file import ObjectFile
 from ndfs.access_permissions import (
@@ -122,6 +127,7 @@ __all__ = [
     "BlockPointer", "MasterBlock", "BitFile",
     "UserFriend", "UserEntry", "UserFile",
     "ObjectEntry", "ObjectFile",
+    "NdfsError", "ObjectBlockLimitError", "ObjectBlockCollisionError",
     # Access control
     "AccessPermissions", "PERM_READ", "PERM_WRITE", "PERM_APPEND", "PERM_EXECUTE", "PERM_DELETE",
     "get_access_level", "get_friend_permissions", "check_access",

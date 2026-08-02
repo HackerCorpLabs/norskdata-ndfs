@@ -21,6 +21,37 @@ void ndfs_oe_init(ndfs_object_entry_t *entry)
     entry->type[4] = '\0';
 }
 
+int32_t ndfs_oe_compute_file_number(uint32_t object_index, uint32_t user_index)
+{
+    /* One object block = 8 pages x 32 entries = 256 files. Successive blocks of
+     * the same user are one whole index block (512 pages) apart. */
+    const uint32_t entries_per_page       = 32u;
+    const uint32_t pages_per_object_block = 8u;
+    const uint32_t pages_per_index_block  = 512u;
+    const uint32_t files_per_object_block = pages_per_object_block * entries_per_page;
+
+    uint32_t page             = object_index / entries_per_page;
+    uint32_t slot_in_page     = object_index % entries_per_page;
+    uint32_t block            = page / pages_per_index_block;
+    uint32_t page_within_row  = page % pages_per_index_block;
+    uint32_t first_page_of_u  = user_index * pages_per_object_block;
+    uint32_t offset_pages;
+    uint32_t slot;
+
+    /* Unsigned subtraction would wrap, so compare before subtracting. */
+    if (page_within_row < first_page_of_u) {
+        return -1;
+    }
+
+    offset_pages = page_within_row - first_page_of_u;
+    if (offset_pages >= pages_per_object_block) {
+        return -1;
+    }
+
+    slot = offset_pages * entries_per_page + slot_in_page;
+    return (int32_t)(block * files_per_object_block + slot);
+}
+
 ndfs_error_t ndfs_oe_from_bytes(const uint8_t *data, size_t data_len,
                                 size_t offset, ndfs_object_entry_t *out)
 {
@@ -65,6 +96,9 @@ ndfs_error_t ndfs_oe_from_bytes(const uint8_t *data, size_t data_len,
     /* User index (byte 34, high byte of the object-index word) */
     out->user_index = data[offset + 34];
     out->disk_object_index = ndfs_read_u16be(data, offset + 34);
+    /* file_number is filled in by the caller once the physical position is
+     * known - see ndfs_oe_compute_file_number. It cannot be derived from the
+     * 64 bytes alone, because the position is what encodes the object block. */
 
     /* Open counts and timestamps (offsets 36-51). */
     out->current_open_count = ndfs_read_u16be(data, offset + 36);

@@ -37,6 +37,26 @@ typedef int ndfs_error_t;
 #define NDFS_ERR_CORRUPT        -14
 #define NDFS_ERR_IO             -15   /* block backend read/write failed */
 
+/* Object-block limits. A user holds 256 files per object block, one by default
+ * and up to NDFS_MAX_OBJECT_BLOCKS. These two distinguish the limit an operator
+ * CAN lift from the one nobody can, so a copy loop can print the right advice:
+ *
+ *   NDFS_ERR_OBJ_BLOCKS_FULL  every block the user is ALLOWED is full, but the
+ *                             maximum is still below 16 - grant more with
+ *                             ndfs_fs_give_object_blocks().
+ *   NDFS_ERR_OBJ_BLOCKS_MAX   the user already has all 16 blocks (4096 files).
+ *                             Nothing can be granted; delete files instead.
+ *
+ * See docs/NDFS-OBJECT-BLOCKS-SPEC.md.
+ */
+#define NDFS_ERR_OBJ_BLOCKS_FULL -16
+#define NDFS_ERR_OBJ_BLOCKS_MAX  -17
+
+/* Growing a user into another object block would land on another user's pages:
+ * user U's block n occupies exactly the pages of user (n*64 + U)'s FIRST block.
+ * See docs/NDFS-OBJECT-BLOCKS-SPEC.md section 6. */
+#define NDFS_ERR_OBJ_BLOCK_COLLISION -18
+
 /* ── Constants ───────────────────────────────────────────────────── */
 
 /** Page size in bytes (1024 x 16-bit words). */
@@ -65,6 +85,36 @@ typedef int ndfs_error_t;
 
 /** Maximum number of users. */
 #define NDFS_MAX_USERS            256
+
+/* ── Object blocks: how a user area holds more than 256 files ──────────────
+ *
+ * A user's file entries live in OBJECT BLOCKS. One block is 8 object-file pages
+ * of 32 entries = 256 files. A user gets one block when created and may be
+ * granted up to 16, giving the SINTRAN version-K ceiling of 4096 files. The
+ * counts live in the two zero-based nibbles of user-entry byte 47 (MXOBL high,
+ * ACOBL low), so a default user stores 0x00.
+ *
+ * Block n for user U occupies object-file pages n*512 + U*8 .. +7, i.e.
+ * successive blocks of the same user are one whole index block apart.
+ *
+ * VERIFIED 2026-08-01 on a live SINTRAN III K pack. See
+ * docs/NDFS-OBJECT-BLOCKS-SPEC.md.
+ */
+
+/** Object-file pages in one object block. */
+#define NDFS_PAGES_PER_OBJECT_BLOCK 8
+
+/** Files held by one object block - 256. */
+#define NDFS_FILES_PER_OBJECT_BLOCK (NDFS_PAGES_PER_OBJECT_BLOCK * NDFS_ENTRIES_PER_PAGE)
+
+/** Page pointers in one index block, and the stride between a user's blocks. */
+#define NDFS_PAGES_PER_INDEX_BLOCK  512
+
+/** Users whose FIRST object block fits in a single index block - 64. */
+#define NDFS_USERS_PER_INDEX_BLOCK  (NDFS_PAGES_PER_INDEX_BLOCK / NDFS_PAGES_PER_OBJECT_BLOCK)
+
+/** The SINTRAN version-K ceiling: 16 object blocks = 4096 files per user. */
+#define NDFS_MAX_OBJECT_BLOCKS      16
 
 /** Maximum number of friends per user. */
 #define NDFS_MAX_FRIENDS          8

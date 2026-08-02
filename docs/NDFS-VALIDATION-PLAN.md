@@ -47,11 +47,25 @@ offsets/encodings:
   dates@40/44/48; pages@52; bytes-1@56; file pointer@60.
 - **Version semantics**: a single-version file has `next = prev = ownIndex`;
   document how additional versions chain and how SINTRAN renders `;N`.
-- **Object index scheme**: `slot = indexBlockPtr*32 + entry`, capped at 255;
-  what happens at the 256th file per user (RC returns false → must error).
+- **Object index scheme**: `slot = indexBlockPtr*32 + entry`. **ANSWERED
+  2026-08-01** - the old question here ("what happens at the 256th file per
+  user") assumed 256 was a hard cap. It is not: the user gets a second *object
+  block*. Creating file 257 must allocate a new block and raise ACOBL, and must
+  only error once `ACOBL == MXOBL`. The file number is `block*256 + slot`, not
+  the raw physical position.
 - **UserEntry** (64 B): name@2; password@18; dates@20/24; reserved@28; used@32;
   dir index@36; user index@37; **default access@40**; **friends@48** (8×2);
-  byte 47 mxobl/acobl nibbles.
+  **byte 47 = MXOBL/ACOBL, two ZERO-BASED nibbles** (high = max object blocks
+  minus 1, low = allocated minus 1; a default user stores `0x00` = 1 block =
+  256 files). Verified against a live SINTRAN III K pack.
+- **Object blocks** (new test area): block *n* for user *U* is at pages
+  `n*512 + U*8 .. +7`. Tests worth having: byte-47 round trip for a
+  multi-block user; a directory walk that finds entries in blocks 2+; the file
+  number for a second-block file (real vector: `F0500` on the BIGMAN pack is
+  `FILE 307`, owner 8 - a position-derived implementation reports index 18483
+  and owner 72); create-past-256 allocating a block rather than failing; and
+  create-past-MXOBL failing cleanly.
+  See `NDInsight SINTRAN/XMSG/DOC/NDFS-OBJECT-BLOCKS-DECODED-2026-08-01.md`.
 - **MasterBlock**/extended info, **BitFile** (contiguous), **BlockPointer**
   (type in bits 31:30, id in 29:0), allocation (contiguous/indexed/subindexed,
   sparse holes = id 0).

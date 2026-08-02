@@ -75,6 +75,11 @@ USERS:
   ndtool --quotadel SYSTEM 100 <image>       Remove 100 pages from quota
   ndtool --passwd SYSTEM <image>             Clear user password
 
+OBJECT BLOCKS (how many FILES a user may hold - not how much space):
+  ndtool --objblocks BIGMAN <image>          Show blocks, files held, room to grant
+  ndtool --giveobjblocks BIGMAN 3 <image>    Give 3 more blocks (256 -> 1024 files)
+  ndtool --takeobjblocks BIGMAN 1 <image>    Lower the maximum by 1
+
 FRIENDS (a user grants another user rights to its files):
   ndtool --friends ALICE <image>             List ALICE's friends and rights
   ndtool --friendadd ALICE:BOB:RWA <image>   Add BOB as ALICE's friend (rights RWA)
@@ -355,6 +360,53 @@ Remove pages from quota (checks that user isn't using more than the new limit):
 $ ndtool --quotadel SYSTEM 100 disk.ndfs
 User 'SYSTEM' quota: 700 -> 600 pages (-100)
 ```
+
+### Object Blocks — raising how many FILES a user may hold
+
+A SINTRAN user area holds **256 files per object block**: one block when the user is created, up to
+**16 blocks (4096 files)** once granted. This is a separate limit from disk quota — object blocks
+cap the *number* of files, `--quotaadd` caps their *total size*. A user can run out of either one
+independently, and running out of object blocks is the one that looks like a mysterious failure,
+because the file being written is not large.
+
+`--giveobjblocks` is the `@GIVE-OBJECT-BLOCKS` equivalent: it **adds** blocks to the maximum rather
+than setting a total.
+
+```
+$ ndtool --objblocks BIGMAN disk.ndfs
+User               : BIGMAN (index 1)
+Object blocks      : 1 allocated of 1 max
+Files in use       : 0 of 256 maximum
+Without new block  : 256 files
+Can still be given : 15 more block(s)
+
+$ ndtool --giveobjblocks BIGMAN 3 disk.ndfs
+User 'BIGMAN' object blocks: 1 -> 4  (max files 256 -> 1024)
+```
+
+Granting moves only the **maximum**. Blocks are allocated on demand as files are created, so
+"allocated" stays at 1 until the 257th file needs a second block. No disk pages are reserved.
+
+When a user fills up, the report names the remedy — or says plainly that there is none:
+
+```
+$ ndtool --objblocks BIGMAN disk.ndfs
+Files in use       : 4096 of 4096 maximum
+
+*** FULL. This is the SINTRAN maximum of 4096 files; no more object blocks can be granted.
+    Delete files, or use another user area.
+```
+
+`--takeobjblocks` lowers the maximum again. **It has no SINTRAN equivalent** — no command to remove
+object blocks is documented, which follows from the structure, since a file's number is derived
+from the block it sits in. It exists to undo a grant on an image you are building, and refuses to
+drop the maximum below the blocks actually holding files.
+
+**Note:** growing into a second block needs a **SubIndexed** object file. Block 1 starts at
+object-file page 512, which a plain Indexed object file cannot address. Granting blocks on such a
+pack succeeds, but the 257th file then fails.
+
+See `docs/NDFS-OBJECT-BLOCKS-SPEC.md` for the on-disk layout and how it was verified.
 
 ### Clear Password
 
@@ -690,6 +742,7 @@ ndtool is inspired by [Tor Arntsen's ndfs tool](https://www.ndwiki.org/wiki/User
 | Delete files | No | Yes (`--rm`) |
 | User management | No | Yes (`--useradd`, `--userdel`) |
 | Quota management | No | Yes (`--quotaadd`, `--quotadel`) |
+| Object blocks (files per user) | No | Yes (`--objblocks`, `--giveobjblocks`, `--takeobjblocks`) |
 | Friend management | No | Yes (`--friends`, `--friendadd`, `--frienddel`) |
 | Password clearing | No | Yes (`--passwd`) |
 | Image creation | No | Yes (`--create`) |

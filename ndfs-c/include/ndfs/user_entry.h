@@ -54,8 +54,35 @@ typedef struct {
     uint8_t            directory_index;
     uint16_t           default_file_access;
     ndfs_user_friend_t friends[NDFS_MAX_FRIENDS];
+
+    /* --- Object blocks: byte 47, decoded 2026-08-01 -------------------------
+     *
+     * A SINTRAN user area holds 256 files by default and up to 4096 on version
+     * K, structured as up to 16 "object blocks" of 256 files each. Blocks are
+     * allocated on demand; the operator raises the ceiling with
+     * @GIVE-OBJECT-BLOCKS and reads it back with @USER-STATISTICS
+     * ("MAXIMUM NUMBER OF FILES").
+     *
+     * Byte 47 holds two ZERO-BASED nibbles:
+     *   high nibble = MXOBL - 1   maximum blocks this user may have
+     *   low  nibble = ACOBL - 1   blocks actually allocated so far
+     *
+     * So a default user reads 0x00 = 1 max, 1 allocated = 256 files, which is
+     * why every untouched user on a real pack has byte 47 == 0.
+     *
+     * VERIFIED on a live SINTRAN III K pack with a control group: user BIGMAN,
+     * given 3 extra blocks and 482 files, reads 0x31 -> MXOBL 4 (matching the
+     * reported maximum of 1024 files) and ACOBL 2 (matching ceil(482/256));
+     * every other user on the same pack reads 0x00.
+     *
+     * Doc: NDInsight SINTRAN/XMSG/DOC/NDFS-OBJECT-BLOCKS-DECODED-2026-08-01.md
+     */
+    uint8_t            max_object_blocks;        /* MXOBL, 1..16 (decoded)  */
+    uint8_t            allocated_object_blocks;  /* ACOBL, 1..MXOBL         */
+
     /* Verbatim on-disk 64 bytes, used as the base when re-serializing so
-     * unmodelled bytes (38-39, 42-47 incl. the mxobl/acobl byte 47) survive.
+     * unmodelled bytes (38-39, 42-46) survive. Byte 47 is now modelled above
+     * and is rewritten from max/allocated_object_blocks.
      * has_raw is false for freshly-built entries. */
     uint8_t            raw[NDFS_ENTRY_SIZE];
     bool               has_raw;

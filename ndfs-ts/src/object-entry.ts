@@ -61,6 +61,25 @@ export class ObjectEntry {
   header: number = OBJECT_ENTRY_IN_USE;
   headerWord: number = OBJECT_ENTRY_IN_USE << 8;
   objectIndex: number = 0;
+
+  /**
+   * The file number SINTRAN reports ("FILE n") - per user, and stable for the
+   * life of the file. NOT the same as {@link objectIndex}.
+   *
+   * `objectIndex` is the raw PHYSICAL position in the object file
+   * (`page*32 + slotInPage`) and is the write-back key. The two coincide only
+   * inside a user's FIRST object block: a user may own up to 16 blocks of 256
+   * files, and block `n` sits at object-file pages `n*512 + user*8`, so past
+   * the first block the physical position encodes both block and slot.
+   *
+   * Worked example from a verified pack: `F0500` is `FILE 307` owned by user 8
+   * and sits at physical position 18483. The old model reads that as file
+   * `18483 & 0xFF` = 51 owned by `18483 >> 8` = 72 - a user that does not
+   * exist. Both wrong; only {@link computeFileNumber} gives 307.
+   *
+   * Doc: NDInsight SINTRAN/XMSG/DOC/NDFS-OBJECT-BLOCKS-DECODED-2026-08-01.md
+   */
+  fileNumber: number = 0;
   objectName: string = '';
   type: string = 'DATA';
   userName: string = '';
@@ -229,4 +248,48 @@ export class ObjectEntry {
       this.filePointer.toBytes(buffer, offset + 60);
     }
   }
+}
+
+/**
+ * Convert a physical object-file position into the file number SINTRAN reports.
+ *
+ * A user's files live in up to 16 object blocks of 256 files each, and block
+ * `n` occupies object-file pages `n*512 + user*8 .. +7`. So the number the user
+ * sees is:
+ *
+ * ```
+ * block      = page / 512
+ * slot       = (page % 512 - user*8) * 32 + slotInPage
+ * fileNumber = block * 256 + slot
+ * ```
+ *
+ * Using the raw position instead is correct only for a user's first block.
+ *
+ * @param objectIndex Physical position, `page*32 + slotInPage`.
+ * @param userIndex   Owning user, from byte 34 of the entry.
+ * @returns The per-user file number, or `-1` when the position lies outside any
+ *          object block belonging to `userIndex`. Returning -1 is deliberate: a
+ *          caller spotting a mismatch beats silently getting a plausible but
+ *          wrong number.
+ */
+export function computeFileNumber(objectIndex: number, userIndex: number): number {
+  const entriesPerPage = 32;
+  const pagesPerObjectBlock = 8;
+  const pagesPerIndexBlock = 512;
+  const filesPerObjectBlock = pagesPerObjectBlock * entriesPerPage;
+
+  const page = Math.floor(objectIndex / entriesPerPage);
+  const slotInPage = objectIndex % entriesPerPage;
+
+  const block = Math.floor(page / pagesPerIndexBlock);
+  const pageWithinBlockRow = page % pagesPerIndexBlock;
+  const firstPageOfUser = userIndex * pagesPerObjectBlock;
+
+  const offsetPages = pageWithinBlockRow - firstPageOfUser;
+  if (offsetPages < 0 || offsetPages >= pagesPerObjectBlock) {
+    return -1;
+  }
+
+  const slot = offsetPages * entriesPerPage + slotInPage;
+  return block * filesPerObjectBlock + slot;
 }

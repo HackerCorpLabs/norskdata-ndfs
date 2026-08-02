@@ -331,3 +331,172 @@ int cmd_friend_list(ndtool_ctx_t *ctx, const char *user_ref)
     ndfs_free_friends(friends);
     return 0;
 }
+
+/*
+ * --objblocks NAME  -- report a user's object-block position.
+ *
+ * A user's file entries live in OBJECT BLOCKS of 256 files each: one when the
+ * user is created, up to 16 (4096 files) once granted. This is the command that
+ * answers "why can I not add another file to this user".
+ *
+ * See docs/NDFS-OBJECT-BLOCKS-SPEC.md.
+ */
+int cmd_objblocks(ndtool_ctx_t *ctx, const char *name)
+{
+    ndfs_error_t err;
+    ndfs_object_block_info_t info;
+
+    err = ndfs_get_object_block_info(ctx->fs, name, &info);
+    if (err != NDFS_OK) {
+        fprintf(stderr, "User '%s' not found\n", name);
+        return -1;
+    }
+
+    printf("User               : %s (index %u)\n", info.user_name, info.user_index);
+    printf("Object blocks      : %u allocated of %u max\n",
+           info.allocated_object_blocks, info.max_object_blocks);
+    printf("Files in use       : %u of %u maximum\n", info.files_in_use, info.max_files);
+    printf("Without new block  : %u files\n", info.allocated_files);
+
+    if (info.files_in_use >= info.max_files) {
+        if (info.grantable_blocks == 0) {
+            /* 16 blocks is the SINTRAN ceiling - do not send the operator to a
+             * command that can only refuse. */
+            printf("\n*** FULL. This is the SINTRAN maximum of %u files;"
+                   " no more object blocks can be granted.\n"
+                   "    Delete files, or use another user area.\n",
+                   (unsigned)(NDFS_MAX_OBJECT_BLOCKS * NDFS_FILES_PER_OBJECT_BLOCK));
+        } else {
+            printf("\n*** FULL. Grant more with:  ndtool --giveobjblocks %s N IMAGE\n"
+                   "    (up to %u more block(s), %u files each)\n",
+                   info.user_name, info.grantable_blocks,
+                   (unsigned)NDFS_FILES_PER_OBJECT_BLOCK);
+        }
+    } else if (info.grantable_blocks > 0) {
+        printf("Can still be given : %u more block(s)\n", info.grantable_blocks);
+    } else {
+        printf("Can still be given : none - already at the SINTRAN maximum\n");
+    }
+
+    return 0;
+}
+
+/*
+ * --giveobjblocks NAME COUNT  -- the @GIVE-OBJECT-BLOCKS equivalent.
+ *
+ * ADDS object blocks to a user's maximum, exactly as the SINTRAN operator
+ * command does. One block is 256 files; the ceiling is 16 blocks = 4096 files.
+ *
+ * This raises only the MAXIMUM. Blocks are allocated on demand as files are
+ * created, and no disk pages are reserved - object blocks cap the NUMBER of
+ * files, not their size (for that, see --quotaadd).
+ */
+int cmd_giveobjblocks(ndtool_ctx_t *ctx, const char *name, uint32_t count)
+{
+    ndfs_error_t err;
+    ndfs_object_block_info_t info;
+    uint8_t new_max = 0;
+
+    err = ndfs_get_object_block_info(ctx->fs, name, &info);
+    if (err != NDFS_OK) {
+        fprintf(stderr, "User '%s' not found\n", name);
+        return -1;
+    }
+
+    if (count < 1) {
+        fprintf(stderr, "The number of object blocks to give must be 1 or more\n");
+        return -1;
+    }
+
+    if (info.grantable_blocks == 0) {
+        fprintf(stderr,
+                "User '%s' already has all %u object blocks (%u files).\n"
+                "This is the SINTRAN maximum - no further object blocks can be granted.\n",
+                info.user_name, (unsigned)NDFS_MAX_OBJECT_BLOCKS, info.max_files);
+        return -1;
+    }
+
+    if (count > info.grantable_blocks) {
+        fprintf(stderr,
+                "Cannot give user '%s' %u more object block(s): they have %u and "
+                "SINTRAN allows at most %u (%u files). At most %u more can be granted.\n",
+                info.user_name, count, info.max_object_blocks,
+                (unsigned)NDFS_MAX_OBJECT_BLOCKS,
+                (unsigned)(NDFS_MAX_OBJECT_BLOCKS * NDFS_FILES_PER_OBJECT_BLOCK),
+                info.grantable_blocks);
+        return -1;
+    }
+
+    if (ctx->dry_run) {
+        printf("Would give '%s' %u more object block(s): max files %u -> %u [dry run]\n",
+               info.user_name, count, info.max_files,
+               (unsigned)((info.max_object_blocks + count) * NDFS_FILES_PER_OBJECT_BLOCK));
+        return 0;
+    }
+
+    err = ndfs_give_object_blocks(ctx->fs, name, count, &new_max);
+    if (err != NDFS_OK) {
+        fprintf(stderr, "Error giving object blocks: %s\n", ndfs_strerror(err));
+        return -1;
+    }
+
+    if (ndtool_save_image(ctx) != 0) return -1;
+
+    printf("User '%s' object blocks: %u -> %u  (max files %u -> %u)\n",
+           info.user_name, info.max_object_blocks, new_max, info.max_files,
+           (unsigned)(new_max * NDFS_FILES_PER_OBJECT_BLOCK));
+    ctx->modified = false;
+    return 0;
+}
+
+/*
+ * --takeobjblocks NAME COUNT  -- lower a user's object-block maximum.
+ *
+ * THIS HAS NO SINTRAN EQUIVALENT: no command to remove object blocks is
+ * documented, which is consistent with the structure since a file's number is
+ * derived from the block it sits in. It exists only to undo a grant on an image
+ * being built, and refuses to drop the maximum below the allocated count.
+ */
+int cmd_takeobjblocks(ndtool_ctx_t *ctx, const char *name, uint32_t count)
+{
+    ndfs_error_t err;
+    ndfs_object_block_info_t info;
+    uint8_t new_max = 0;
+
+    err = ndfs_get_object_block_info(ctx->fs, name, &info);
+    if (err != NDFS_OK) {
+        fprintf(stderr, "User '%s' not found\n", name);
+        return -1;
+    }
+
+    if (count < 1) {
+        fprintf(stderr, "The number of object blocks to take must be 1 or more\n");
+        return -1;
+    }
+
+    if (ctx->dry_run) {
+        printf("Would take %u object block(s) from '%s' [dry run]\n", count, info.user_name);
+        return 0;
+    }
+
+    err = ndfs_take_object_blocks(ctx->fs, name, count, &new_max);
+    if (err == NDFS_ERR_OUT_OF_RANGE) {
+        fprintf(stderr,
+                "Cannot take %u object block(s) from '%s': %u of %u are allocated and "
+                "hold files. Lowering the maximum below the allocated count would orphan them.\n",
+                count, info.user_name, info.allocated_object_blocks, info.max_object_blocks);
+        return -1;
+    }
+    if (err != NDFS_OK) {
+        fprintf(stderr, "Error taking object blocks: %s\n", ndfs_strerror(err));
+        return -1;
+    }
+
+    if (ndtool_save_image(ctx) != 0) return -1;
+
+    printf("User '%s' object blocks: %u -> %u  (max files %u -> %u)\n",
+           info.user_name, info.max_object_blocks, new_max, info.max_files,
+           (unsigned)(new_max * NDFS_FILES_PER_OBJECT_BLOCK));
+    ctx->modified = false;
+    return 0;
+}

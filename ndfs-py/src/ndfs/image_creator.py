@@ -25,6 +25,7 @@ from ndfs.constants import (
 )
 from ndfs.endian import write_uint16_be, write_uint32_be
 from ndfs.ndfs_name import write_ndfs_name
+from ndfs.bit_file import BitFile
 from ndfs.block_pointer import BlockPointer
 from ndfs.master_block import MasterBlock
 from ndfs.types import PointerType, ImageTemplate, ImageCreationOptions
@@ -145,7 +146,9 @@ def _create_custom_spec(options: ImageCreationOptions) -> TemplateSpec:
     # on SCSI, bit+202 on floppy). We place object/user clear of the bitmap's own page span
     # so a multi-page bitmap can never overwrite them. Only bit-exactness with a
     # SINTRAN-created image is affected; the reader is pointer-driven.
-    bitmap_bytes = math.ceil(ndfs_pages / 8)
+    # Whole 16-bit words: the bit file is word-addressed, so an odd byte count would
+    # leave the last word half present. See BitFile._bit_position.
+    bitmap_bytes = (math.ceil(ndfs_pages / 8) + 1) & ~1
     bitmap_pages = math.ceil(bitmap_bytes / NDFS_PAGE_SIZE)
 
     bit_file_block = (ndfs_pages // 2 // 9) * 9
@@ -166,9 +169,16 @@ def _create_custom_spec(options: ImageCreationOptions) -> TemplateSpec:
 
 
 def _mark_block_allocated(bitmap: bytearray, block_number: int) -> None:
-    """Mark a block as allocated in the bitmap (LSB bit order within each byte)."""
-    byte_index = block_number >> 3
-    bit_index = block_number & 7
+    """Mark a block as allocated in the bitmap.
+
+    Delegates the addressing to :meth:`BitFile._bit_position` rather than repeating it.
+    This function used to carry its own copy of the arithmetic, and when the bit order
+    was corrected to SINTRAN's 16-bit word convention the copy was left behind - so a
+    freshly created image had its reserved blocks marked in one convention and read back
+    in the other, and the allocator handed the object file's own index page out to the
+    first file written.
+    """
+    byte_index, bit_index = BitFile._bit_position(block_number)
     if byte_index < len(bitmap):
         bitmap[byte_index] |= 1 << bit_index
 
@@ -229,7 +239,7 @@ def _write_master_block(
 
 def _create_bit_file(disk_image: bytearray, spec: TemplateSpec) -> None:
     """Create Bit File (allocation bitmap) and mark reserved blocks."""
-    bitmap_bytes = math.ceil(spec.ndfs_pages / 8)
+    bitmap_bytes = (math.ceil(spec.ndfs_pages / 8) + 1) & ~1
     bitmap = bytearray(bitmap_bytes)
 
     # Mark system blocks as allocated

@@ -41,6 +41,9 @@ static struct option long_options[] = {
     {"userdel",  required_argument, 0, 'D'},
     {"quotaadd", required_argument, 0, 1003},
     {"quotadel", required_argument, 0, 1004},
+    {"objblocks",     required_argument, 0, 1016},
+    {"giveobjblocks", required_argument, 0, 1017},
+    {"takeobjblocks", required_argument, 0, 1018},
     {"friendadd", required_argument, 0, 1013},
     {"frienddel", required_argument, 0, 1014},
     {"friends",    required_argument, 0, 1015},
@@ -84,6 +87,11 @@ int main(int argc, char **argv)
     const char *useradd_name = NULL;
     const char *userdel_name = NULL;
     const char *addquota_name = NULL;
+    /* Object blocks: files per user. See docs/NDFS-OBJECT-BLOCKS-SPEC.md. */
+    const char *objblocks_name = NULL;
+    const char *giveobjblocks_name = NULL;
+    const char *takeobjblocks_name = NULL;
+    uint32_t objblock_count = 0;
     const char *remquota_name = NULL;
     uint32_t quota_pages = 0;
     const char *passwd_name = NULL;
@@ -130,6 +138,9 @@ int main(int argc, char **argv)
         case 'A': useradd_name = optarg; needs_write = 1; break;
         case 'D': userdel_name = optarg; needs_write = 1; break;
         case 1003: addquota_name = optarg; needs_write = 1; break;
+        case 1016: objblocks_name = optarg; break;
+        case 1017: giveobjblocks_name = optarg; needs_write = 1; break;
+        case 1018: takeobjblocks_name = optarg; needs_write = 1; break;
         case 1004: remquota_name = optarg; needs_write = 1; break;
         case 'W': passwd_name = optarg; needs_write = 1; break;
         case 1013: friend_add_arg = optarg; needs_write = 1; break;
@@ -194,6 +205,12 @@ int main(int argc, char **argv)
 
         if ((addquota_name || remquota_name) && optind < argc - 1) {
             quota_pages = (uint32_t)atol(argv[optind]);
+        }
+
+        /* --giveobjblocks/--takeobjblocks NAME COUNT IMAGE - the count is the
+         * positional argument between the option's NAME and the image path. */
+        if ((giveobjblocks_name || takeobjblocks_name) && optind < argc - 1) {
+            objblock_count = (uint32_t)atol(argv[optind]);
         }
     }
 
@@ -289,6 +306,15 @@ int main(int argc, char **argv)
         ret = cmd_addquota(&ctx, addquota_name, quota_pages);
     } else if (remquota_name && quota_pages > 0) {
         ret = cmd_remquota(&ctx, remquota_name, quota_pages);
+    } else if (objblocks_name) {
+        ret = cmd_objblocks(&ctx, objblocks_name);
+    } else if (giveobjblocks_name) {
+        /* Default to a single block, matching @GIVE-OBJECT-BLOCKS with no count. */
+        ret = cmd_giveobjblocks(&ctx, giveobjblocks_name,
+                                objblock_count > 0 ? objblock_count : 1);
+    } else if (takeobjblocks_name) {
+        ret = cmd_takeobjblocks(&ctx, takeobjblocks_name,
+                                objblock_count > 0 ? objblock_count : 1);
     } else if (passwd_name) {
         ret = cmd_passwd(&ctx, passwd_name);
     } else if (friend_add_arg) {
@@ -328,6 +354,12 @@ static void print_usage(const char *prog)
     printf("  --quotaadd NAME PAGES   Add pages to user quota (checks disk space)\n");
     printf("  --quotadel NAME PAGES   Remove pages from user quota (checks usage)\n");
     printf("  --passwd NAME            Clear user password\n");
+    printf("  --objblocks NAME         Show object blocks and file count for a user\n");
+    printf("  --giveobjblocks NAME N   Give N more object blocks (256 files each, max 16)\n");
+    printf("                           The @GIVE-OBJECT-BLOCKS equivalent. Raises the\n");
+    printf("                           file limit only; blocks are used on demand and\n");
+    printf("                           no disk pages are reserved (see --quotaadd).\n");
+    printf("  --takeobjblocks NAME N   Lower the object block maximum by N\n");
     printf("  --friends USER           List USER's friends and their rights\n");
     printf("  --friendadd OWNER:FRIEND[:RWACD]  Add a friend (default rights RWA)\n");
     printf("  --frienddel OWNER:FRIEND          Remove a friend\n");

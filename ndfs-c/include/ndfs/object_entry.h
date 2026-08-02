@@ -63,6 +63,27 @@ typedef struct {
     uint8_t              header;        /**< Byte 0: bit7 = in use. */
     uint16_t             header_word;   /**< Bytes 0-1: full 16-bit header. */
     uint32_t             object_index;  /**< Physical slot in the object file. */
+    /**
+     * The file number SINTRAN reports ("FILE n"), per user and stable for the
+     * life of the file. NOT the same as object_index.
+     *
+     * object_index is the raw PHYSICAL position (page*32 + slot) and is the
+     * write-back key. The two coincide only inside a user's FIRST object block:
+     * a user may own up to 16 blocks of 256 files, and block n sits at object
+     * file pages n*512 + user*8, so past the first block the physical position
+     * encodes both block and slot.
+     *
+     * Worked example from a verified pack: F0500 is FILE 307 owned by user 8,
+     * at physical position 18483. The old model reads that as file 18483&0xFF
+     * = 51 owned by 18483>>8 = 72 - a user that does not exist. Both wrong.
+     *
+     * Set by ndfs_oe_compute_file_number(); -1 (as 0xFFFFFFFF) is never stored
+     * here - callers get -1 from the function itself for a position outside the
+     * user's region.
+     *
+     * Doc: NDInsight SINTRAN/XMSG/DOC/NDFS-OBJECT-BLOCKS-DECODED-2026-08-01.md
+     */
+    uint32_t             file_number;
     char                 object_name[NDFS_NAME_MAX + 1];
     char                 type[NDFS_TYPE_MAX + 1];
     char                 user_name[NDFS_NAME_MAX + 1]; /**< Resolved at load time. */
@@ -116,6 +137,28 @@ void ndfs_oe_full_name(const ndfs_object_entry_t *entry, char *buf, size_t buf_l
 
 /** Initialize a new empty object entry. */
 void ndfs_oe_init(ndfs_object_entry_t *entry);
+
+/**
+ * Convert a physical object-file position into the file number SINTRAN reports.
+ *
+ * A user's files live in up to 16 object blocks of 256 files each, and block n
+ * occupies object-file pages n*512 + user*8 .. +7. The number the user sees is
+ * therefore:
+ *
+ *     block      = page / 512
+ *     slot       = (page % 512 - user*8) * 32 + slot_in_page
+ *     fileNumber = block * 256 + slot
+ *
+ * Using the raw position instead is correct only for a user's first block.
+ *
+ * @param object_index  Physical position, page*32 + slot_in_page.
+ * @param user_index    Owning user, from byte 34 of the entry.
+ * @return The per-user file number, or -1 when the position lies outside any
+ *         object block belonging to user_index. Returning -1 is deliberate: a
+ *         caller spotting a mismatch beats silently getting a plausible but
+ *         wrong number.
+ */
+int32_t ndfs_oe_compute_file_number(uint32_t object_index, uint32_t user_index);
 
 #ifdef __cplusplus
 }

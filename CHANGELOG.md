@@ -1,0 +1,83 @@
+# Changelog
+
+All notable changes to the NDFS libraries (`ndfs-c`, `ndfs-py`, `ndfs-ts`, `ndtool`).
+
+## 0.0.5 — 2026-08-02
+
+**Upgrade strongly recommended. Earlier versions can corrupt genuine SINTRAN packs on write.**
+
+### Fixed — allocation bitmap was byte-swapped (data corruption)
+
+The bit file is an array of **16-bit words**: page `N` is bit `N%16` of word `N/16`, counting
+from the LSB. Every earlier version addressed it as byte `N/8`, bit `N%8`, which on a
+big-endian image swaps the two bytes of every word.
+
+Consequence: the free-page search could return pages SINTRAN had already allocated, so
+**writing to a real pack could overwrite live file data**. Reading was unaffected in practice,
+which is why `list` and `extract` always looked correct.
+
+Authority: `ND-30.003.007 EN SINTRAN III System Supervisor`, appendix F.2 —
+`PAGE = BLOCK*400B + WORD*20B + BIT`, where `20B` is 16 decimal (identical formula in the
+Norwegian edition `ND-30.003.7 NO`); and SINTRAN's own allocator, which forms the word index
+with `SHA ZIN SHR 4` (page/16) at `TPAGF` 51043B.
+
+Measured on three genuine ND media — pages that demonstrably hold file data yet were reported
+FREE:
+
+| Image | old | new |
+|---|---|---|
+| `BIGDISK0-L.IMG` (75 MB pack) | 32 | **0** |
+| `210319H02-XX-01D.img` (floppy) | 4 | **0** |
+| `Nd-210523I01-XX-01D.img` (floppy) | 3 | **0** |
+
+### Fixed — bitmap truncated on devices not a multiple of 16 pages
+
+The bitmap is now rounded up to a whole 16-bit word. `ceil(pages/8)` alone leaves the final
+word half present: a 616-page ND floppy silently lost pages 608-615.
+
+### Fixed — file numbers wrong for a relocated overflow object block
+
+SINTRAN relocates a user's overflow object block when another user needs that index-block
+group. The logical block is therefore the **ordinal rank** of the group among the groups that
+user occupies, not the physical group number. On a captured 201-user pack the old formula
+numbered one user's files 0..255 then **1024..1067**, where SINTRAN reports **256..299**.
+
+Because the rank depends on the user's whole set of groups, file numbering is no longer a pure
+function of `(position, user)` — it is applied as a post-load pass.
+
+### Changed — overflow blocks no longer refuse on a "collision"
+
+An earlier guard refused to grow a user into a block whose group belonged to another user.
+SINTRAN does not refuse: it **skips** to a free group, and relocates later if the home owner
+needs it. These libraries now skip too, and additionally never place a block in an existing
+user's home group, so they cannot produce a layout SINTRAN would have to rearrange.
+
+Note also that the "multi-user" and "multi-block" placements were never rival models:
+`(U//64)*512 + (U%64)*8` is identically `8U`.
+
+### Added — regression tests that could actually have caught the above
+
+The previous suites round-tripped through this library: written with convention X, read back
+with convention X, which passes for any self-consistent convention including a wrong one. The
+one check against real data was a **popcount** comparison, and popcount is invariant under
+byte-swapping — it could not have failed even in principle.
+
+The new tests are deliberately **asymmetric**, checked against artefacts this project did not
+produce:
+
+- ND's own worked example from appendix F.2 (the `313B` bit-file word)
+- the `PAGE = BLOCK*400B + WORD*20B + BIT` formula, and explicit byte-position assertions
+- the invariant that no page holding real file data may read as free, on genuine ND media
+- `testdata/BIGDISK0-K-201users.img.gz` — a real SINTRAN III K pack captured with 201 users
+  and a thrice-relocated overflow block, which no synthetic image can reproduce
+
+Each was verified to **fail** against the pre-0.0.5 code.
+
+### Test counts
+
+TypeScript 396, Python 475, C 261.
+
+## 0.0.4 and earlier
+
+See git history. **Do not use for writing to genuine SINTRAN media** — see the bitmap defect
+above.

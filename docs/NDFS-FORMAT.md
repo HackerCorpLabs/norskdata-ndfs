@@ -225,7 +225,10 @@ Offset  Size  Field              Format
   the owning user, and the object file is partitioned so user *U* owns object
   slots `U*256 .. U*256+255` (index-block pointer slots `U*8 .. U*8+7`). SINTRAN
   derives the owner from the slot's physical position; a file must be written
-  into its owner's region, not the first free global slot. Max 256 files/user.
+  into its owner's region, not the first free global slot.
+  **This describes ONE object block. A user may own up to 16** - see
+  "Object blocks" below. The 256-per-user figure held for every pack this
+  project had seen, but it is the DEFAULT, not the limit.
 - Name/Type fields use a **single** `0x27` terminator followed by NULs (not a
   field padded with terminators).
 
@@ -352,6 +355,56 @@ encodes `(U << 8) | fileEntry`, and a new file MUST be placed in a free slot of
 its owner's region (allocating/linking that user's directory page on demand) —
 not the first free global slot. Writing to a global slot puts the file in the
 wrong user's region as far as SINTRAN is concerned.
+
+### Object blocks — a user can own more than one region
+
+**Corrected 2026-08-01.** The paragraph above describes a single **object
+block**. A SINTRAN user area holds 256 files per object block, **one block by
+default and up to 16 (4096 files) on version K**. The operator raises the
+ceiling with `@GIVE-OBJECT-BLOCKS`; `@USER-STATISTICS` reports the result as
+`MAXIMUM NUMBER OF FILES`. Blocks are allocated on demand as files are created.
+
+The counts live in **user-entry byte 47, as two ZERO-BASED nibbles**:
+
+| nibble | meaning |
+|---|---|
+| high | `MXOBL - 1` — maximum object blocks this user may have |
+| low  | `ACOBL - 1` — object blocks actually allocated so far |
+
+A default user therefore stores `0x00` (1 max, 1 allocated), which is why every
+pack examined before this correction showed byte 47 = 0 and the extra structure
+stayed invisible.
+
+**Placement.** Object block *n* (0-based) for user *U* occupies pages:
+
+```
+n*512 + U*8  ..  n*512 + U*8 + 7
+```
+
+i.e. successive blocks of the same user are a **stride of 512 pages** apart —
+exactly one index block. The object file is effectively a two-dimensional array
+indexed by (block, user).
+
+**The file number is therefore NOT the raw physical position:**
+
+```
+block      = page / 512
+slot       = (page % 512 - U*8) * 32 + entryInPage
+fileNumber = block * 256 + slot
+```
+
+Deriving the number from physical position alone is correct only for a user's
+first block, and silently wrong for every file beyond it.
+
+**Verified** on a live SINTRAN III K pack with a control group: user BIGMAN,
+given 3 extra blocks and holding 482 files, stores byte 47 = `0x31` (MXOBL 4,
+matching its reported maximum of 1024; ACOBL 2, matching ceil(482/256)) with its
+entries at pages 64-71 and 576-583, while every other user on the same pack
+stores `0x00`. Independently, the file `F0500` reports as `FILE 307` both to
+SINTRAN and through the formula above.
+
+Full evidence:
+`NDInsight SINTRAN/XMSG/DOC/NDFS-OBJECT-BLOCKS-DECODED-2026-08-01.md`.
 
 ## Path Format
 

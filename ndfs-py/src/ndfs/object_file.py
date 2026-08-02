@@ -16,10 +16,16 @@ from ndfs.constants import (
     NDFS_PAGE_SIZE,
     ENTRIES_PER_PAGE,
     ENTRY_SIZE,
+    FILES_PER_OBJECT_BLOCK,
+    MAX_OBJECT_BLOCKS,
     MAX_OBJECT_FILE_POINTERS,
+    MAX_VERIFIED_MULTIBLOCK_USER,
+    PAGES_PER_INDEX_BLOCK,
+    PAGES_PER_OBJECT_BLOCK,
+    USERS_PER_INDEX_BLOCK,
 )
 from ndfs.block_pointer import BlockPointer
-from ndfs.object_entry import ObjectEntry
+from ndfs.object_entry import ObjectEntry, compute_file_number
 from ndfs.types import PointerType
 
 _BufType = Union[bytes, bytearray, memoryview]
@@ -90,17 +96,106 @@ class ObjectFile:
                 return i
         return self._next_index
 
-    def find_free_user_slot(self, user_index: int) -> int:
-        """Find the next free object slot WITHIN a user's region.
+    @staticmethod
+    def physical_slot(user_index: int, block: int, slot_in_block: int) -> int:
+        """Physical object-file position of a slot in a user's *block*-th object block.
 
-        SINTRAN partitions the object file so user U owns slots
-        U*256..U*256+255 and the object-index high byte is the owning user.
-        Returns -1 if the user's table is full.
+        Kept for compatibility: it assumes the block-th block lives in the group
+        ``home + block``, which is where an UNOBSTRUCTED overflow block lands. Use
+        :meth:`physical_slot_in_group` when the group is known, because SINTRAN skips
+        groups whose slot is already spoken for.
         """
-        base = (user_index & 0xFF) << 8
-        for slot in range(base, base + 256):
-            if slot not in self._entries:
-                return slot
+        return ObjectFile.physical_slot_in_group(
+            user_index, (user_index // USERS_PER_INDEX_BLOCK) + block, slot_in_block
+        )
+
+    @staticmethod
+    def physical_slot_in_group(user_index: int, group: int, slot_in_block: int) -> int:
+        """Physical object-file position of ``slot_in_block`` in a given index-block group.
+
+        A user always occupies slot ``user % 64`` of a group, eight pages wide::
+
+            page     = group*512 + (user % 64)*8 + slot_in_block // 32
+            physical = page*32 + slot_in_block % 32
+
+        The user's HOME group is ``user // 64``; that pairing reduces to the flat
+        ``page = user*8`` for a first block. Overflow blocks use the same slot in a
+        higher group.
+        """
+        page = (group * PAGES_PER_INDEX_BLOCK
+                + (user_index % USERS_PER_INDEX_BLOCK) * PAGES_PER_OBJECT_BLOCK
+                + slot_in_block // ENTRIES_PER_PAGE)
+        return page * ENTRIES_PER_PAGE + (slot_in_block % ENTRIES_PER_PAGE)
+
+    def groups_used_by(self, user_index: int) -> List[int]:
+        """The index-block groups this user has entries in, ascending."""
+        groups = set()
+        for entry in self._entries.values():
+            if entry.user_index != user_index:
+                continue
+            page = entry.object_index // ENTRIES_PER_PAGE
+            groups.add(page // PAGES_PER_INDEX_BLOCK)
+        return sorted(groups)
+
+    def find_free_user_slot(
+        self,
+        user_index: int,
+        max_object_blocks: int = 1,
+        allocated_object_blocks: int = 1,
+        group_available=None,
+    ) -> int:
+        """Find the next free object slot for a user, across all their object blocks.
+
+        A user area holds 256 files per object block. Every one of a user's blocks sits
+        at slot ``user % 64`` of some index-block group; the HOME group ``user // 64``
+        holds block 0, and overflow blocks take the same slot in a HIGHER group.
+
+        **SINTRAN skips a group whose slot is already spoken for.** Measured live
+        (2026-08-02): user 8 overflowing past 256 files did not take group 1 - user 72
+        lives there - it took the next group whose slot 8 was free. See
+        ``_assign_file_numbers`` for the full experiment.
+
+        Args:
+            user_index: The owning user.
+            max_object_blocks: MXOBL, 1..16.
+            allocated_object_blocks: ACOBL, 1..MXOBL.
+            group_available: Optional predicate ``(group) -> bool`` used only when a NEW
+                block is needed. The file-system layer supplies it so this class does not
+                need to know about the user file. Default: any group is acceptable, which
+                reproduces the old unobstructed behaviour.
+
+        Returns:
+            The physical slot, or -1 when every permitted block is full or no group can
+            be found for the next one.
+        """
+        max_blocks = max(1, min(MAX_OBJECT_BLOCKS, max_object_blocks))
+        allocated = max(1, min(max_blocks, allocated_object_blocks))
+
+        # Blocks the user already occupies, plus the HOME group - which is block 0 and
+        # must be searched even when the user has no entries yet. Look for a hole; holes
+        # are normal, since deleting a file leaves one and SINTRAN never compacts.
+        home = user_index // USERS_PER_INDEX_BLOCK
+        for group in sorted(set(self.groups_used_by(user_index)) | {home}):
+            for slot_in_block in range(FILES_PER_OBJECT_BLOCK):
+                physical = self.physical_slot_in_group(user_index, group, slot_in_block)
+                if physical not in self._entries:
+                    return physical
+
+        # Every allocated block is full. Open the next one if the user's maximum allows,
+        # searching upward from home for a group whose slot is free AND acceptable.
+        if allocated >= max_blocks:
+            return -1
+
+        used = set(self.groups_used_by(user_index)) | {home}
+        for group in range(home, MAX_OBJECT_FILE_POINTERS):
+            if group in used:
+                continue
+            if group_available is not None and not group_available(group):
+                continue
+            first = self.physical_slot_in_group(user_index, group, 0)
+            if first not in self._entries:
+                return first
+
         return -1
 
     def get_total_pages_used(self) -> int:
@@ -146,6 +241,62 @@ class ObjectFile:
                     index_page, read_page, global_object_index
                 )
 
+        # File numbers can only be assigned once every entry is loaded - see
+        # _assign_file_numbers for why they are not a pure function of position.
+        self._assign_file_numbers()
+
+    def _assign_file_numbers(self) -> None:
+        """Assign each entry the number SINTRAN reports, e.g. the 307 in "FILE 307".
+
+        The number is ``logical_block * 256 + slot_in_block``, where **logical_block is
+        the ORDINAL RANK of the entry's index-block group among the groups that user
+        occupies**, ascending - NOT the physical group number.
+
+        That distinction is invisible until a user's overflow block gets relocated, and
+        SINTRAN relocates them freely. Measured on a live SINTRAN III K pack
+        (2026-08-02): user 8 with 300 files held block 0 at group 0 and its overflow
+        block at group 2. Creating files for user 136 - whose HOME is group 2 slot 8 -
+        moved user 8's overflow to group 3; then creating files for user 200, whose home
+        is group 3 slot 8, moved it again to group 4. All 300 files survived every move,
+        and SINTRAN reported them throughout as FILE 0..299.
+
+        A user's blocks always sit at the same slot ``user % 64``; only the group varies.
+        The home group ``user // 64`` holds block 0, and overflow blocks take the same
+        slot in a higher group, yielding it to the rightful home owner on demand.
+
+        This is why the old ``block = page // 512`` formula was wrong: for user 8 above it
+        produced file numbers 0..255 and then 1024..1067, where SINTRAN says 256..299. It
+        looked right on the earlier BIGMAN pack only because nothing had displaced that
+        pack's overflow block, so the physical group happened to equal the ordinal.
+        """
+        by_user: Dict[int, List[ObjectEntry]] = {}
+        for entry in self._entries.values():
+            by_user.setdefault(entry.user_index, []).append(entry)
+
+        for user_index, entries in by_user.items():
+            groups = sorted({
+                (e.object_index // ENTRIES_PER_PAGE) // PAGES_PER_INDEX_BLOCK
+                for e in entries
+            })
+            rank = {g: i for i, g in enumerate(groups)}
+
+            for entry in entries:
+                page = entry.object_index // ENTRIES_PER_PAGE
+                group = page // PAGES_PER_INDEX_BLOCK
+                page_in_group = page % PAGES_PER_INDEX_BLOCK
+                # The slot WITHIN a group is (user % 64), not the raw user index -
+                # 64 users' slots fill one 512-page group.
+                slot_base = (user_index % USERS_PER_INDEX_BLOCK) * PAGES_PER_OBJECT_BLOCK
+                offset_pages = page_in_group - slot_base
+                if offset_pages < 0 or offset_pages >= PAGES_PER_OBJECT_BLOCK:
+                    # Not inside this user's slot - report -1 rather than a plausible
+                    # wrong number, so a mismatch surfaces.
+                    entry.file_number = -1
+                    continue
+                slot = (offset_pages * ENTRIES_PER_PAGE
+                        + entry.object_index % ENTRIES_PER_PAGE)
+                entry.file_number = rank[group] * FILES_PER_OBJECT_BLOCK + slot
+
     def _load_objects_from_index_block(
         self,
         index_page: _BufType,
@@ -166,6 +317,12 @@ class ObjectFile:
                 entry = ObjectEntry.from_bytes(data_page, j * ENTRY_SIZE)
                 if entry is not None:
                     entry.object_index = object_index + j
+                    # The number SINTRAN shows is NOT the physical position:
+                    # a user's files can span several object blocks, each a
+                    # whole index block apart. compute_file_number undoes that.
+                    entry.file_number = compute_file_number(
+                        entry.object_index, entry.user_index
+                    )
                     self._entries[entry.object_index] = entry
                     if entry.object_index >= self._next_index:
                         self._next_index = entry.object_index + 1

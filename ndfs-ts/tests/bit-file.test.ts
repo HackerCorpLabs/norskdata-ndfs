@@ -8,7 +8,9 @@ describe('BitFile', () => {
       const bf = new BitFile();
       bf.initialize(100);
       expect(bf.totalPages).toBe(100);
-      expect(bf.getBitmapData().length).toBe(13); // ceil(100/8)
+      // ceil(100/8) = 13, rounded UP to a whole 16-bit word: the bit file is word
+      // addressed, so an odd byte count leaves pages 96..99 unreachable.
+      expect(bf.getBitmapData().length).toBe(14);
     });
 
     it('starts with all blocks free', () => {
@@ -179,7 +181,13 @@ describe('BitFile', () => {
     it('loads raw bitmap data', () => {
       const bf = new BitFile();
       bf.initialize(16);
-      const raw = new Uint8Array([0xff, 0x00]); // first 8 used, next 8 free
+      // The bit file is an array of 16-bit BIG-ENDIAN words, page N at bit N%16 of
+      // word N/16 (LSB-first). So in the byte pair [high, low], the LOW byte carries
+      // pages 0..7 and the HIGH byte carries pages 8..15.
+      //
+      // This test used to read `[0xff, 0x00] // first 8 used` and assert the opposite.
+      // That was the bug, asserted as if it were the specification.
+      const raw = new Uint8Array([0x00, 0xff]); // high: pages 8-15 free, low: 0-7 used
       bf.loadBitmap(raw);
       for (let i = 0; i < 8; i++) expect(bf.isBlockUsed(i)).toBe(true);
       for (let i = 8; i < 16; i++) expect(bf.isBlockUsed(i)).toBe(false);

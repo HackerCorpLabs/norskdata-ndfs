@@ -18,14 +18,20 @@ from ndfs.constants import (
     NDFS_PAGE_SIZE,
     ENTRIES_PER_PAGE,
     ENTRY_SIZE,
+    FILES_PER_OBJECT_BLOCK,
+    MAX_OBJECT_BLOCKS,
     MAX_OBJECT_FILE_POINTERS,
     MAX_USER_FILE_POINTERS,
+    PAGES_PER_INDEX_BLOCK,
+    PAGES_PER_OBJECT_BLOCK,
+    USERS_PER_INDEX_BLOCK,
     FIRST_ALLOCATABLE_BLOCK,
     MAX_USERS,
     NDFS_NAME_MAX,
     NDFS_TYPE_MAX,
 )
 from ndfs.endian import read_uint32_be, write_uint32_be
+from ndfs.errors import ObjectBlockCollisionError, ObjectBlockLimitError
 from ndfs.block_pointer import BlockPointer
 from ndfs.master_block import MasterBlock
 from ndfs.bit_file import BitFile
@@ -33,7 +39,13 @@ from ndfs.user_file import UserFile
 from ndfs.object_file import ObjectFile
 from ndfs.user_entry import UserEntry
 from ndfs.user_friend import UserFriend
-from ndfs.object_entry import ObjectEntry, ACCESS_DEFAULT, FT_INDEXED, FT_CONTIGUOUS
+from ndfs.object_entry import (
+    ObjectEntry,
+    ACCESS_DEFAULT,
+    FT_INDEXED,
+    FT_CONTIGUOUS,
+    compute_file_number,
+)
 from ndfs.types import PointerType, FileEntry, ImageCreationOptions, BootFormat, BootControllerType, BootCode
 from ndfs.xat import object_entry_to_xat, xat_to_object_entry
 from ndfs import sintran
@@ -897,8 +909,14 @@ class NdfsFileSystem:
                     and 0 < mb.ext_pages_available <= total_pages):
                 self._bit_file.alloc_ceiling = mb.ext_pages_available
 
-            # Determine bitmap size in pages
-            bitmap_bytes = math.ceil(total_pages / 8)
+            # Determine bitmap size in pages.
+            #
+            # Rounded up to a whole number of 16-bit WORDS, because that is how the bit
+            # file is addressed (see BitFile._bit_position). On a device whose page count
+            # is not a multiple of 16, the final word is only half covered by
+            # ceil(pages/8) bytes, and the pages living in its high byte would be cut off
+            # - a 616-page floppy loses pages 608..615 exactly this way.
+            bitmap_bytes = (math.ceil(total_pages / 8) + 1) & ~1
             bitmap_pages = math.ceil(bitmap_bytes / NDFS_PAGE_SIZE)
 
             # Read contiguous bitmap pages
@@ -1204,6 +1222,220 @@ class NdfsFileSystem:
                     bytes_read += to_copy
         return bytes_read
 
+    def _allocate_user_object_slot(self, user) -> int:
+        """Pick a free object slot for *user*, opening a new object block if needed.
+
+        A user's blocks all sit at slot ``user % 64`` of an index-block group. Block 0 is
+        in the HOME group ``user // 64``; further blocks take the same slot in a HIGHER
+        group, skipping any group whose slot belongs to a user that already exists.
+
+        That skipping is what SINTRAN does, measured live on 2026-08-02: user 8 growing
+        past 256 files did NOT take group 1 (user 72 lives there) - it moved on. SINTRAN
+        goes further still and RELOCATES an overflow block when the rightful home owner
+        later needs the group; this library instead declines to place a block in another
+        user's home in the first place, which never produces a layout needing relocation.
+
+        Raises IOError only when the user is genuinely at their ceiling, or when no group
+        can be found for another block.
+        """
+        def group_available(group: int) -> bool:
+            # The user whose HOME this group/slot is. Placing an overflow block there
+            # would be taken back by SINTRAN the moment that user creates a file, so
+            # avoid it if that user exists at all.
+            home_owner = group * USERS_PER_INDEX_BLOCK + (user.user_index % USERS_PER_INDEX_BLOCK)
+            if home_owner == user.user_index:
+                return True
+            if home_owner >= MAX_USERS:
+                return True
+            return self._user_file.get_user(home_owner) is None
+
+        slot = self._object_file.find_free_user_slot(
+            user.user_index,
+            user.max_object_blocks,
+            user.allocated_object_blocks,
+            group_available,
+        )
+        if slot < 0:
+            raise ObjectBlockLimitError(
+                user.user_name,
+                user.max_object_blocks,
+                user.allocated_object_blocks,
+                is_hard_limit=user.max_object_blocks >= MAX_OBJECT_BLOCKS,
+            )
+
+        # Count the distinct groups this user now occupies: that IS the allocated block
+        # count, and byte 47's low nibble records it.
+        groups = set(self._object_file.groups_used_by(user.user_index))
+        page = slot // ENTRIES_PER_PAGE
+        groups.add(page // PAGES_PER_INDEX_BLOCK)
+        user.allocated_object_blocks = max(1, min(user.max_object_blocks, len(groups)))
+
+        return slot
+
+    # ------------------------------------------------------------------
+    # Object block administration - the @GIVE-OBJECT-BLOCKS equivalent
+    # ------------------------------------------------------------------
+
+    def get_object_block_info(self, user_name_or_index):
+        """Report a user's object-block position: what they hold and what they may hold.
+
+        This is the query a user interface needs in order to say anything useful
+        about "why can I not add another file". It returns a plain dict:
+
+            user_name                the user area
+            user_index               its index in the user file
+            allocated_object_blocks  ACOBL - blocks in use, 1..max
+            max_object_blocks        MXOBL - blocks permitted, 1..16
+            files_in_use             entries actually present for this user
+            max_files                MXOBL * 256, what @USER-STATISTICS prints
+                                     as MAXIMUM NUMBER OF FILES
+            allocated_files          ACOBL * 256, capacity without growing
+            can_grant                True while MXOBL < 16
+            grantable_blocks         16 - MXOBL, how many give_object_blocks may add
+
+        Blocks are allocated on demand, so ``allocated_object_blocks`` climbs by
+        itself as files are created; only ``max_object_blocks`` needs an operator.
+
+        Args:
+            user_name_or_index: User name (case-insensitive) or user index.
+
+        Returns:
+            The dict described above.
+
+        Raises:
+            ValueError: If no such user exists.
+        """
+        user = self._require_user(user_name_or_index)
+        files_in_use = len(self._object_file.get_user_objects(user.user_index))
+        return {
+            "user_name": user.user_name,
+            "user_index": user.user_index,
+            "allocated_object_blocks": user.allocated_object_blocks,
+            "max_object_blocks": user.max_object_blocks,
+            "files_in_use": files_in_use,
+            "max_files": user.max_object_blocks * FILES_PER_OBJECT_BLOCK,
+            "allocated_files": user.allocated_object_blocks * FILES_PER_OBJECT_BLOCK,
+            "can_grant": user.max_object_blocks < MAX_OBJECT_BLOCKS,
+            "grantable_blocks": MAX_OBJECT_BLOCKS - user.max_object_blocks,
+        }
+
+    def give_object_blocks(self, user_name_or_index, count: int = 1) -> int:
+        """Grant *count* additional object blocks to a user, raising their file ceiling.
+
+        This is the library equivalent of the SINTRAN operator command::
+
+            @GIVE-OBJECT-BLOCKS (<directory>:)<user>,<count>
+
+        which likewise ADDS to the maximum rather than setting it. Each block is
+        256 files, so granting 3 blocks to a default user takes their ceiling
+        from 256 to 1024 - exactly what ``@USER-STATISTICS`` then reports as
+        MAXIMUM NUMBER OF FILES. VERIFIED on a live SINTRAN III K pack: user
+        BIGMAN went from 256 to 1024 after ``@GIVE-OBJECT-BLOCKS BIGMAN,3``, and
+        user-entry byte 47 read back 0x31 = MXOBL 4.
+
+        What this does NOT do, deliberately:
+
+          * It does not allocate the blocks. Only the MAXIMUM moves. SINTRAN
+            allocates a block the first time a file needs it, and so does this
+            library - see ``_allocate_user_object_slot``. A user granted 4 blocks
+            who holds 300 files still has ACOBL 2.
+          * It does not reserve disk pages. Object blocks limit the number of
+            FILES, not their size; page quota is separate
+            (``pages_reserved``/``@GIVE-USER-SPACE``).
+          * It does not convert an Indexed object file to SubIndexed. A second
+            object block lives at page 512 and up, which an Indexed object file
+            cannot address at all; growth into it fails later, when a file
+            actually needs the block. See docs/NDFS-OBJECT-BLOCKS-SPEC.md
+            section 3.
+
+        Args:
+            user_name_or_index: User name (case-insensitive) or user index.
+            count: Blocks to ADD, 1 or more. Defaults to 1.
+
+        Returns:
+            The user's new maximum object block count, 2..16.
+
+        Raises:
+            ValueError: If no such user exists, if *count* is below 1, or if the
+                grant would push the maximum past the SINTRAN limit of 16 blocks.
+                The limit case reports how many blocks are still grantable so the
+                caller can retry with a figure that fits.
+        """
+        self._ensure_writable()
+        if count < 1:
+            raise ValueError(f"count must be 1 or more, got {count}")
+
+        user = self._require_user(user_name_or_index)
+        new_max = user.max_object_blocks + count
+        if new_max > MAX_OBJECT_BLOCKS:
+            grantable = MAX_OBJECT_BLOCKS - user.max_object_blocks
+            raise ValueError(
+                f"Cannot give user {user.user_name} {count} more object block(s): they "
+                f"have {user.max_object_blocks} and SINTRAN allows at most "
+                f"{MAX_OBJECT_BLOCKS} ({MAX_OBJECT_BLOCKS * FILES_PER_OBJECT_BLOCK} "
+                f"files). At most {grantable} more can be granted."
+            )
+
+        user.max_object_blocks = new_max
+        self._write_user_page(user.user_index)
+        return new_max
+
+    def take_object_blocks(self, user_name_or_index, count: int = 1) -> int:
+        """Lower a user's object-block maximum by *count*.
+
+        **This has no SINTRAN equivalent.** No command to remove object blocks is
+        documented in the manuals or was found while carving the kernel, and that
+        is consistent with the structure: file numbers are stable identifiers
+        derived from the block a file sits in, so dropping a block would orphan
+        every file in it. This exists only so a tool can undo its own grant on an
+        image it is building, and it refuses anything that would strand a file.
+
+        The maximum can never fall below the number of blocks actually allocated,
+        nor below 1.
+
+        Args:
+            user_name_or_index: User name (case-insensitive) or user index.
+            count: Blocks to remove, 1 or more. Defaults to 1.
+
+        Returns:
+            The user's new maximum object block count.
+
+        Raises:
+            ValueError: If no such user exists, if *count* is below 1, or if the
+                reduction would drop the maximum below the allocated count.
+        """
+        self._ensure_writable()
+        if count < 1:
+            raise ValueError(f"count must be 1 or more, got {count}")
+
+        user = self._require_user(user_name_or_index)
+        new_max = user.max_object_blocks - count
+        if new_max < user.allocated_object_blocks:
+            raise ValueError(
+                f"Cannot take {count} object block(s) from user {user.user_name}: "
+                f"{user.allocated_object_blocks} of {user.max_object_blocks} are "
+                "allocated and hold files. Lowering the maximum below the allocated "
+                "count would orphan them."
+            )
+        if new_max < 1:
+            raise ValueError("A user must keep at least one object block")
+
+        user.max_object_blocks = new_max
+        self._write_user_page(user.user_index)
+        return new_max
+
+    def _require_user(self, user_name_or_index) -> UserEntry:
+        """Look a user up by name or index, raising ValueError when absent.
+
+        Thin wrapper over the existing ``_resolve_user_ref`` (which returns None
+        for a miss) so the object-block calls can fail loudly instead of each
+        repeating the same None check.
+        """
+        user = self._resolve_user_ref(user_name_or_index)
+        if user is None:
+            raise ValueError(f"User not found: {user_name_or_index}")
+        return user
+
     def _ensure_object_dir_page(self, object_index: int) -> None:
         """Ensure the object-file directory page holding *object_index* exists,
         allocating and linking it on demand (each user's region grows as
@@ -1331,9 +1563,7 @@ class NdfsFileSystem:
         # partitions the object file: user U owns slots U*256..U*256+255 and
         # the object-index high byte is the owner) and ensure its directory
         # page exists, before allocating file data.
-        obj_index = self._object_file.find_free_user_slot(user.user_index)
-        if obj_index < 0:
-            raise IOError("User object table is full")
+        obj_index = self._allocate_user_object_slot(user)
         self._ensure_object_dir_page(obj_index)
 
         # Allocate index/sub-index block(s) and write data (sparse-aware).
@@ -1345,6 +1575,10 @@ class NdfsFileSystem:
         # Create object entry
         entry = ObjectEntry()
         entry.object_index = obj_index
+        # The user-visible number is not the physical position once a user owns
+        # more than one object block - compute it here too, or a freshly created
+        # entry reads 0 until the pack is reloaded.
+        entry.file_number = compute_file_number(obj_index, user.user_index)
         entry.object_name = object_name.upper()[:NDFS_NAME_MAX]
         entry.type = file_type.upper()[:NDFS_TYPE_MAX]
         entry.user_index = user.user_index
@@ -1438,9 +1672,7 @@ class NdfsFileSystem:
                 )
             user.pages_reserved += expansion
 
-        obj_index = self._object_file.find_free_user_slot(user.user_index)
-        if obj_index < 0:
-            raise IOError("User object table is full")
+        obj_index = self._allocate_user_object_slot(user)
         self._ensure_object_dir_page(obj_index)
 
         # The defining property: one run, no index block. find_free_block_range is the
@@ -1460,6 +1692,10 @@ class NdfsFileSystem:
 
         entry = ObjectEntry()
         entry.object_index = obj_index
+        # The user-visible number is not the physical position once a user owns
+        # more than one object block - compute it here too, or a freshly created
+        # entry reads 0 until the pack is reloaded.
+        entry.file_number = compute_file_number(obj_index, user.user_index)
         entry.object_name = object_name.upper()[:NDFS_NAME_MAX]
         entry.type = file_type.upper()[:NDFS_TYPE_MAX]
         entry.user_index = user.user_index

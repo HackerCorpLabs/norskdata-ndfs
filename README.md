@@ -6,16 +6,65 @@
 
 Read and write NDFS (Norsk Data File System) disk images from Sintran-III minicomputers.
 
+> ## ⚠ Upgrade to 0.0.5 — earlier versions corrupt real SINTRAN disks on write
+>
+> **Every version before 0.0.5 read and wrote the allocation bitmap byte-swapped.** If you
+> have written to a genuine SINTRAN-written pack with 0.0.4 or earlier, **check it** — the
+> free-page search could hand out pages SINTRAN had already allocated, overwriting live file
+> data.
+>
+> ### What was wrong
+>
+> | | Before 0.0.5 | 0.0.5 |
+> |---|---|---|
+> | **Bit file addressing** | byte `N/8`, bit `N%8` | 16-bit **word** `N/16`, bit `N%16` |
+> | **Bitmap size** | `ceil(pages/8)` bytes | rounded up to a whole 16-bit word |
+> | **File number** | from the **physical** index-block group | from the group's **ordinal rank** |
+>
+> **1. The bit file is word-addressed, not byte-addressed.** SINTRAN stores it as 16-bit
+> words — `PAGE = BLOCK*400B + WORD*20B + BIT`, `ND-30.003.007` appendix F.2, where `20B` is
+> 16 — so on a big-endian image page 0 lives in byte **1**, not byte 0. Measured on three
+> genuine ND media, the old scheme reported **32, 4 and 3 pages that demonstrably hold file
+> data as FREE**. The new scheme reports none.
+>
+> *Reading was unaffected in practice*, which is why `list`/`extract` always looked correct.
+> Writing was not.
+>
+> **2. Devices whose page count is not a multiple of 16 lost their last pages.** A 616-page
+> ND floppy silently dropped pages 608-615, because `ceil(616/8) = 77` bytes leaves the
+> final 16-bit word half present.
+>
+> **3. File numbers were wrong for any relocated overflow object block.** SINTRAN moves a
+> user's second object block when another user needs that group, so the number must come from
+> the group's ordinal **rank**, not its index. On a captured 201-user pack the old formula
+> numbered a user's files 0..255 then **1024..1067** where SINTRAN says **256..299**.
+>
+> ### Why the test suites did not catch any of it
+>
+> Every test round-tripped through this library: written with convention X, read back with
+> convention X. That passes for **any** self-consistent convention, including a wrong one. The
+> one check made against real data was a **popcount** comparison — and popcount is invariant
+> under byte-swapping, so it could not have failed even in principle.
+>
+> 0.0.5 adds deliberately **asymmetric** regression tests, checked against ND's own manual
+> (the appendix F.2 worked example), against SINTRAN's own allocator, and against packs
+> SINTRAN itself wrote — including one captured with 201 users and a thrice-relocated object
+> block. Each was verified to **fail** against the old code.
+>
+> Full detail: [`docs/NDFS-OBJECT-BLOCKS-SPEC.md`](docs/NDFS-OBJECT-BLOCKS-SPEC.md) and
+> [`docs/NDFS-FORMAT.md`](docs/NDFS-FORMAT.md).
+
+
 Three standalone libraries with identical APIs, plus a CLI tool:
 
 | Library | Language | Tests | Install |
 |---------|----------|-------|---------|
-| [ndfs-ts](ndfs-ts/) | TypeScript | 288 | `npm install norskdata-ndfs` |
-| [ndfs-py](ndfs-py/) | Python | 328 | `pip install norskdata-ndfs` |
-| [ndfs-c](ndfs-c/) | C99 | 166 | `cmake .. && make` |
+| [ndfs-ts](ndfs-ts/) | TypeScript | 396 | `npm install norskdata-ndfs` |
+| [ndfs-py](ndfs-py/) | Python | 475 | `pip install norskdata-ndfs` |
+| [ndfs-c](ndfs-c/) | C99 | 261 | `cmake .. && make` |
 | [ndtool](ndfs-c/tools/ndtool/README.md) | CLI (C) | -- | Built with libndfs |
 
-**Total: 782 tests. No external dependencies in any library.**
+**Total: 1132 tests. No external dependencies in any library.**
 
 ## What It Does
 
@@ -107,7 +156,8 @@ ndfs.write_initial_commands(['ENTER-DIRECTORY,,DISC-SCSI-1,0', 'SET-AVAILABLE'])
 ndtool -t disk.ndfs                          # List all files
 ndtool -i -v disk.ndfs                       # Info with bitmap visualization
 ndtool --fsck disk.ndfs                      # Full filesystem check
-ndtool -x -p -d -l -o output/ disk.ndfs     # Extract all, strip parity, lowercase
+ndtool -x -d -l -o output/ disk.ndfs        # Extract all (binaries safe: no -p)
+ndtool -x -p -d -l -o output/ disk.ndfs     # TEXT ONLY: -p strips bit 7 and DESTROYS :BPUN/:PROG/:DATA binaries
 ndtool -p --put source.c RONNY/SOURCE:C disk.ndfs   # Copy in with parity
 ndtool --create floppy360 --name MYDISK new.ndfs     # Create new image
 ndtool --shell disk.ndfs                     # Interactive mode

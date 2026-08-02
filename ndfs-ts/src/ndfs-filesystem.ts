@@ -14,7 +14,11 @@ import {
   NDFS_PAGE_SIZE,
   ENTRIES_PER_PAGE,
   ENTRY_SIZE,
+  FILES_PER_OBJECT_BLOCK,
+  MAX_OBJECT_BLOCKS,
   MAX_OBJECT_FILE_POINTERS,
+  PAGES_PER_INDEX_BLOCK,
+  USERS_PER_INDEX_BLOCK,
   MAX_USER_FILE_POINTERS,
   FIRST_ALLOCATABLE_BLOCK,
   MAX_USERS,
@@ -22,6 +26,7 @@ import {
   NDFS_TYPE_MAX,
 } from './constants.js';
 import { readUint32BE, writeUint32BE } from './endian.js';
+import { ObjectBlockCollisionError, ObjectBlockLimitError } from './errors.js';
 import * as sintran from './sintran.js';
 import { BlockPointer } from './block-pointer.js';
 import { MasterBlock } from './master-block.js';
@@ -32,6 +37,7 @@ import { UserEntry } from './user-entry.js';
 import { UserFriend } from './user-friend.js';
 import {
   ObjectEntry,
+  computeFileNumber,
   ACCESS_DEFAULT,
   FT_INDEXED,
   FT_CONTIGUOUS,
@@ -399,6 +405,213 @@ export class NdfsFileSystem {
     const ok = this.userFile.updateUserQuota(index, newPages);
     if (ok) this.writeUserPage(index);
     return ok;
+  }
+
+  // ------------------------------------------------------------------
+  // Object blocks: files per user
+  // ------------------------------------------------------------------
+
+  /**
+   * Pick a free object slot for `user`, growing into a new object block if needed.
+   *
+   * A user area holds 256 files per object block, one by default and up to
+   * `user.maxObjectBlocks` (raised with `@GIVE-OBJECT-BLOCKS`, or
+   * {@link giveObjectBlocks} here). Blocks are allocated on demand, so when every
+   * allocated block is full this takes the first slot of the next one and raises
+   * the user's allocated count to match - which is what SINTRAN does, and what
+   * makes creating file 257 work at all.
+   *
+   * @throws {ObjectBlockLimitError} when the user is genuinely at their ceiling,
+   * rather than merely past 256 files. Read `isHardLimit` to tell a grantable
+   * limit from the SINTRAN maximum of 4096 files.
+   * @throws {ObjectBlockCollisionError} when the next block's pages belong to
+   * another user.
+   */
+  private allocateUserObjectSlot(user: UserEntry): number {
+    // A user's blocks all sit at slot (user % 64) of an index-block group. Block 0 is in
+    // the HOME group (user / 64); further blocks take the same slot in a HIGHER group,
+    // skipping any group whose slot belongs to a user that already exists.
+    //
+    // That skipping is what SINTRAN does, measured live 2026-08-02: user 8 growing past
+    // 256 files did NOT take group 1 (user 72 lives there). SINTRAN goes further and
+    // RELOCATES an overflow block when the rightful home owner later needs the group;
+    // this library instead declines to place a block in another user's home at all, so it
+    // never produces a layout needing relocation.
+    const groupAvailable = (group: number): boolean => {
+      const homeOwner =
+        group * USERS_PER_INDEX_BLOCK + (user.userIndex % USERS_PER_INDEX_BLOCK);
+      if (homeOwner === user.userIndex) return true;
+      if (homeOwner >= MAX_USERS) return true;
+      return this.userFile.getUser(homeOwner) === null;
+    };
+
+    const slot = this.objectFile.findFreeUserSlot(
+      user.userIndex,
+      user.maxObjectBlocks,
+      user.allocatedObjectBlocks,
+      groupAvailable,
+    );
+
+    if (slot < 0) {
+      throw new ObjectBlockLimitError(
+        user.userName,
+        user.maxObjectBlocks,
+        user.allocatedObjectBlocks,
+        user.maxObjectBlocks >= MAX_OBJECT_BLOCKS,
+      );
+    }
+
+    // The number of distinct groups this user occupies IS the allocated block count, which
+    // byte 47's low nibble records.
+    const groups = new Set(this.objectFile.groupsUsedBy(user.userIndex));
+    groups.add(Math.floor(slot / ENTRIES_PER_PAGE / PAGES_PER_INDEX_BLOCK));
+    user.allocatedObjectBlocks = Math.max(
+      1,
+      Math.min(user.maxObjectBlocks, groups.size),
+    );
+
+    return slot;
+  }
+
+  /**
+   * Grant a user additional object blocks, raising the number of files they may hold.
+   *
+   * The library equivalent of the SINTRAN operator command
+   * `@GIVE-OBJECT-BLOCKS (<directory>:)<user>,<count>`, which likewise ADDS to
+   * the maximum rather than setting it. Each block is 256 files, so granting 3
+   * blocks to a default user takes their ceiling from 256 to 1024 - exactly what
+   * `@USER-STATISTICS` then reports as MAXIMUM NUMBER OF FILES. VERIFIED on a
+   * live SINTRAN III K pack: user BIGMAN went from 256 to 1024 after
+   * `@GIVE-OBJECT-BLOCKS BIGMAN,3`, with byte 47 reading back `0x31`.
+   *
+   * What this deliberately does NOT do:
+   *  - It does not allocate the blocks. Only the MAXIMUM moves; a block is
+   *    allocated the first time a file needs it, as SINTRAN does. A user granted
+   *    4 blocks who holds 300 files still has `allocatedObjectBlocks` of 2.
+   *  - It does not reserve disk pages. Object blocks cap the NUMBER of files,
+   *    not their size; page quota is separate (`@GIVE-USER-SPACE`).
+   *  - It does not convert an Indexed object file to SubIndexed. A second block
+   *    lives at page 512 and up, which an Indexed object file cannot address at
+   *    all, so growth into it fails later - when a file actually needs the block.
+   *
+   * @param indexOrName User index, or user name (case-insensitive).
+   * @param count Object blocks to ADD. Must be 1 or more. Defaults to 1.
+   * @returns The user's new maximum object block count, 2..16.
+   * @throws {Error} when no such user exists, when `count` is below 1, or when
+   * the grant would push the maximum past the SINTRAN limit of 16 blocks. The
+   * limit case reports how many blocks are still grantable.
+   */
+  giveObjectBlocks(indexOrName: number | string, count = 1): number {
+    this.ensureWritable();
+
+    if (count < 1) throw new Error(`count must be 1 or more, got ${count}`);
+
+    const user = this.requireUser(indexOrName);
+    const newMax = user.maxObjectBlocks + count;
+    if (newMax > MAX_OBJECT_BLOCKS) {
+      // Refuse rather than clamp: clamping would leave the caller believing it
+      // received what it asked for.
+      const grantable = MAX_OBJECT_BLOCKS - user.maxObjectBlocks;
+      throw new Error(
+        `Cannot give user ${user.userName} ${count} more object block(s): they ` +
+          `have ${user.maxObjectBlocks} and SINTRAN allows at most ` +
+          `${MAX_OBJECT_BLOCKS} (${MAX_OBJECT_BLOCKS * FILES_PER_OBJECT_BLOCK} ` +
+          `files). At most ${grantable} more can be granted.`,
+      );
+    }
+
+    user.maxObjectBlocks = newMax;
+    this.writeUserPage(user.userIndex);
+    return newMax;
+  }
+
+  /**
+   * Lower a user's object-block maximum.
+   *
+   * **This has no SINTRAN equivalent.** No command to remove object blocks is
+   * documented in the manuals, nor was one found while carving the kernel -
+   * consistent with the structure, since a file's number is derived from the
+   * block it sits in, so dropping a block would orphan every file in it. This
+   * exists only so a tool can undo its own grant on an image it is building, and
+   * refuses anything that would strand a file.
+   *
+   * @param indexOrName User index, or user name (case-insensitive).
+   * @param count Object blocks to remove. Must be 1 or more. Defaults to 1.
+   * @returns The user's new maximum object block count.
+   * @throws {Error} when no such user exists, when `count` is below 1, or when
+   * the reduction would drop the maximum below the allocated count.
+   */
+  takeObjectBlocks(indexOrName: number | string, count = 1): number {
+    this.ensureWritable();
+
+    if (count < 1) throw new Error(`count must be 1 or more, got ${count}`);
+
+    const user = this.requireUser(indexOrName);
+    const newMax = user.maxObjectBlocks - count;
+    if (newMax < user.allocatedObjectBlocks) {
+      throw new Error(
+        `Cannot take ${count} object block(s) from user ${user.userName}: ` +
+          `${user.allocatedObjectBlocks} of ${user.maxObjectBlocks} are allocated ` +
+          `and hold files. Lowering the maximum below the allocated count would ` +
+          `orphan them.`,
+      );
+    }
+    if (newMax < 1) throw new Error('A user must keep at least one object block');
+
+    user.maxObjectBlocks = newMax;
+    this.writeUserPage(user.userIndex);
+    return newMax;
+  }
+
+  /**
+   * Report a user's object-block position: what they hold and what they may hold.
+   *
+   * This is the query a user interface needs in order to answer "why can I not
+   * add another file". Blocks are allocated on demand, so `allocatedObjectBlocks`
+   * climbs by itself as files are created; only `maxObjectBlocks` needs an
+   * operator.
+   *
+   * @param indexOrName User index, or user name (case-insensitive).
+   * @throws {Error} when no such user exists.
+   */
+  getObjectBlockInfo(indexOrName: number | string): {
+    userName: string;
+    userIndex: number;
+    allocatedObjectBlocks: number;
+    maxObjectBlocks: number;
+    filesInUse: number;
+    maxFiles: number;
+    allocatedFiles: number;
+    canGrant: boolean;
+    grantableBlocks: number;
+  } {
+    const user = this.requireUser(indexOrName);
+
+    // Counted live rather than read from a stored total: SINTRAN never compacts
+    // the object table, so deletions leave holes and any cached figure drifts.
+    const filesInUse = this.objectFile.getUserObjects(user.userIndex).length;
+
+    return {
+      userName: user.userName,
+      userIndex: user.userIndex,
+      allocatedObjectBlocks: user.allocatedObjectBlocks,
+      maxObjectBlocks: user.maxObjectBlocks,
+      filesInUse,
+      maxFiles: user.maxObjectBlocks * FILES_PER_OBJECT_BLOCK,
+      allocatedFiles: user.allocatedObjectBlocks * FILES_PER_OBJECT_BLOCK,
+      canGrant: user.maxObjectBlocks < MAX_OBJECT_BLOCKS,
+      grantableBlocks: MAX_OBJECT_BLOCKS - user.maxObjectBlocks,
+    };
+  }
+
+  /** Look a user up by index or name, throwing when absent. */
+  private requireUser(indexOrName: number | string): UserEntry {
+    const user =
+      typeof indexOrName === 'number'
+        ? this.userFile.getUser(indexOrName)
+        : this.userFile.findUser(indexOrName);
+    if (!user) throw new Error(`User not found: ${indexOrName}`);
+    return user;
   }
 
   /** Clear a user's password (set to 0). */
@@ -871,7 +1084,10 @@ export class NdfsFileSystem {
       this.bitFile.initialize(totalPages);
 
       // Determine bitmap size in pages
-      const bitmapBytes = Math.ceil(totalPages / 8);
+      // Whole 16-bit words - the bit file is word addressed, so ceil(pages/8) cuts the
+      // last word in half on any device whose page count is not a multiple of 16 and
+      // loses the pages living in its high byte. A 616-page ND floppy loses 608..615.
+      const bitmapBytes = (Math.ceil(totalPages / 8) + 1) & ~1;
       const bitmapPages = Math.ceil(bitmapBytes / NDFS_PAGE_SIZE);
 
       // Read contiguous bitmap pages
@@ -1172,8 +1388,7 @@ export class NdfsFileSystem {
 
     // Choose the object slot inside the owning user's region, and make sure
     // that user's directory page exists, before allocating file data.
-    const slot = this.objectFile.findFreeUserSlot(user.userIndex);
-    if (slot < 0) throw new Error(`User ${user.userName} object table is full`);
+    const slot = this.allocateUserObjectSlot(user);
     this.ensureObjectDirPage(slot);
 
     const { topBlockId, pointerType } = this.allocateAndWriteData(fileData, dataPages);
@@ -1184,6 +1399,11 @@ export class NdfsFileSystem {
     entry.objectName = objectName.toUpperCase().substring(0, NDFS_NAME_MAX);
     entry.type = fileType.toUpperCase().substring(0, NDFS_TYPE_MAX);
     entry.userIndex = user.userIndex;
+    // The number SINTRAN shows is NOT the physical position: a user's files can
+    // span several object blocks, each a whole index block apart. Compute it on
+    // create as well as on load, or a freshly created file reports 0 until the
+    // image is reloaded.
+    entry.fileNumber = computeFileNumber(entry.objectIndex, entry.userIndex);
     entry.userName = user.userName;
     // pagesInFile counts the pages ACTUALLY ALLOCATED, not the logical extent.
     //
@@ -1268,8 +1488,7 @@ export class NdfsFileSystem {
       user.pagesReserved += expansion;
     }
 
-    const slot = this.objectFile.findFreeUserSlot(user.userIndex);
-    if (slot < 0) throw new Error(`User ${user.userName} object table is full`);
+    const slot = this.allocateUserObjectSlot(user);
     this.ensureObjectDirPage(slot);
 
     // The defining property: one run, no index block. findFreeBlockRange is the only
@@ -1294,6 +1513,11 @@ export class NdfsFileSystem {
     entry.objectName = objectName.toUpperCase().substring(0, NDFS_NAME_MAX);
     entry.type = fileType.toUpperCase().substring(0, NDFS_TYPE_MAX);
     entry.userIndex = user.userIndex;
+    // The number SINTRAN shows is NOT the physical position: a user's files can
+    // span several object blocks, each a whole index block apart. Compute it on
+    // create as well as on load, or a freshly created file reports 0 until the
+    // image is reloaded.
+    entry.fileNumber = computeFileNumber(entry.objectIndex, entry.userIndex);
     entry.userName = user.userName;
 
     // Unlike an indexed file, allocated and logical extent are the same here, and both

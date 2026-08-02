@@ -19,6 +19,7 @@ extern void run_master_block_tests(void);
 extern void run_bit_file_tests(void);
 extern void run_user_entry_tests(void);
 extern void run_object_entry_tests(void);
+extern void run_object_block_tests(void);
 extern void run_filesystem_tests(void);
 extern void run_image_creator_tests(void);
 extern void run_boot_loader_tests(void);
@@ -44,6 +45,7 @@ int main(void)
     run_bit_file_tests();
     run_user_entry_tests();
     run_object_entry_tests();
+    run_object_block_tests();
     run_filesystem_tests();
     run_image_creator_tests();
     run_boot_loader_tests();

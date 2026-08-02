@@ -75,6 +75,18 @@ int cmd_delete(ndtool_ctx_t *ctx, const char *ndfs_path);
 int cmd_useradd(ndtool_ctx_t *ctx, const char *name, uint32_t quota);
 int cmd_userdel(ndtool_ctx_t *ctx, const char *name);
 int cmd_addquota(ndtool_ctx_t *ctx, const char *name, uint32_t pages);
+
+/* Object blocks: files per user. A user holds 256 files per object block, one
+ * by default and up to 16 (4096 files). See docs/NDFS-OBJECT-BLOCKS-SPEC.md. */
+
+/** Report a user's object-block position: files held, ceiling, room to grant. */
+int cmd_objblocks(ndtool_ctx_t *ctx, const char *name);
+
+/** Grant a user COUNT more object blocks - the @GIVE-OBJECT-BLOCKS equivalent. */
+int cmd_giveobjblocks(ndtool_ctx_t *ctx, const char *name, uint32_t count);
+
+/** Lower a user's object-block maximum. No SINTRAN equivalent; undoes a grant. */
+int cmd_takeobjblocks(ndtool_ctx_t *ctx, const char *name, uint32_t count);
 int cmd_remquota(ndtool_ctx_t *ctx, const char *name, uint32_t pages);
 int cmd_passwd(ndtool_ctx_t *ctx, const char *name);
 /* Friend commands. add/del take "OWNER:FRIEND[:RWACD]" / "OWNER:FRIEND";

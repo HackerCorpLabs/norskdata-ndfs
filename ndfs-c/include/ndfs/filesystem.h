@@ -285,6 +285,115 @@ ndfs_error_t ndfs_get_metadata(const ndfs_filesystem_t *fs, const char *path,
 ndfs_error_t ndfs_get_user(const ndfs_filesystem_t *fs, uint8_t index,
                            ndfs_user_entry_t *out_user);
 
+/* ── Object blocks: files per user ──────────────────────────────────
+ *
+ * A user's file entries live in OBJECT BLOCKS of 256 files each. A user gets
+ * one when created and may be granted up to NDFS_MAX_OBJECT_BLOCKS (16), giving
+ * the SINTRAN version-K ceiling of 4096 files. The counts live in the two
+ * zero-based nibbles of user-entry byte 47 (MXOBL high, ACOBL low).
+ *
+ * Blocks are allocated ON DEMAND as files are created, so the allocated count
+ * climbs by itself; only the MAXIMUM needs an operator.
+ *
+ * See docs/NDFS-OBJECT-BLOCKS-SPEC.md.
+ */
+
+/** A user's object-block position: what they hold and what they may hold. */
+typedef struct {
+    char     user_name[NDFS_NAME_MAX + 1]; /**< The user area described.        */
+    uint8_t  user_index;                   /**< Index in the user file.         */
+    uint8_t  allocated_object_blocks;      /**< ACOBL - blocks in use, 1..max.  */
+    uint8_t  max_object_blocks;            /**< MXOBL - blocks permitted, 1..16.*/
+    uint32_t files_in_use;                 /**< Entries present for this user.  */
+    uint32_t max_files;                    /**< MXOBL * 256. What SINTRAN calls
+                                            *   MAXIMUM NUMBER OF FILES.        */
+    uint32_t allocated_files;              /**< ACOBL * 256 - capacity without
+                                            *   allocating another block.       */
+    uint8_t  grantable_blocks;             /**< 16 - MXOBL. Zero means the user
+                                            *   is at the hard ceiling.         */
+} ndfs_object_block_info_t;
+
+/**
+ * Grant a user additional object blocks, raising the number of files they may hold.
+ *
+ * The library equivalent of the SINTRAN operator command
+ * @GIVE-OBJECT-BLOCKS (<directory>:)<user>,<count>, which likewise ADDS to the
+ * maximum rather than setting it. Each block is 256 files, so granting 3 blocks
+ * to a default user takes the ceiling from 256 to 1024 - exactly what
+ * @USER-STATISTICS then reports as MAXIMUM NUMBER OF FILES.
+ *
+ * VERIFIED on a live SINTRAN III K pack: user BIGMAN went from 256 to 1024 after
+ * @GIVE-OBJECT-BLOCKS BIGMAN,3, and byte 47 read back 0x31 = MXOBL 4.
+ *
+ * What this deliberately does NOT do:
+ *   - It does not allocate the blocks. Only the MAXIMUM moves; a block is
+ *     allocated the first time a file needs it, as SINTRAN does.
+ *   - It does not reserve disk pages. Object blocks cap the NUMBER of files,
+ *     not their size; page quota is separate (@GIVE-USER-SPACE).
+ *   - It does not convert an Indexed object file to SubIndexed. A second block
+ *     lives at page 512 and up, which an Indexed object file cannot address, so
+ *     growth into it fails later - when a file actually needs the block.
+ *
+ * @param fs        The file system, opened read-write.
+ * @param user_name User name, case-insensitive.
+ * @param count     Object blocks to ADD. Must be 1 or more.
+ * @param out_max   Receives the new maximum, 2..16. May be NULL.
+ *
+ * @return NDFS_OK on success.
+ *         NDFS_ERR_NOT_FOUND      no such user.
+ *         NDFS_ERR_INVALID_ARG    count below 1.
+ *         NDFS_ERR_OUT_OF_RANGE   the grant would pass 16 blocks. Nothing is
+ *                                 changed; call ndfs_get_object_block_info() to
+ *                                 find how many are still grantable.
+ *         NDFS_ERR_READ_ONLY      the file system is read-only.
+ */
+ndfs_error_t ndfs_give_object_blocks(ndfs_filesystem_t *fs, const char *user_name,
+                                     uint32_t count, uint8_t *out_max);
+
+/**
+ * Lower a user's object-block maximum.
+ *
+ * THIS HAS NO SINTRAN EQUIVALENT. No command to remove object blocks is
+ * documented in the manuals, nor was one found while carving the kernel - which
+ * is consistent with the structure, since a file's number is derived from the
+ * block it sits in, so dropping a block would orphan every file in it. This
+ * exists only so a tool can undo its own grant on an image it is building.
+ *
+ * The maximum can never fall below the number of blocks actually allocated, nor
+ * below 1.
+ *
+ * @param fs        The file system, opened read-write.
+ * @param user_name User name, case-insensitive.
+ * @param count     Object blocks to remove. Must be 1 or more.
+ * @param out_max   Receives the new maximum. May be NULL.
+ *
+ * @return NDFS_OK on success.
+ *         NDFS_ERR_NOT_FOUND      no such user.
+ *         NDFS_ERR_INVALID_ARG    count below 1.
+ *         NDFS_ERR_OUT_OF_RANGE   the reduction would drop the maximum below the
+ *                                 allocated count, or below 1.
+ *         NDFS_ERR_READ_ONLY      the file system is read-only.
+ */
+ndfs_error_t ndfs_take_object_blocks(ndfs_filesystem_t *fs, const char *user_name,
+                                     uint32_t count, uint8_t *out_max);
+
+/**
+ * Report a user's object-block position.
+ *
+ * This is the query a tool needs in order to explain "why can I not add another
+ * file": a user whose files_in_use has reached max_files cannot take another,
+ * and grantable_blocks says whether anything can be done about it.
+ *
+ * @param fs        The file system.
+ * @param user_name User name, case-insensitive.
+ * @param out_info  Receives the report.
+ *
+ * @return NDFS_OK, or NDFS_ERR_NOT_FOUND when no such user exists.
+ */
+ndfs_error_t ndfs_get_object_block_info(const ndfs_filesystem_t *fs,
+                                        const char *user_name,
+                                        ndfs_object_block_info_t *out_info);
+
 /**
  * Get the list of data-block IDs that make up a file, in order.
  * Walks contiguous / indexed / sub-indexed allocation. A block ID of 0 marks

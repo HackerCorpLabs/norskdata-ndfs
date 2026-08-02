@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(ndfs C)
+project(ndfs VERSION 0.0.5 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -66,6 +66,7 @@ set(TEST_SOURCES
     tests/test_bit_file.c
     tests/test_user_entry.c
     tests/test_object_entry.c
+    tests/test_object_blocks.c
     tests/test_filesystem.c
     tests/test_image_creator.c
     tests/test_boot_loader.c

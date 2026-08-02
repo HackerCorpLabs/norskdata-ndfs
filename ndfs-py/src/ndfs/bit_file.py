@@ -49,35 +49,76 @@ class BitFile:
         self.total_pages = total_pages
         # Until the caller supplies the declared capacity, the whole device is allocatable.
         self.alloc_ceiling = total_pages
-        bitmap_bytes = math.ceil(total_pages / 8)
+        # Rounded up to a whole number of 16-bit WORDS. The bitmap is addressed by word
+        # (see _bit_position), so an odd byte count would leave the last word half
+        # present and put the final few pages past the end of the buffer.
+        bitmap_bytes = (math.ceil(total_pages / 8) + 1) & ~1
         self._bitmap = bytearray(bitmap_bytes)
 
     def load_bitmap(self, data: _BufType) -> None:
-        """Load bitmap data from raw bytes."""
+        """Load bitmap data from raw bytes.
+
+        Padded to a whole number of 16-bit words for the same reason as
+        :meth:`initialize`: word addressing needs the high byte of the final word to
+        exist, even when the source slice stops on an odd boundary.
+        """
         self._bitmap = bytearray(data)
+        if len(self._bitmap) & 1:
+            # Should not happen - the caller slices whole words - but a half word here
+            # would make the last few pages unreadable rather than merely unallocatable.
+            self._bitmap.append(0)
+
+    @staticmethod
+    def _bit_position(block_id: int):
+        """Byte index and bit index of *block_id* in the on-disk bitmap.
+
+        Page N lives in 16-bit WORD N/16, at bit N%16 counting from the LSB.
+
+        AUTHORITY: SINTRAN III System Supervisor, ND-30.003.007 EN, appendix F.2
+        "Bit-File"::
+
+            PAGE = BLOCK*400B + WORD*20B + BIT
+
+        20B is 16 decimal, so ONE 16-BIT WORD MAPS 16 PAGES - not one byte mapping 8.
+        And because the formula ADDS the bit number, page x sits at bit 0, the least
+        significant bit. The Norwegian edition (ND-30.003.7 NO) carries the identical
+        formula, and SINTRAN's own allocator agrees: TPAGF at 51043B forms the word
+        index with ``SHA ZIN SHR 4``, i.e. page/16.
+
+        The image is big-endian, so the word at index w occupies bytes w*2 (high) and
+        w*2+1 (low). Page N therefore lands in the OTHER byte of the pair from where a
+        naive "byte N/8, bit N%8" scheme would put it, which reduces to flipping the
+        low bit of the byte index.
+
+        WHY THIS MATTERS: this library previously used the naive byte scheme. Wrong in
+        both reader and writer, it was self-consistent and every round-trip test
+        passed - but on a pack written by real SINTRAN it reads the allocation map with
+        every byte pair swapped. Measured on three genuine ND media (a 78 MB pack and
+        two ND distribution floppies), the naive scheme reports 32, 4 and 3 pages that
+        demonstrably hold file data as FREE; this scheme reports none. Handing those
+        pages out would have overwritten live files.
+        """
+        return (block_id >> 3) ^ 1, block_id & 7
 
     def is_block_used(self, block_id: int) -> bool:
         """Check if a block is marked as used."""
         if self._bitmap is None or block_id >= self.total_pages:
             return False
-        byte_index = block_id >> 3
-        bit_index = block_id & 7
+        byte_index, bit_index = self._bit_position(block_id)
         return (self._bitmap[byte_index] & (1 << bit_index)) != 0
 
     def mark_block_used(self, block_id: int) -> None:
         """Mark a block as used."""
         if self._bitmap is None or block_id >= self.total_pages:
             raise IndexError(f"Block ID {block_id} out of range")
-        byte_index = block_id >> 3
-        bit_index = block_id & 7
+        byte_index, bit_index = self._bit_position(block_id)
         self._bitmap[byte_index] |= 1 << bit_index
 
     def mark_block_free(self, block_id: int) -> None:
         """Mark a block as free."""
         if self._bitmap is None or block_id >= self.total_pages:
             raise IndexError(f"Block ID {block_id} out of range")
-        byte_index = block_id >> 3
-        bit_index = block_id & 7
+        byte_index, bit_index = self._bit_position(block_id)
         self._bitmap[byte_index] &= ~(1 << bit_index)
 
     def calc_used_pages(self) -> int:

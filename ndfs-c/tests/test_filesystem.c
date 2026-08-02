@@ -108,8 +108,13 @@ static uint8_t *create_test_image(void)
     bitmap_bytes = (TEST_TOTAL_PAGES + 7) / 8;
     /* Mark pages 0-8 as used */
     for (i = 0; i <= 8; i++) {
-        size_t byte_idx = i / 8;
-        uint8_t bit_idx = (uint8_t)(i % 8);
+        /* Page N is bit N%16 of the 16-bit BIG-ENDIAN word N/16, i.e. byte (N>>3)^1 on
+         * a byte array - see bf_byte_index() in src/bit_file.c and appendix F.2 of
+         * ND-30.003.007. This fixture used to mark bits with the old "byte N/8" scheme,
+         * so it built an image the library could no longer read once the bit order was
+         * corrected. A fixture that encodes the bug tests nothing. */
+        size_t byte_idx = (size_t)((i >> 3) ^ 1u);
+        uint8_t bit_idx = (uint8_t)(i & 7u);
         img[5 * NDFS_PAGE_SIZE + byte_idx] |= (uint8_t)(1u << bit_idx);
     }
     /* Unused: ensure rest is 0 (already calloc'd) */

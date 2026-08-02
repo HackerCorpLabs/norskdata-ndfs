@@ -19,6 +19,10 @@ void ndfs_ue_init(ndfs_user_entry_t *entry)
      * ndfs_ue_from_bytes reads the slot as free. */
     entry->uf = NDFS_USER_ENTRY_FLAG;
     entry->default_file_access = 0x04FF;
+    /* A brand-new user area gets one object block = 256 files, which is what
+     * SINTRAN itself does; @GIVE-OBJECT-BLOCKS raises the maximum later. */
+    entry->max_object_blocks       = 1;
+    entry->allocated_object_blocks = 1;
     for (i = 0; i < NDFS_MAX_FRIENDS; i++) {
         entry->friends[i].bits = 0;
     }
@@ -39,7 +43,8 @@ ndfs_error_t ndfs_ue_from_bytes(const uint8_t *data, size_t data_len,
     ndfs_ue_init(out);
 
     /* Preserve the verbatim 64 bytes so re-serialization never loses fields
-     * we do not model (offsets 38-39 and 42-47, incl. byte 47 mxobl/acobl). */
+     * we do not model (offsets 38-39 and 42-46). Byte 47 IS modelled - see
+     * max_object_blocks / allocated_object_blocks below. */
     memcpy(out->raw, data + offset, NDFS_ENTRY_SIZE);
     out->has_raw = true;
 
@@ -59,6 +64,12 @@ ndfs_error_t ndfs_ue_from_bytes(const uint8_t *data, size_t data_len,
     /* Default file access is at offset 40 (verified against on-disk images
      * and the reference ndfs/RetroCore tools); offset 38-39 is unused. */
     out->default_file_access = ndfs_read_u16be(data, offset + 40);
+
+    /* Byte 47: MXOBL/ACOBL, two ZERO-BASED nibbles (see user_entry.h).
+     * A default user stores 0x00, meaning 1 block max and 1 allocated = 256
+     * files, so +1 on both halves is what turns the raw byte into counts. */
+    out->max_object_blocks       = (uint8_t)((data[offset + 47] >> 4) + 1);
+    out->allocated_object_blocks = (uint8_t)((data[offset + 47] & 0x0F) + 1);
 
     /* Parse friends (8 x 2 bytes starting at offset 48) */
     for (i = 0; i < NDFS_MAX_FRIENDS; i++) {
@@ -96,6 +107,19 @@ void ndfs_ue_to_bytes(const ndfs_user_entry_t *entry, uint8_t *buf)
     buf[36] = entry->directory_index;
     buf[37] = entry->user_index;
     ndfs_write_u16be(buf, 40, entry->default_file_access);
+
+    /* Byte 47: MXOBL/ACOBL back to zero-based nibbles. Clamped to 1..16 so a
+     * caller cannot write a count SINTRAN could not express - 16 blocks x 256
+     * files is the version-K ceiling of 4096. */
+    {
+        uint8_t mx = entry->max_object_blocks;
+        uint8_t ac = entry->allocated_object_blocks;
+        if (mx < 1) mx = 1;
+        if (mx > 16) mx = 16;
+        if (ac < 1) ac = 1;
+        if (ac > mx) ac = mx;
+        buf[47] = (uint8_t)(((mx - 1) << 4) | (ac - 1));
+    }
 
     for (i = 0; i < NDFS_MAX_FRIENDS; i++) {
         ndfs_uf_to_bytes(&entry->friends[i], buf, 48 + (size_t)i * 2);

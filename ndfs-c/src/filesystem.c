@@ -437,7 +437,70 @@ static void add_object(struct ndfs_filesystem *fs, const ndfs_object_entry_t *ob
     fs->object_count++;
 }
 
-/* ── Structure loading ───────────────────────────────────────────── */
+/* Assign every entry the number SINTRAN reports - the 307 in "FILE 307".
+ *
+ * The number is logical_block*256 + slot_in_block, where **logical_block is the ORDINAL
+ * RANK of the entry's index-block group among the groups that user occupies**, ascending
+ * - NOT the physical group number.
+ *
+ * That distinction only shows up once an overflow block has been relocated, and SINTRAN
+ * relocates them freely. Measured live on 2026-08-02: user 8 with 300 files held block 0
+ * in group 0 and its overflow in group 2; creating files for user 136 (whose HOME is
+ * group 2, slot 8) moved user 8's overflow to group 3, and then user 200 moved it to
+ * group 4. All 300 files survived, reported by SINTRAN throughout as FILE 0..299.
+ *
+ * The old "block = page / 512" formula gave 0..255 then 1024..1067 for that user, where
+ * SINTRAN says 256..299. It looked right on the earlier BIGMAN pack only because nothing
+ * had displaced that pack's overflow block, so rank happened to equal group number.
+ */
+static void assign_file_numbers(struct ndfs_filesystem *fs)
+{
+    size_t i, j;
+
+    for (i = 0; i < fs->object_count; i++) {
+        uint8_t  user = fs->objects[i].user_index;
+        uint32_t page = fs->objects[i].object_index / NDFS_ENTRIES_PER_PAGE;
+        uint32_t group = page / NDFS_PAGES_PER_INDEX_BLOCK;
+        uint32_t slot_base, offset_pages, slot;
+        uint32_t rank = 0;
+
+        /* Rank of this group among the groups this user occupies. */
+        for (j = 0; j < fs->object_count; j++) {
+            uint32_t other_page, other_group;
+            if (fs->objects[j].user_index != user) continue;
+            other_page  = fs->objects[j].object_index / NDFS_ENTRIES_PER_PAGE;
+            other_group = other_page / NDFS_PAGES_PER_INDEX_BLOCK;
+            if (other_group < group) {
+                size_t k;
+                int already = 0;
+                for (k = 0; k < j; k++) {
+                    uint32_t p2, g2;
+                    if (fs->objects[k].user_index != user) continue;
+                    p2 = fs->objects[k].object_index / NDFS_ENTRIES_PER_PAGE;
+                    g2 = p2 / NDFS_PAGES_PER_INDEX_BLOCK;
+                    if (g2 == other_group) { already = 1; break; }
+                }
+                if (!already) rank++;
+            }
+        }
+
+        /* The slot WITHIN a group is (user % 64) - 64 users fill one 512-page group. */
+        slot_base = (uint32_t)(user % NDFS_USERS_PER_INDEX_BLOCK) * NDFS_PAGES_PER_OBJECT_BLOCK;
+        offset_pages = (page % NDFS_PAGES_PER_INDEX_BLOCK) - slot_base;
+
+        if ((page % NDFS_PAGES_PER_INDEX_BLOCK) < slot_base
+            || offset_pages >= NDFS_PAGES_PER_OBJECT_BLOCK) {
+            fs->objects[i].file_number = 0u;   /* outside this user's slot */
+            continue;
+        }
+
+        slot = offset_pages * NDFS_ENTRIES_PER_PAGE
+             + (fs->objects[i].object_index % NDFS_ENTRIES_PER_PAGE);
+        fs->objects[i].file_number = rank * NDFS_FILES_PER_OBJECT_BLOCK + slot;
+    }
+}
+
+/* ââ Structure loading ââââââââââââââââââââââââââââââââââ */
 
 static ndfs_error_t load_structures(struct ndfs_filesystem *fs)
 {
@@ -504,6 +567,15 @@ static ndfs_error_t load_structures(struct ndfs_filesystem *fs)
                                                           j * NDFS_ENTRY_SIZE, &oe);
                     if (err == NDFS_OK) {
                         oe.object_index = global_idx + (uint32_t)j;
+                        /* Physical position above. The number SINTRAN shows is
+                         * per-user and differs as soon as the user owns more
+                         * than one object block, because block n sits a whole
+                         * index block further on. */
+                        {
+                            int32_t fn = ndfs_oe_compute_file_number(oe.object_index,
+                                                                     oe.user_index);
+                            oe.file_number = (fn < 0) ? 0u : (uint32_t)fn;
+                        }
                         /* Resolve user name */
                         ui = find_user_by_index(fs, oe.user_index);
                         if (ui >= 0) {
@@ -551,6 +623,14 @@ static ndfs_error_t load_structures(struct ndfs_filesystem *fs)
                                                               j * NDFS_ENTRY_SIZE, &oe);
                         if (err == NDFS_OK) {
                             oe.object_index = global_idx + (uint32_t)j;
+                            /* See the sibling loop above: physical position is
+                             * not the user-visible file number once a user owns
+                             * more than one object block. */
+                            {
+                                int32_t fn = ndfs_oe_compute_file_number(oe.object_index,
+                                                                         oe.user_index);
+                                oe.file_number = (fn < 0) ? 0u : (uint32_t)fn;
+                            }
                             ui = find_user_by_index(fs, oe.user_index);
                             if (ui >= 0) {
                                 memcpy(oe.user_name, fs->users[ui].user_name,
@@ -570,7 +650,10 @@ static ndfs_error_t load_structures(struct ndfs_filesystem *fs)
     /* Load bit file */
     if (ndfs_bp_is_valid(&mb->bit_file_ptr)) {
         uint32_t total_pages = (uint32_t)(fs->size / NDFS_PAGE_SIZE);
-        uint32_t bitmap_bytes = (total_pages + 7) / 8;
+        /* Whole 16-bit words - the bit file is word addressed, so ceil(pages/8) cuts
+         * the last word in half on any device whose page count is not a multiple of 16
+         * and loses the pages living in its high byte. See bf_byte_index(). */
+        uint32_t bitmap_bytes = (((total_pages + 7) / 8) + 1) & ~1u;
         uint32_t bitmap_pages = (bitmap_bytes + NDFS_PAGE_SIZE - 1) / NDFS_PAGE_SIZE;
         ndfs_error_t err;
 
@@ -611,6 +694,9 @@ static ndfs_error_t load_structures(struct ndfs_filesystem *fs)
             free(tmp);
         }
     }
+
+    /* Only possible once every entry is loaded - see assign_file_numbers. */
+    assign_file_numbers(fs);
 
     return NDFS_OK;
 }
@@ -849,23 +935,164 @@ static uint32_t count_real_data_pages_in_object(const struct ndfs_filesystem *fs
 
 /* ── File creation/update ────────────────────────────────────────── */
 
-/* Find the next free object slot WITHIN a user's region. SINTRAN partitions
- * the object file so each user owns 256 slots [user<<8 .. user<<8|0xFF]; the
- * object index's high byte is the owning user. Returns -1 if the user's 256
- * file slots are all in use. */
-static int find_free_user_slot(const struct ndfs_filesystem *fs, uint8_t user_index)
+/* Physical object-file position of a slot inside one of a user's object blocks.
+ *
+ * Object block `block` for user `user_index` occupies pages
+ * block*512 + user*8 .. +7, and each page holds 32 entries, so:
+ *
+ *     page     = block*512 + user*8 + slot_in_block/32
+ *     physical = page*32 + slot_in_block%32
+ *
+ * `slot_in_block` is 0..255. The value returned is what goes in
+ * object_entry.object_index; the user-VISIBLE number is block*256 + slot_in_block
+ * (see ndfs_oe_compute_file_number). Those two coincide only inside a user's
+ * FIRST block, which is why the old flat user<<8 model looked right for years.
+ */
+static uint32_t physical_slot_in_group(uint8_t user_index, uint32_t group,
+                                      uint32_t slot_in_block)
 {
-    uint32_t base = (uint32_t)user_index << 8;
-    uint32_t slot;
-    for (slot = base; slot < base + 256; slot++) {
-        size_t i;
-        bool used = false;
-        for (i = 0; i < fs->object_count; i++) {
-            if (fs->objects[i].object_index == slot) { used = true; break; }
-        }
-        if (!used) return (int)slot;
+    /* A user always occupies slot (user % 64) of a group, eight pages wide. The HOME
+     * group is user/64, and that pairing reduces to the flat page = user*8 for block 0. */
+    uint32_t page = group * NDFS_PAGES_PER_INDEX_BLOCK
+                  + (uint32_t)(user_index % NDFS_USERS_PER_INDEX_BLOCK)
+                        * NDFS_PAGES_PER_OBJECT_BLOCK
+                  + slot_in_block / NDFS_ENTRIES_PER_PAGE;
+    return page * NDFS_ENTRIES_PER_PAGE + (slot_in_block % NDFS_ENTRIES_PER_PAGE);
+}
+
+
+/* True if this user has any entry in the given index-block group. */
+static bool user_uses_group(const struct ndfs_filesystem *fs, uint8_t user_index,
+                            uint32_t group)
+{
+    size_t i;
+    for (i = 0; i < fs->object_count; i++) {
+        uint32_t page;
+        if (fs->objects[i].user_index != user_index) continue;
+        page = fs->objects[i].object_index / NDFS_ENTRIES_PER_PAGE;
+        if (page / NDFS_PAGES_PER_INDEX_BLOCK == group) return true;
     }
+    return false;
+}
+
+/* True if any loaded object entry already sits at this physical position. */
+static bool slot_in_use(const struct ndfs_filesystem *fs, uint32_t slot)
+{
+    size_t i;
+    for (i = 0; i < fs->object_count; i++) {
+        if (fs->objects[i].object_index == slot) return true;
+    }
+    return false;
+}
+
+/* Find the next free object slot for a user, across ALL their object blocks.
+ *
+ * A user area holds 256 files per object block, one by default and up to
+ * `max_blocks` (16 max) once the operator has run @GIVE-OBJECT-BLOCKS. Blocks
+ * are allocated on demand, so this searches every block already allocated and,
+ * if they are all full, returns the first slot of the NEXT block while one is
+ * still permitted.
+ *
+ * The caller must raise the user's allocated count when the returned slot falls
+ * in a block beyond the current one, and must make the page exist
+ * (ensure_object_dir_page). See allocate_user_object_slot below.
+ *
+ * Returns -1 when every permitted block is full - which now genuinely means the
+ * user is at their SINTRAN limit rather than merely past 256 files. */
+static int find_free_user_slot(const struct ndfs_filesystem *fs,
+                               uint8_t user_index,
+                               uint32_t max_blocks,
+                               uint32_t allocated_blocks)
+{
+    uint32_t group, slot_in_block, home;
+
+    if (max_blocks < 1) max_blocks = 1;
+    if (max_blocks > NDFS_MAX_OBJECT_BLOCKS) max_blocks = NDFS_MAX_OBJECT_BLOCKS;
+    if (allocated_blocks < 1) allocated_blocks = 1;
+    if (allocated_blocks > max_blocks) allocated_blocks = max_blocks;
+
+    home = (uint32_t)(user_index / NDFS_USERS_PER_INDEX_BLOCK);
+
+    /* Groups this user already occupies, plus HOME (block 0, which must be searched even
+     * when the user has no entries yet). Holes are normal - deleting a file leaves one and
+     * SINTRAN never compacts. */
+    for (group = home; group < NDFS_MAX_OBJECT_FILE_PTRS; group++) {
+        if (group != home && !user_uses_group(fs, user_index, group)) continue;
+        for (slot_in_block = 0; slot_in_block < NDFS_FILES_PER_OBJECT_BLOCK; slot_in_block++) {
+            uint32_t phys = physical_slot_in_group(user_index, group, slot_in_block);
+            if (!slot_in_use(fs, phys)) return (int)phys;
+        }
+    }
+
+    /* Every occupied block is full. Open the next one if the maximum allows, searching
+     * upward from home for a group whose slot is free AND is not an existing user's home.
+     *
+     * SINTRAN skips such a group (measured live 2026-08-02: user 8 overflowing past 256
+     * files did not take group 1, where user 72 lives) and RELOCATES the block if the home
+     * owner later needs it. This library instead never places a block in another user's
+     * home, so it produces no layout needing relocation. */
+    if (allocated_blocks >= max_blocks) return -1;
+
+    for (group = home; group < NDFS_MAX_OBJECT_FILE_PTRS; group++) {
+        uint32_t home_owner;
+        uint32_t first;
+
+        if (group == home || user_uses_group(fs, user_index, group)) continue;
+
+        home_owner = group * NDFS_USERS_PER_INDEX_BLOCK
+                   + (uint32_t)(user_index % NDFS_USERS_PER_INDEX_BLOCK);
+        if (home_owner < NDFS_MAX_USERS
+            && find_user_by_index(fs, (uint8_t)home_owner) >= 0) {
+            continue;   /* that group's slot belongs to a user that exists */
+        }
+
+        first = physical_slot_in_group(user_index, group, 0);
+        if (!slot_in_use(fs, first)) return (int)first;
+    }
+
     return -1;
+}
+
+/* Pick a free object slot for `user`, opening a new object block if needed.
+ *
+ * Writes the chosen physical slot to *out_slot and returns NDFS_OK, or:
+ *   NDFS_ERR_OBJ_BLOCKS_FULL   every permitted block full, more can still be granted
+ *   NDFS_ERR_OBJ_BLOCKS_MAX    the user already holds all 16 blocks (4096 files)
+ *
+ * A user's blocks all sit at slot (user % 64) of an index-block group; block 0 is in the
+ * HOME group user/64, and overflow blocks take the same slot in a HIGHER group, skipping
+ * any group whose slot belongs to an existing user. find_free_user_slot does the search;
+ * this records the resulting block count on the user entry, which byte 47's low nibble
+ * carries.
+ */
+static int allocate_user_object_slot(struct ndfs_filesystem *fs,
+                                     ndfs_user_entry_t *user,
+                                     uint32_t *out_slot)
+{
+    int slot;
+    uint32_t group, count = 0;
+
+    slot = find_free_user_slot(fs, user->user_index,
+                               user->max_object_blocks,
+                               user->allocated_object_blocks);
+    if (slot < 0) {
+        return (user->max_object_blocks >= NDFS_MAX_OBJECT_BLOCKS)
+             ? NDFS_ERR_OBJ_BLOCKS_MAX
+             : NDFS_ERR_OBJ_BLOCKS_FULL;
+    }
+
+    /* The number of distinct groups this user will occupy IS the allocated block count. */
+    for (group = 0; group < NDFS_MAX_OBJECT_FILE_PTRS; group++) {
+        uint32_t chosen = ((uint32_t)slot / NDFS_ENTRIES_PER_PAGE)
+                        / NDFS_PAGES_PER_INDEX_BLOCK;
+        if (user_uses_group(fs, user->user_index, group) || group == chosen) count++;
+    }
+    if (count < 1) count = 1;
+    if (count > user->max_object_blocks) count = user->max_object_blocks;
+    user->allocated_object_blocks = (uint8_t)count;
+
+    *out_slot = (uint32_t)slot;
+    return NDFS_OK;
 }
 
 /* Ensure the object-file directory data page that holds object entry
@@ -1274,7 +1501,6 @@ static ndfs_error_t create_new_file(struct ndfs_filesystem *fs,
     ndfs_pointer_type_t pointer_type;
     uint32_t struct_pages;
     uint32_t obj_index;
-    int slot;
     ndfs_object_entry_t entry;
     ndfs_error_t err;
 
@@ -1289,9 +1515,10 @@ static ndfs_error_t create_new_file(struct ndfs_filesystem *fs,
      * partitions the object file: user U owns slots U*256..U*256+255 and the
      * object-index high byte is the owner). A flat global slot would land the
      * file in the wrong user. Make sure that user's directory page exists. */
-    slot = find_free_user_slot(fs, fs->users[user_slot].user_index);
-    if (slot < 0) return NDFS_ERR_NO_SPACE;
-    obj_index = (uint32_t)slot;
+    {
+        int alloc_err = allocate_user_object_slot(fs, &fs->users[user_slot], &obj_index);
+        if (alloc_err != NDFS_OK) return alloc_err;
+    }
     if (ensure_object_dir_page(fs, obj_index) == 0) return NDFS_ERR_NO_SPACE;
 
     /* Allocate + write the data-block structure: plain Indexed for
@@ -1319,6 +1546,12 @@ static ndfs_error_t create_new_file(struct ndfs_filesystem *fs,
         str_toupper(entry.type);
     }
     entry.user_index = fs->users[user_slot].user_index;
+    /* The number SINTRAN shows is NOT the physical position: a user's files can
+     * span several object blocks, each a whole index block apart. Compute it here
+     * as well as on load, or a freshly created file reports number 0 until the
+     * image is reloaded. */
+    entry.file_number = (uint32_t)ndfs_oe_compute_file_number(entry.object_index,
+                                                              entry.user_index);
     memcpy(entry.user_name, fs->users[user_slot].user_name, NDFS_NAME_MAX + 1);
     /* pages_in_file counts the pages ACTUALLY ALLOCATED, not the logical extent.
      *
@@ -2165,7 +2398,6 @@ ndfs_error_t ndfs_create_contiguous_file(ndfs_filesystem_t *fs,
     char obj_name[NDFS_NAME_MAX + 1];
     char file_type[NDFS_TYPE_MAX + 1];
     int user_slot;
-    int slot;
     uint32_t obj_index;
     uint32_t start_block;
     uint32_t i;
@@ -2210,9 +2442,10 @@ ndfs_error_t ndfs_create_contiguous_file(ndfs_filesystem_t *fs,
         }
     }
 
-    slot = find_free_user_slot(fs, user->user_index);
-    if (slot < 0) return NDFS_ERR_NO_SPACE;
-    obj_index = (uint32_t)slot;
+    {
+        int alloc_err = allocate_user_object_slot(fs, user, &obj_index);
+        if (alloc_err != NDFS_OK) return alloc_err;
+    }
     if (ensure_object_dir_page(fs, obj_index) == 0) return NDFS_ERR_NO_SPACE;
 
     /* The defining property: one run, no index block. ndfs_bf_find_free_range()
@@ -2252,6 +2485,12 @@ ndfs_error_t ndfs_create_contiguous_file(ndfs_filesystem_t *fs,
         str_toupper(entry.type);
     }
     entry.user_index = user->user_index;
+    /* The number SINTRAN shows is NOT the physical position: a user's files can
+     * span several object blocks, each a whole index block apart. Compute it here
+     * as well as on load, or a freshly created file reports number 0 until the
+     * image is reloaded. */
+    entry.file_number = (uint32_t)ndfs_oe_compute_file_number(entry.object_index,
+                                                              entry.user_index);
     memcpy(entry.user_name, user->user_name, NDFS_NAME_MAX + 1);
 
     /* Unlike an indexed file, allocated and logical extent are the same here,
@@ -2907,6 +3146,114 @@ ndfs_error_t ndfs_get_user(const ndfs_filesystem_t *fs, uint8_t index,
     if (slot < 0) return NDFS_ERR_NOT_FOUND;
 
     *out_user = fs->users[slot];
+    return NDFS_OK;
+}
+
+/* ── Object blocks: the @GIVE-OBJECT-BLOCKS equivalent ───────────── */
+
+ndfs_error_t ndfs_give_object_blocks(ndfs_filesystem_t *fs, const char *user_name,
+                                     uint32_t count, uint8_t *out_max)
+{
+    int slot;
+    uint32_t new_max;
+    ndfs_error_t err;
+
+    if (!fs || !user_name) return NDFS_ERR_NULL_PTR;
+    if (fs->read_only) return NDFS_ERR_READ_ONLY;
+    if (count < 1) return NDFS_ERR_INVALID_ARG;
+
+    slot = find_user_by_name(fs, user_name);
+    if (slot < 0) return NDFS_ERR_NOT_FOUND;
+
+    new_max = (uint32_t)fs->users[slot].max_object_blocks + count;
+    if (new_max > NDFS_MAX_OBJECT_BLOCKS) {
+        /* Refuse rather than clamp: clamping would leave the caller believing
+         * it received what it asked for, and the shortfall would only surface
+         * much later as a premature "user is full". */
+        return NDFS_ERR_OUT_OF_RANGE;
+    }
+
+    fs->users[slot].max_object_blocks = (uint8_t)new_max;
+
+    err = write_user_page(fs, fs->users[slot].user_index);
+    if (err != NDFS_OK) {
+        /* Put the entry back so the in-memory view does not claim a ceiling the
+         * image does not have. */
+        fs->users[slot].max_object_blocks = (uint8_t)(new_max - count);
+        return err;
+    }
+
+    if (out_max) *out_max = (uint8_t)new_max;
+    return NDFS_OK;
+}
+
+ndfs_error_t ndfs_take_object_blocks(ndfs_filesystem_t *fs, const char *user_name,
+                                     uint32_t count, uint8_t *out_max)
+{
+    int slot;
+    int32_t new_max;
+    ndfs_error_t err;
+
+    if (!fs || !user_name) return NDFS_ERR_NULL_PTR;
+    if (fs->read_only) return NDFS_ERR_READ_ONLY;
+    if (count < 1) return NDFS_ERR_INVALID_ARG;
+
+    slot = find_user_by_name(fs, user_name);
+    if (slot < 0) return NDFS_ERR_NOT_FOUND;
+
+    new_max = (int32_t)fs->users[slot].max_object_blocks - (int32_t)count;
+
+    /* Never below the blocks actually allocated - those hold files, and a file's
+     * number is derived from the block it sits in, so removing one would orphan
+     * every file in it. Never below one either. */
+    if (new_max < (int32_t)fs->users[slot].allocated_object_blocks) return NDFS_ERR_OUT_OF_RANGE;
+    if (new_max < 1) return NDFS_ERR_OUT_OF_RANGE;
+
+    fs->users[slot].max_object_blocks = (uint8_t)new_max;
+
+    err = write_user_page(fs, fs->users[slot].user_index);
+    if (err != NDFS_OK) {
+        fs->users[slot].max_object_blocks = (uint8_t)(new_max + (int32_t)count);
+        return err;
+    }
+
+    if (out_max) *out_max = (uint8_t)new_max;
+    return NDFS_OK;
+}
+
+ndfs_error_t ndfs_get_object_block_info(const ndfs_filesystem_t *fs,
+                                        const char *user_name,
+                                        ndfs_object_block_info_t *out_info)
+{
+    int slot;
+    size_t i;
+    const ndfs_user_entry_t *user;
+
+    if (!fs || !user_name || !out_info) return NDFS_ERR_NULL_PTR;
+
+    slot = find_user_by_name(fs, user_name);
+    if (slot < 0) return NDFS_ERR_NOT_FOUND;
+
+    user = &fs->users[slot];
+    memset(out_info, 0, sizeof(*out_info));
+
+    strncpy(out_info->user_name, user->user_name, NDFS_NAME_MAX);
+    out_info->user_name[NDFS_NAME_MAX] = '\0';
+    out_info->user_index              = user->user_index;
+    out_info->allocated_object_blocks = user->allocated_object_blocks;
+    out_info->max_object_blocks       = user->max_object_blocks;
+    out_info->max_files       = (uint32_t)user->max_object_blocks * NDFS_FILES_PER_OBJECT_BLOCK;
+    out_info->allocated_files = (uint32_t)user->allocated_object_blocks * NDFS_FILES_PER_OBJECT_BLOCK;
+    out_info->grantable_blocks =
+        (uint8_t)(NDFS_MAX_OBJECT_BLOCKS - user->max_object_blocks);
+
+    /* Counted live rather than read from a stored total: SINTRAN never compacts
+     * the object table, so deleting a file leaves a hole and any cached figure
+     * would drift. */
+    for (i = 0; i < fs->object_count; i++) {
+        if (fs->objects[i].user_index == user->user_index) out_info->files_in_use++;
+    }
+
     return NDFS_OK;
 }
 

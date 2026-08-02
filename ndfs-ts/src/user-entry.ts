@@ -14,7 +14,21 @@
  *   37:    User index
  *   38-39: Reserved
  *   40-41: Default file access (16-bit, big-endian)
- *   42-47: Reserved / tracking (byte 47 = mxobl/acobl nibbles)
+ *   42-46: Reserved / tracking (42-43 and 44-45 both hold the user index)
+ *   47:    MXOBL/ACOBL - object block counts, two ZERO-BASED nibbles:
+ *            high = MXOBL - 1   maximum object blocks this user may have
+ *            low  = ACOBL - 1   object blocks actually allocated so far
+ *          A SINTRAN user area holds 256 files per object block, 1 block by
+ *          default and up to 16 (4096 files) on version K. The operator raises
+ *          the ceiling with @GIVE-OBJECT-BLOCKS and reads it back from
+ *          @USER-STATISTICS ("MAXIMUM NUMBER OF FILES"); blocks are allocated
+ *          on demand as files are created.
+ *          A default user therefore stores 0x00 = 1 max, 1 allocated = 256 files.
+ *          VERIFIED 2026-08-01 on a live SINTRAN III K pack with a control
+ *          group: user BIGMAN, given 3 extra blocks and holding 482 files,
+ *          stores 0x31 -> MXOBL 4 (matching its reported maximum of 1024) and
+ *          ACOBL 2 (matching ceil(482/256)); every other user stores 0x00.
+ *          Doc: NDInsight SINTRAN/XMSG/DOC/NDFS-OBJECT-BLOCKS-DECODED-2026-08-01.md
  *   48-63: Friends (8 x 2-byte entries, big-endian)
  *
  * SPDX-License-Identifier: MIT
@@ -51,6 +65,21 @@ export class UserEntry {
   pagesUsed: number = 0;
   directoryIndex: number = 0;
   defaultFileAccess: number = 0x4ff;
+
+  /**
+   * Byte 47 high nibble + 1: the maximum number of object blocks this user may
+   * have (1..16). 256 files per block, so this times 256 is the user's
+   * "MAXIMUM NUMBER OF FILES" as SINTRAN reports it.
+   * A brand-new user area gets one block, which is what SINTRAN itself does.
+   */
+  maxObjectBlocks: number = 1;
+
+  /**
+   * Byte 47 low nibble + 1: the number of object blocks actually allocated so
+   * far (1..maxObjectBlocks). SINTRAN allocates a further block on demand when
+   * the current ones are full.
+   */
+  allocatedObjectBlocks: number = 1;
   friends: UserFriend[];
   /** Verbatim on-disk 64 bytes, used as the base when re-serializing so
    * unmodelled bytes (38-39, 42-47) survive. Null for freshly-built entries. */
@@ -93,6 +122,13 @@ export class UserEntry {
     // Default file access is at offset 40 (verified on-disk); 38-39 is unused.
     entry.defaultFileAccess = readUint16BE(data, offset + 40);
 
+    // Byte 47: MXOBL/ACOBL, two ZERO-BASED nibbles. A default user stores 0x00
+    // meaning 1 block max and 1 allocated = 256 files, so +1 on both halves is
+    // what turns the raw byte into usable counts.
+    const b47 = data[offset + 47];
+    entry.maxObjectBlocks = (b47 >> 4) + 1;
+    entry.allocatedObjectBlocks = (b47 & 0x0f) + 1;
+
     // Parse friends (8 x 2 bytes starting at offset 48)
     for (let i = 0; i < MAX_FRIENDS; i++) {
       entry.friends[i] = UserFriend.fromBytes(data, offset + 48 + i * 2);
@@ -124,6 +160,13 @@ export class UserEntry {
     buf[36] = this.directoryIndex;
     buf[37] = this.userIndex & 0xff;
     writeUint16BE(buf, 40, this.defaultFileAccess);
+
+    // Byte 47: MXOBL/ACOBL back to zero-based nibbles. Clamped to 1..16 so a
+    // caller cannot write a count SINTRAN could not express - 16 blocks of 256
+    // files is the version-K ceiling of 4096.
+    const mx = Math.min(16, Math.max(1, this.maxObjectBlocks));
+    const ac = Math.min(mx, Math.max(1, this.allocatedObjectBlocks));
+    buf[47] = ((mx - 1) << 4) | (ac - 1);
 
     for (let i = 0; i < MAX_FRIENDS; i++) {
       this.friends[i].toBytes(buf, 48 + i * 2);

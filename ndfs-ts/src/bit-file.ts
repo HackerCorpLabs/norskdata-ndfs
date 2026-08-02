@@ -41,21 +41,57 @@ export class BitFile {
     this.totalPages = totalPages;
     // Until the caller supplies the declared capacity, the whole device is allocatable.
     this.allocCeiling = totalPages;
-    const bitmapBytes = Math.ceil(totalPages / 8);
+    // Rounded up to a whole number of 16-bit WORDS. The bit file is word addressed
+    // (see bitPosition), so an odd byte count would leave the last word half present
+    // and its high-byte pages past the end of the buffer.
+    const bitmapBytes = (Math.ceil(totalPages / 8) + 1) & ~1;
     this.bitmap = new Uint8Array(bitmapBytes);
   }
 
-  /** Load bitmap data from raw bytes. */
+  /** Load bitmap data from raw bytes, padded to a whole number of 16-bit words. */
   loadBitmap(data: Uint8Array): void {
-    this.bitmap = new Uint8Array(data.length);
+    this.bitmap = new Uint8Array((data.length + 1) & ~1);
     this.bitmap.set(data);
+  }
+
+  /**
+   * Byte index and bit index of `blockId` in the on-disk bitmap.
+   *
+   * Page N lives in 16-bit WORD N/16, at bit N%16 counting from the LSB.
+   *
+   * AUTHORITY: SINTRAN III System Supervisor, ND-30.003.007 EN, appendix F.2
+   * "Bit-File":
+   *
+   * ```
+   * PAGE = BLOCK*400B + WORD*20B + BIT
+   * ```
+   *
+   * 20B is 16 decimal, so ONE 16-BIT WORD MAPS 16 PAGES - not one byte mapping 8. And
+   * because the formula ADDS the bit number, page x sits at bit 0, the least
+   * significant bit. The Norwegian edition (ND-30.003.7 NO) carries the identical
+   * formula, and SINTRAN's own allocator agrees: TPAGF at 51043B forms the word index
+   * with `SHA ZIN SHR 4`, i.e. page/16.
+   *
+   * The image is big-endian, so the word at index w occupies bytes w*2 (high) and
+   * w*2+1 (low). Page N therefore lands in the OTHER byte of the pair from where a
+   * naive "byte N/8, bit N%8" scheme would put it, which reduces to flipping the low
+   * bit of the byte index.
+   *
+   * WHY THIS MATTERS: this library previously used the naive byte scheme. Being wrong
+   * in both reader and writer, it was self-consistent and every round-trip test
+   * passed - but on a pack written by real SINTRAN it reads the allocation map with
+   * every byte pair swapped. Measured on three genuine ND media, the naive scheme
+   * reports 32, 4 and 3 pages that demonstrably hold file data as FREE; this scheme
+   * reports none. Handing those pages out would have overwritten live files.
+   */
+  private static bitPosition(blockId: number): [number, number] {
+    return [(blockId >>> 3) ^ 1, blockId & 7];
   }
 
   /** Check if a block is marked as used. */
   isBlockUsed(blockId: number): boolean {
     if (this.bitmap === null || blockId >= this.totalPages) return false;
-    const byteIndex = blockId >>> 3;
-    const bitIndex = blockId & 7;
+    const [byteIndex, bitIndex] = BitFile.bitPosition(blockId);
     return (this.bitmap[byteIndex] & (1 << bitIndex)) !== 0;
   }
 
@@ -64,8 +100,7 @@ export class BitFile {
     if (this.bitmap === null || blockId >= this.totalPages) {
       throw new RangeError(`Block ID ${blockId} out of range`);
     }
-    const byteIndex = blockId >>> 3;
-    const bitIndex = blockId & 7;
+    const [byteIndex, bitIndex] = BitFile.bitPosition(blockId);
     this.bitmap[byteIndex] |= 1 << bitIndex;
   }
 
@@ -74,8 +109,7 @@ export class BitFile {
     if (this.bitmap === null || blockId >= this.totalPages) {
       throw new RangeError(`Block ID ${blockId} out of range`);
     }
-    const byteIndex = blockId >>> 3;
-    const bitIndex = blockId & 7;
+    const [byteIndex, bitIndex] = BitFile.bitPosition(blockId);
     this.bitmap[byteIndex] &= ~(1 << bitIndex);
   }
 

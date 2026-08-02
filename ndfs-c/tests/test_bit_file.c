@@ -17,7 +17,9 @@ static int test_init_and_destroy(void)
     TEST_ASSERT_OK(ndfs_bf_init(&bf, 100));
     TEST_ASSERT_EQUAL(100, bf.total_pages);
     TEST_ASSERT_NOT_NULL(bf.bitmap);
-    TEST_ASSERT_EQUAL(13, bf.bitmap_size); /* ceil(100/8) = 13 */
+    /* ceil(100/8) = 13, rounded UP to a whole 16-bit word: the bit file is word
+     * addressed, so an odd byte count leaves pages 96..99 unreachable. */
+    TEST_ASSERT_EQUAL(14, bf.bitmap_size);
 
     ndfs_bf_destroy(&bf);
     TEST_ASSERT_NULL(bf.bitmap);
@@ -190,21 +192,29 @@ static int test_free_range(void)
 
 static int test_bitmap_bit_layout(void)
 {
-    /* Verify: byte[blockId/8] & (1 << (blockId % 8)) */
+    /* Page N is bit N%16 of the 16-bit BIG-ENDIAN word N/16, LSB-first.
+     *
+     * AUTHORITY: ND-30.003.007 EN appendix F.2, "PAGE = BLOCK*400B + WORD*20B + BIT",
+     * where 20B = 16 decimal. So the LOW byte of each word (index 1) carries pages
+     * 0..7 and the HIGH byte (index 0) carries pages 8..15.
+     *
+     * This test previously asserted "byte[blockId/8] & (1 << (blockId % 8))" - it
+     * encoded the bug as though it were the specification, which is precisely why the
+     * suite never caught it. */
     ndfs_bit_file_t bf;
     const uint8_t *data;
     size_t len;
     memset(&bf, 0, sizeof(bf));
 
     ndfs_bf_init(&bf, 16);
-    ndfs_bf_mark_used(&bf, 0);  /* bit 0 of byte 0 */
-    ndfs_bf_mark_used(&bf, 7);  /* bit 7 of byte 0 */
-    ndfs_bf_mark_used(&bf, 8);  /* bit 0 of byte 1 */
+    ndfs_bf_mark_used(&bf, 0);  /* bit 0 of the LOW byte  */
+    ndfs_bf_mark_used(&bf, 7);  /* bit 7 of the LOW byte  */
+    ndfs_bf_mark_used(&bf, 8);  /* bit 0 of the HIGH byte */
 
     ndfs_bf_get_data(&bf, &data, &len);
     TEST_ASSERT_EQUAL(2, len);
-    TEST_ASSERT_EQUAL(0x81, data[0]); /* bits 0 and 7 */
-    TEST_ASSERT_EQUAL(0x01, data[1]); /* bit 0 */
+    TEST_ASSERT_EQUAL(0x01, data[0]); /* high byte: page 8            */
+    TEST_ASSERT_EQUAL(0x81, data[1]); /* low byte:  pages 0 and 7     */
 
     ndfs_bf_destroy(&bf);
     return 0;

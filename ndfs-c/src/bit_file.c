@@ -21,7 +21,11 @@ ndfs_error_t ndfs_bf_init(ndfs_bit_file_t *bf, uint32_t total_pages)
     /* Until the caller supplies the directory's declared capacity, the whole device is
      * allocatable. ndfs_fs_* narrows this to ext_pages_available on mount. */
     bf->alloc_ceiling = total_pages;
-    bytes = (total_pages + 7) / 8;
+    /* Rounded up to a whole number of 16-bit WORDS: the bit file is word addressed
+     * (see bf_byte_index), so an odd byte count would leave the last word half present
+     * and its high-byte pages past the end of the buffer. A 616-page ND floppy is the
+     * real case - ceil(616/8) = 77 bytes, but page 615 needs byte 77 to exist. */
+    bytes = (((total_pages + 7) / 8) + 1) & ~1u;
     bf->bitmap = (uint8_t *)calloc(bytes, 1);
     if (!bf->bitmap) return NDFS_ERR_ALLOC;
     bf->bitmap_size = bytes;
@@ -53,42 +57,66 @@ ndfs_error_t ndfs_bf_load(ndfs_bit_file_t *bf, const uint8_t *data, size_t len)
     return NDFS_OK;
 }
 
+/*
+ * Bit-file addressing: page N lives in 16-bit WORD N/16, at bit N%16 counting from
+ * the LSB.
+ *
+ * AUTHORITY: SINTRAN III System Supervisor, ND-30.003.007 EN, appendix F.2 "Bit-File":
+ *
+ *     PAGE = BLOCK*400B + WORD*20B + BIT
+ *
+ * 20B is 16 decimal, so ONE 16-BIT WORD MAPS 16 PAGES - not one byte mapping 8. And
+ * because the formula ADDS the bit number, page x sits at bit 0, the least significant
+ * bit. The Norwegian edition (ND-30.003.7 NO) carries the identical formula, and
+ * SINTRAN's own allocator agrees: TPAGF at 51043B forms the word index with
+ * "SHA ZIN SHR 4", i.e. page/16.
+ *
+ * The image is big-endian, so a 16-bit word at word index w occupies bytes w*2 (high)
+ * and w*2+1 (low). Page N therefore lands in the OTHER byte of the pair from where a
+ * naive "byte N/8, bit N%8" scheme would put it - which reduces to flipping the low
+ * bit of the byte index:
+ *
+ *     byte = (N >> 3) ^ 1        bit = N & 7
+ *
+ * WHY THIS MATTERS: this library previously used the naive byte scheme. Being wrong in
+ * both the reader and the writer, it was self-consistent and every round-trip test
+ * passed - but on a pack written by real SINTRAN it reads the allocation map with every
+ * byte pair swapped. Measured on three genuine ND media (a 78 MB pack and two ND
+ * distribution floppies), the naive scheme reports 32, 4 and 3 pages that demonstrably
+ * hold file data as FREE; this scheme reports none. Handing those pages out would have
+ * overwritten live files.
+ */
+static size_t bf_byte_index(uint32_t block_id)
+{
+    return (size_t)((block_id >> 3) ^ 1u);
+}
+
+static uint8_t bf_bit_mask(uint32_t block_id)
+{
+    return (uint8_t)(1u << (block_id & 7u));
+}
+
 bool ndfs_bf_is_used(const ndfs_bit_file_t *bf, uint32_t block_id)
 {
-    size_t byte_idx;
-    uint8_t bit_idx;
-
     if (!bf || !bf->bitmap || block_id >= bf->total_pages) return false;
-    byte_idx = block_id >> 3;
-    bit_idx  = (uint8_t)(block_id & 7);
-    return (bf->bitmap[byte_idx] & (1u << bit_idx)) != 0;
+    return (bf->bitmap[bf_byte_index(block_id)] & bf_bit_mask(block_id)) != 0;
 }
 
 ndfs_error_t ndfs_bf_mark_used(ndfs_bit_file_t *bf, uint32_t block_id)
 {
-    size_t byte_idx;
-    uint8_t bit_idx;
-
     if (!bf) return NDFS_ERR_NULL_PTR;
     if (!bf->bitmap || block_id >= bf->total_pages) return NDFS_ERR_OUT_OF_RANGE;
 
-    byte_idx = block_id >> 3;
-    bit_idx  = (uint8_t)(block_id & 7);
-    bf->bitmap[byte_idx] |= (uint8_t)(1u << bit_idx);
+    bf->bitmap[bf_byte_index(block_id)] |= bf_bit_mask(block_id);
     return NDFS_OK;
 }
 
 ndfs_error_t ndfs_bf_mark_free(ndfs_bit_file_t *bf, uint32_t block_id)
 {
-    size_t byte_idx;
-    uint8_t bit_idx;
-
     if (!bf) return NDFS_ERR_NULL_PTR;
     if (!bf->bitmap || block_id >= bf->total_pages) return NDFS_ERR_OUT_OF_RANGE;
 
-    byte_idx = block_id >> 3;
-    bit_idx  = (uint8_t)(block_id & 7);
-    bf->bitmap[byte_idx] &= (uint8_t)~(1u << bit_idx);
+    bf->bitmap[bf_byte_index(block_id)] &= (uint8_t)~bf_bit_mask(block_id);
     return NDFS_OK;
 }
 

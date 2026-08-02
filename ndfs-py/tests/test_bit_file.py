@@ -15,7 +15,10 @@ class TestBitFileInitialize:
         bf = BitFile()
         bf.initialize(100)
         assert bf.total_pages == 100
-        assert len(bf.get_bitmap_data()) == 13  # ceil(100/8)
+        # ceil(100/8) = 13, rounded UP to a whole 16-bit word. The bit file is
+        # word-addressed, so an odd byte count would leave the last word half present
+        # and pages 96..99 unreachable.
+        assert len(bf.get_bitmap_data()) == 14
 
     def test_starts_with_all_blocks_free(self):
         bf = BitFile()
@@ -169,12 +172,18 @@ class TestBitFileLoadBitmap:
     def test_loads_raw_bitmap_data(self):
         bf = BitFile()
         bf.initialize(16)
-        raw = bytes([0xFF, 0x00])  # first 8 used, next 8 free
+        # The bit file is an array of 16-bit BIG-ENDIAN words, page N at bit N%16 of
+        # word N/16 (LSB-first). So in the byte pair [high, low], the LOW byte - index
+        # 1 - carries pages 0..7 and the HIGH byte carries pages 8..15.
+        #
+        # This test used to read `bytes([0xFF, 0x00])  # first 8 used` and assert the
+        # opposite. That was the bug, asserted as if it were the specification.
+        raw = bytes([0x00, 0xFF])  # high byte: pages 8-15 free; low byte: pages 0-7 used
         bf.load_bitmap(raw)
         for i in range(8):
-            assert bf.is_block_used(i) is True
+            assert bf.is_block_used(i) is True, f"page {i} lives in the LOW byte"
         for i in range(8, 16):
-            assert bf.is_block_used(i) is False
+            assert bf.is_block_used(i) is False, f"page {i} lives in the HIGH byte"
 
 
 class TestBitFileToPageBuffers:

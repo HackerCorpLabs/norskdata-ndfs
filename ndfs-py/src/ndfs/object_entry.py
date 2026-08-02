@@ -31,10 +31,14 @@ from __future__ import annotations
 from typing import Optional, Union
 
 from ndfs.constants import (
+    ENTRIES_PER_PAGE,
     ENTRY_SIZE,
+    FILES_PER_OBJECT_BLOCK,
     OBJECT_ENTRY_IN_USE,
     NDFS_NAME_MAX,
     NDFS_TYPE_MAX,
+    PAGES_PER_INDEX_BLOCK,
+    PAGES_PER_OBJECT_BLOCK,
 )
 from ndfs.endian import (
     read_uint16_be,
@@ -61,6 +65,43 @@ FT_LIBRARY = 1 << 7
 ACCESS_DEFAULT = 0x03FF
 
 
+def compute_file_number(object_index: int, user_index: int) -> int:
+    """Convert a physical object-file position into the file number SINTRAN reports.
+
+    ``object_index`` is the raw physical position (``page * 32 + slot_in_page``);
+    ``user_index`` is the owning user from byte 34.
+
+    A user's files live in up to 16 *object blocks* of 256 files each, and block
+    ``n`` occupies pages ``n*512 + user*8 .. +7``. So the raw position encodes
+    both the block and the slot, and the number the user sees is::
+
+        block      = page // 512
+        slot       = (page % 512 - user*8) * 32 + slot_in_page
+        fileNumber = block * 256 + slot
+
+    Using the raw position instead is correct ONLY for a user's first block. For
+    anything beyond it both the number and the "owner" derived from its high
+    byte are wrong - on a verified pack, file ``F0500`` (SINTRAN: ``FILE 307``,
+    owner 8) sits at raw position 18483, whose high byte reads as user 72.
+
+    Returns -1 when the position does not belong to ``user_index`` at all, so a
+    caller can spot a mismatch instead of silently getting a plausible number.
+    """
+    page = object_index // ENTRIES_PER_PAGE
+    slot_in_page = object_index % ENTRIES_PER_PAGE
+
+    block = page // PAGES_PER_INDEX_BLOCK
+    page_within_block_row = page % PAGES_PER_INDEX_BLOCK
+    first_page_of_user = user_index * PAGES_PER_OBJECT_BLOCK
+
+    offset_pages = page_within_block_row - first_page_of_user
+    if offset_pages < 0 or offset_pages >= PAGES_PER_OBJECT_BLOCK:
+        return -1
+
+    slot = offset_pages * ENTRIES_PER_PAGE + slot_in_page
+    return block * FILES_PER_OBJECT_BLOCK + slot
+
+
 class ObjectEntry:
     """A single NDFS file (object) entry (64 bytes on disk)."""
 
@@ -68,6 +109,7 @@ class ObjectEntry:
         "header",
         "header_word",
         "object_index",
+        "file_number",
         "object_name",
         "type",
         "user_name",
@@ -93,7 +135,14 @@ class ObjectEntry:
     def __init__(self) -> None:
         self.header: int = OBJECT_ENTRY_IN_USE
         self.header_word: int = OBJECT_ENTRY_IN_USE << 8
+        # PHYSICAL position in the object file: page * 32 + slot-in-page. This
+        # is the write-back key (see ObjectFile.to_data_pages) and is NOT the
+        # number SINTRAN shows the user - see file_number below.
         self.object_index: int = 0
+        # The number SINTRAN reports as "FILE n", per user, stable for the life
+        # of the file. Set by compute_file_number() during load; 0 on a fresh
+        # entry until it is placed.
+        self.file_number: int = 0
         self.object_name: str = ""
         self.type: str = "DATA"
         self.user_name: str = ""

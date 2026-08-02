@@ -13,10 +13,15 @@ import {
   NDFS_PAGE_SIZE,
   ENTRIES_PER_PAGE,
   ENTRY_SIZE,
+  FILES_PER_OBJECT_BLOCK,
+  MAX_OBJECT_BLOCKS,
   MAX_OBJECT_FILE_POINTERS,
+  PAGES_PER_INDEX_BLOCK,
+  PAGES_PER_OBJECT_BLOCK,
+  USERS_PER_INDEX_BLOCK,
 } from './constants.js';
 import { BlockPointer } from './block-pointer.js';
-import { ObjectEntry } from './object-entry.js';
+import { ObjectEntry, computeFileNumber } from './object-entry.js';
 import { PointerType } from './types.js';
 
 export class ObjectFile {
@@ -93,16 +98,182 @@ export class ObjectFile {
   }
 
   /**
-   * Find the next free object slot WITHIN a user's region. SINTRAN partitions
-   * the object file so user U owns slots U*256..U*256+255 and the object-index
-   * high byte is the owning user. Returns -1 if the user's table is full.
+   * Physical object-file position of a slot inside one of a user's object blocks.
+   *
+   * Object block `block` for user `userIndex` occupies pages
+   * `block*512 + user*8 .. +7`, and each page holds 32 entries, so:
+   *
+   * ```
+   * page     = block*512 + user*8 + slotInBlock/32
+   * physical = page*32 + slotInBlock%32
+   * ```
+   *
+   * `slotInBlock` is 0..255. The value returned is what goes in
+   * {@link ObjectEntry.objectIndex}; the user-VISIBLE number is
+   * `block*256 + slotInBlock` (see {@link computeFileNumber}). The two coincide
+   * only inside a user's FIRST block, which is why the old flat `user<<8` model
+   * looked correct for years.
    */
-  findFreeUserSlot(userIndex: number): number {
-    const base = (userIndex & 0xff) << 8;
-    for (let slot = base; slot < base + 256; slot++) {
-      if (!this.entries.has(slot)) return slot;
+  static physicalSlot(userIndex: number, block: number, slotInBlock: number): number {
+    // Compatibility: assumes the block-th block lives in group home+block, which is where
+    // an UNOBSTRUCTED overflow block lands. Prefer physicalSlotInGroup when the group is
+    // known, because SINTRAN skips groups whose slot is already spoken for.
+    return ObjectFile.physicalSlotInGroup(
+      userIndex,
+      Math.floor(userIndex / USERS_PER_INDEX_BLOCK) + block,
+      slotInBlock,
+    );
+  }
+
+  /**
+   * Physical position of a slot in a given index-block group.
+   *
+   * A user always occupies slot `user % 64` of a group, eight pages wide. The HOME group
+   * is `user / 64`, and that pairing reduces to the flat `page = user*8` for block 0.
+   */
+  static physicalSlotInGroup(userIndex: number, group: number, slotInBlock: number): number {
+    const page =
+      group * PAGES_PER_INDEX_BLOCK +
+      (userIndex % USERS_PER_INDEX_BLOCK) * PAGES_PER_OBJECT_BLOCK +
+      Math.floor(slotInBlock / ENTRIES_PER_PAGE);
+    return page * ENTRIES_PER_PAGE + (slotInBlock % ENTRIES_PER_PAGE);
+  }
+
+  /**
+   * Find the next free object slot for a user, across ALL their object blocks.
+   *
+   * A user area holds 256 files per object block, one by default and up to
+   * `maxObjectBlocks` (16 max, 4096 files) once the operator has run
+   * `@GIVE-OBJECT-BLOCKS`. Blocks are allocated on demand, so this searches every
+   * block already allocated and, if they are all full, returns the first slot of
+   * the NEXT block while one is still permitted.
+   *
+   * The caller must raise the user's allocated count when the returned slot falls
+   * in a block beyond the current one, and must make the page exist. See
+   * `NdfsFileSystem.allocateUserObjectSlot`.
+   *
+   * Defaults of 1/1 reproduce the historical single-block behaviour, so callers
+   * that have not been taught about object blocks keep working unchanged.
+   *
+   * **Block 1 and above overlap the high-user region.** An index block holds 512
+   * pages = 64 users at 8 pages each, so index-block group `g` is where this
+   * library places users `g*64 .. g*64+63`. SINTRAN instead puts user U's block
+   * `n` in group `n` at the same offset - so a second block for user U lands
+   * exactly where user `64+U`'s FIRST block would go. This function only computes
+   * placement; the caller must refuse to grow into block `n` when user
+   * `n*64 + userIndex` exists.
+   *
+   * @returns The physical slot, or -1 when every permitted block is full - which
+   * now genuinely means the user is at their SINTRAN limit rather than merely
+   * past 256 files.
+   */
+  /**
+   * Find the next free object slot for a user, across all their object blocks.
+   *
+   * A user's blocks all sit at slot `user % 64` of an index-block group; the HOME group
+   * `user / 64` holds block 0, and overflow blocks take the same slot in a HIGHER group.
+   *
+   * **SINTRAN skips a group whose slot is already spoken for**, and relocates the block if
+   * that group's home owner later needs it (measured live 2026-08-02). This library instead
+   * never places a block in another user's home, so it produces no layout needing
+   * relocation - `groupAvailable` is how the file-system layer supplies that check.
+   *
+   * @returns The physical slot, or -1 when every permitted block is full.
+   */
+  findFreeUserSlot(
+    userIndex: number,
+    maxObjectBlocks = 1,
+    allocatedObjectBlocks = 1,
+    groupAvailable?: (group: number) => boolean,
+  ): number {
+    const maxBlocks = Math.max(1, Math.min(MAX_OBJECT_BLOCKS, maxObjectBlocks));
+    const allocated = Math.max(1, Math.min(maxBlocks, allocatedObjectBlocks));
+    const home = Math.floor(userIndex / USERS_PER_INDEX_BLOCK);
+
+    // Groups already occupied, plus HOME - block 0 must be searched even when the user has
+    // no entries yet. Holes are normal: SINTRAN never compacts.
+    const occupied = new Set(this.groupsUsedBy(userIndex));
+    occupied.add(home);
+    for (const group of Array.from(occupied).sort((a, b) => a - b)) {
+      for (let slot = 0; slot < FILES_PER_OBJECT_BLOCK; slot++) {
+        const physical = ObjectFile.physicalSlotInGroup(userIndex, group, slot);
+        if (!this.entries.has(physical)) return physical;
+      }
     }
+
+    // Every occupied block is full: open the next one if the maximum allows.
+    if (allocated >= maxBlocks) return -1;
+
+    for (let group = home; group < MAX_OBJECT_FILE_POINTERS; group++) {
+      if (occupied.has(group)) continue;
+      if (groupAvailable && !groupAvailable(group)) continue;
+      const first = ObjectFile.physicalSlotInGroup(userIndex, group, 0);
+      if (!this.entries.has(first)) return first;
+    }
+
     return -1;
+  }
+
+  /** The index-block groups this user has entries in, ascending. */
+  groupsUsedBy(userIndex: number): number[] {
+    const groups = new Set<number>();
+    this.entries.forEach((e) => {
+      if (e.userIndex !== userIndex) return;
+      groups.add(Math.floor(e.objectIndex / ENTRIES_PER_PAGE / PAGES_PER_INDEX_BLOCK));
+    });
+    return Array.from(groups).sort((a, b) => a - b);
+  }
+
+  /**
+   * Assign each entry the number SINTRAN reports - the 307 in "FILE 307".
+   *
+   * The number is `logicalBlock * 256 + slotInBlock`, where **logicalBlock is the ORDINAL
+   * RANK of the entry's index-block group among the groups that user occupies**, ascending
+   * - NOT the physical group number.
+   *
+   * That only shows up once an overflow block has been relocated, and SINTRAN relocates
+   * them freely. Measured live 2026-08-02: user 8 with 300 files held block 0 in group 0
+   * and its overflow in group 2; creating files for user 136 (home = group 2, slot 8) moved
+   * user 8's overflow to group 3, and user 200 then moved it to group 4. All 300 files
+   * survived and SINTRAN reported them throughout as FILE 0..299.
+   *
+   * The old `block = page / 512` gave that user 0..255 then 1024..1067 where SINTRAN says
+   * 256..299. It looked right on the earlier BIGMAN pack only because nothing had displaced
+   * that pack's overflow block, so rank equalled group number.
+   */
+  private assignFileNumbers(): void {
+    const byUser = new Map<number, ObjectEntry[]>();
+    this.entries.forEach((e) => {
+      const list = byUser.get(e.userIndex);
+      if (list) list.push(e);
+      else byUser.set(e.userIndex, [e]);
+    });
+
+    byUser.forEach((entries, userIndex) => {
+      const groups = Array.from(
+        new Set(
+          entries.map((e) =>
+            Math.floor(e.objectIndex / ENTRIES_PER_PAGE / PAGES_PER_INDEX_BLOCK),
+          ),
+        ),
+      ).sort((a, b) => a - b);
+      const rank = new Map<number, number>();
+      groups.forEach((g, i) => rank.set(g, i));
+
+      for (const e of entries) {
+        const page = Math.floor(e.objectIndex / ENTRIES_PER_PAGE);
+        const group = Math.floor(page / PAGES_PER_INDEX_BLOCK);
+        // The slot WITHIN a group is (user % 64): 64 users fill one 512-page group.
+        const slotBase = (userIndex % USERS_PER_INDEX_BLOCK) * PAGES_PER_OBJECT_BLOCK;
+        const offsetPages = (page % PAGES_PER_INDEX_BLOCK) - slotBase;
+        if (offsetPages < 0 || offsetPages >= PAGES_PER_OBJECT_BLOCK) {
+          e.fileNumber = -1;
+          continue;
+        }
+        const slot = offsetPages * ENTRIES_PER_PAGE + (e.objectIndex % ENTRIES_PER_PAGE);
+        e.fileNumber = (rank.get(group) ?? 0) * FILES_PER_OBJECT_BLOCK + slot;
+      }
+    });
   }
 
   /** Get total pages used by all objects. */
@@ -137,6 +308,9 @@ export class ObjectFile {
       // Single index block -> up to 512 data page pointers
       const indexPage = readPage(pointer.blockId);
       this.loadObjectsFromIndexBlock(indexPage, readPage, globalObjectIndex);
+      // File numbers can only be assigned once every entry is loaded.
+      this.assignFileNumbers();
+      return;
     } else if (pointer.type === PointerType.SubIndexed) {
       // Sub-index block -> up to 512 index block pointers
       const subIndexPage = readPage(pointer.blockId);
@@ -152,6 +326,9 @@ export class ObjectFile {
         );
       }
     }
+
+    // File numbers can only be assigned once every entry is loaded.
+    this.assignFileNumbers();
   }
 
   private loadObjectsFromIndexBlock(
@@ -173,6 +350,13 @@ export class ObjectFile {
         const entry = ObjectEntry.fromBytes(dataPage, j * ENTRY_SIZE);
         if (entry !== null) {
           entry.objectIndex = objectIndex + j;
+          // The number SINTRAN shows is NOT the physical position: a user's
+          // files can span several object blocks, each a whole index block
+          // apart. computeFileNumber undoes that. Without this every loaded
+          // entry reports file number 0.
+          // Provisional; assignFileNumbers() recomputes it by group RANK once the
+          // whole object file is loaded, which is the only correct basis.
+          entry.fileNumber = computeFileNumber(entry.objectIndex, entry.userIndex);
           this.entries.set(entry.objectIndex, entry);
           if (entry.objectIndex >= this.nextIndex) {
             this.nextIndex = entry.objectIndex + 1;

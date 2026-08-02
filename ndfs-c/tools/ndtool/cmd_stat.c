@@ -187,6 +187,17 @@ int cmd_stat(ndtool_ctx_t *ctx, const char *path, bool verbose)
 
     printf("ObjectName                       : %s\n", obj.object_name);
     printf("ObjectIndexOfThisObjectEntry     : %u\n", obj.disk_object_index);
+    /* The number SINTRAN itself shows - the "n" in "FILE n" - which is NOT the
+     * physical position and NOT the raw on-disk word above. A user's files can
+     * span up to 16 object blocks of 256, each a whole index block apart, and
+     * only inside the first block do the three coincide. The on-disk word can
+     * only carry the low 8 bits of the slot, which is why file numbers above
+     * 255 were wrong before this was computed properly.
+     * See docs/NDFS-OBJECT-BLOCKS-SPEC.md section 4. */
+    printf("FileNumber (SINTRAN 'FILE n')    : %d  [block %u, slot %u]\n",
+           (int)obj.file_number,
+           (unsigned)(obj.file_number / NDFS_FILES_PER_OBJECT_BLOCK),
+           (unsigned)(obj.file_number % NDFS_FILES_PER_OBJECT_BLOCK));
     printf("\n");
     printf("Type                             : %s\n", obj.type);
     printf("FileType                         : %s\n", ptr_type_str(obj.file_pointer.type));

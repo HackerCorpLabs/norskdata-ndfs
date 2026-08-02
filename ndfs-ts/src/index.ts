@@ -17,6 +17,7 @@ export * from './bit-file.js';
 export * from './user-friend.js';
 export * from './user-entry.js';
 export * from './user-file.js';
+export * from './errors.js';
 export * from './object-entry.js';
 export * from './object-file.js';
 export * from './access-permissions.js';
