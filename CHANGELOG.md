@@ -2,6 +2,33 @@
 
 All notable changes to the NDFS libraries (`ndfs-c`, `ndfs-py`, `ndfs-ts`, `ndtool`).
 
+## 0.0.6 - 2026-08-18
+
+### Fixed - a damaged user file hid the whole file listing
+
+All three ports loaded the object file only after the user file had been read,
+so a user index page that could not be read took the listing down with it. The
+object file does not depend on the user file, and it is what names every file
+on the disk.
+
+* `ndfs-ts` - `loadStructures()` nested the object-file load inside the
+  user-file branch, and `readPage()` throwing on a damaged page threw out of
+  the constructor. The user file is now read on its own, its failure caught,
+  and the object file loaded either way.
+* `ndfs-py` - `_load_structures()` had the same nesting; same fix.
+* `ndfs-c` - `load_structures()` returned `NDFS_ERR_CORRUPT` when the user
+  index page could not be read, so the whole image failed to load. It now
+  carries on with no user names.
+
+Objects keep their user index when no name can be resolved; nothing else is
+lost.
+
+Seen on a 154 page SINTRAN floppy (directory `N-10-102-I`) whose master block
+and object file are intact and whose page 151, the user index, holds an object
+entry page left from an older backup. The parse failed with "Block 268453449
+out of range" and reported nothing; it now lists `MACM-1718K:BPUN` and
+`SINTRAN-I:DATA`.
+
 ## 0.0.5 — 2026-08-02
 
 **Upgrade strongly recommended. Earlier versions can corrupt genuine SINTRAN packs on write.**

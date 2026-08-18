@@ -508,10 +508,14 @@ static ndfs_error_t load_structures(struct ndfs_filesystem *fs)
     size_t i, j;
     int ui;
 
-    /* Load user file */
+    /* Load user file. A user index page that cannot be read is not fatal: the
+     * object file does not depend on the user file, and it is what names every
+     * file on the disk. A floppy whose user index page is damaged used to load
+     * as NDFS_ERR_CORRUPT and report nothing at all; it now loads with no user
+     * names, and the objects keep their user index. */
     if (ndfs_bp_is_valid(&mb->user_file_ptr)) {
         const uint8_t *index_page = read_page(fs, mb->user_file_ptr.block_id);
-        if (!index_page) return NDFS_ERR_CORRUPT;
+        if (index_page) {
         /* index_page is held across the data-page reads below (up to 8 of
          * them) -- pin it so LRU can't evict its slot mid-loop. */
         cache_pin(fs, mb->user_file_ptr.block_id);
@@ -540,6 +544,7 @@ static ndfs_error_t load_structures(struct ndfs_filesystem *fs)
             }
         }
         cache_unpin(fs, mb->user_file_ptr.block_id);
+        }
     }
 
     /* Load object file */

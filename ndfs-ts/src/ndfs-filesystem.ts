@@ -1053,28 +1053,36 @@ export class NdfsFileSystem {
   private loadStructures(): void {
     const mb = this.masterBlock;
 
-    // Load user file
+    // Load user file. The object file does not depend on it, so a user file
+    // that cannot be read must not take the file listing down with it: a
+    // floppy whose user index page is damaged still has an intact object file
+    // naming every file on the disk, and reading one page of a damaged floppy
+    // throws out of readPage(). Without user names the objects keep their user
+    // index and nothing else is lost.
+    const userMap = new Map<number, string>();
     if (mb.userFilePointer && mb.userFilePointer.isValid()) {
-      const indexPage = this.readPage(mb.userFilePointer.blockId);
-      this.userFile.loadFromPages(indexPage, (id) => this.readPage(id));
+      try {
+        const indexPage = this.readPage(mb.userFilePointer.blockId);
+        this.userFile.loadFromPages(indexPage, (id) => this.readPage(id));
 
-      // Link user names to object entries
-      const users = this.userFile.getUsers();
-      const userMap = new Map<number, string>();
-      for (let i = 0; i < users.length; i++) {
-        userMap.set(users[i].userIndex, users[i].userName);
-      }
-
-      // Load object file
-      if (mb.objectFilePointer && mb.objectFilePointer.isValid()) {
-        this.objectFile.loadFromPages(mb.objectFilePointer, (id) => this.readPage(id));
-
-        // Resolve user names on objects
-        const objects = this.objectFile.getObjects();
-        for (let i = 0; i < objects.length; i++) {
-          const name = userMap.get(objects[i].userIndex);
-          if (name) objects[i].userName = name;
+        const users = this.userFile.getUsers();
+        for (let i = 0; i < users.length; i++) {
+          userMap.set(users[i].userIndex, users[i].userName);
         }
+      } catch {
+        // damaged user file: carry on with no user names
+      }
+    }
+
+    // Load object file
+    if (mb.objectFilePointer && mb.objectFilePointer.isValid()) {
+      this.objectFile.loadFromPages(mb.objectFilePointer, (id) => this.readPage(id));
+
+      // Resolve user names on objects
+      const objects = this.objectFile.getObjects();
+      for (let i = 0; i < objects.length; i++) {
+        const name = userMap.get(objects[i].userIndex);
+        if (name) objects[i].userName = name;
       }
     }
 

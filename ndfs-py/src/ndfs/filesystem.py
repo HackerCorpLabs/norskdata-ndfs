@@ -862,30 +862,38 @@ class NdfsFileSystem:
         """Load user file, object file, and bit file from the image."""
         mb = self._master_block
 
-        # Load user file
+        # Load user file. The object file does not depend on it, so a user file
+        # that cannot be read must not take the file listing down with it: a
+        # floppy whose user index page is damaged still has an intact object
+        # file naming every file on the disk, and reading a damaged page raises
+        # out of _read_page(). Without user names the objects keep their user
+        # index and nothing else is lost.
+        user_map: Dict[int, str] = {}
         if mb.user_file_pointer is not None and mb.user_file_pointer.is_valid():
-            index_page = self._read_page(mb.user_file_pointer.block_id)
-            self._user_file.load_from_pages(index_page, lambda bid: self._read_page(bid))
+            try:
+                index_page = self._read_page(mb.user_file_pointer.block_id)
+                self._user_file.load_from_pages(index_page, lambda bid: self._read_page(bid))
 
-            # Link user names to object entries
-            users = self._user_file.get_users()
-            user_map: Dict[int, str] = {}
-            for i in range(len(users)):
-                user_map[users[i].user_index] = users[i].user_name
+                users = self._user_file.get_users()
+                for i in range(len(users)):
+                    user_map[users[i].user_index] = users[i].user_name
+            except Exception:
+                # damaged user file: carry on with no user names
+                pass
 
-            # Load object file
-            if mb.object_file_pointer is not None and mb.object_file_pointer.is_valid():
-                self._object_file.load_from_pages(
-                    mb.object_file_pointer,
-                    lambda bid: self._read_page(bid),
-                )
+        # Load object file
+        if mb.object_file_pointer is not None and mb.object_file_pointer.is_valid():
+            self._object_file.load_from_pages(
+                mb.object_file_pointer,
+                lambda bid: self._read_page(bid),
+            )
 
-                # Resolve user names on objects
-                objects = self._object_file.get_objects()
-                for i in range(len(objects)):
-                    name = user_map.get(objects[i].user_index)
-                    if name is not None:
-                        objects[i].user_name = name
+            # Resolve user names on objects
+            objects = self._object_file.get_objects()
+            for i in range(len(objects)):
+                name = user_map.get(objects[i].user_index)
+                if name is not None:
+                    objects[i].user_name = name
 
         # Load bit file
         if mb.bit_file_pointer is not None and mb.bit_file_pointer.is_valid():
