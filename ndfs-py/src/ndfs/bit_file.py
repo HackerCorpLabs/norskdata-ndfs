@@ -19,12 +19,20 @@ _BufType = Union[bytes, bytearray, memoryview]
 class BitFile:
     """NDFS allocation bitmap manager."""
 
-    __slots__ = ("index_pointer", "total_pages", "alloc_ceiling", "_bitmap")
+    __slots__ = ("index_pointer", "total_pages", "alloc_ceiling", "_bitmap",
+                 "_scan_cursor", "_used_count")
 
     def __init__(self) -> None:
         self.index_pointer: Optional[BlockPointer] = None
         #: Pages the bitmap covers -- the PHYSICAL DEVICE size, not the declared capacity.
         self.total_pages: int = 0
+        #: Where the descending free-block search left off. None = start from the
+        #: top. Cleared whenever a block is freed, so it can only ever skip a
+        #: prefix that was genuinely used. Pure optimisation, no format meaning.
+        self._scan_cursor: Optional[int] = None
+        #: Running count of used pages, or None when it has to be rebuilt from
+        #: the bitmap. Keeps calc_used_pages() O(1) -- see its docstring.
+        self._used_count: Optional[int] = None
         #: Highest allocatable page + 1 -- the descending allocator's ceiling.
         #:
         #: SINTRAN bounds the allocatable window by the directory's DECLARED CAPACITY
@@ -47,6 +55,8 @@ class BitFile:
         device (e.g. 38400 on a 75MB SMD pack), not to the declared capacity.
         """
         self.total_pages = total_pages
+        self._scan_cursor = None  # new bitmap: any cached search position is stale
+        self._used_count = None   # and the used-page total must be rebuilt
         # Until the caller supplies the declared capacity, the whole device is allocatable.
         self.alloc_ceiling = total_pages
         # Rounded up to a whole number of 16-bit WORDS. The bitmap is addressed by word
@@ -63,6 +73,8 @@ class BitFile:
         exist, even when the source slice stops on an odd boundary.
         """
         self._bitmap = bytearray(data)
+        self._scan_cursor = None  # new bitmap: any cached search position is stale
+        self._used_count = None   # and the used-page total must be rebuilt
         if len(self._bitmap) & 1:
             # Should not happen - the caller slices whole words - but a half word here
             # would make the last few pages unreadable rather than merely unallocatable.
@@ -112,19 +124,48 @@ class BitFile:
         if self._bitmap is None or block_id >= self.total_pages:
             raise IndexError(f"Block ID {block_id} out of range")
         byte_index, bit_index = self._bit_position(block_id)
+        if not (self._bitmap[byte_index] & (1 << bit_index)) and self._used_count is not None:
+            self._used_count += 1
         self._bitmap[byte_index] |= 1 << bit_index
 
     def mark_block_free(self, block_id: int) -> None:
         """Mark a block as free."""
+        # A freed block may sit ABOVE the descending search cursor, so drop the
+        # cursor: without this, find_first_free_block would never look back up
+        # and the freed page would be lost until the next full scan.
+        self._scan_cursor = None
         if self._bitmap is None or block_id >= self.total_pages:
             raise IndexError(f"Block ID {block_id} out of range")
         byte_index, bit_index = self._bit_position(block_id)
+        if (self._bitmap[byte_index] & (1 << bit_index)) and self._used_count is not None:
+            self._used_count -= 1
         self._bitmap[byte_index] &= ~(1 << bit_index)
 
     def calc_used_pages(self) -> int:
-        """Count total used pages."""
+        """Count total used pages.
+
+        Served from a running total kept by mark_block_used/mark_block_free, so
+        this is O(1) rather than a walk of every page in the volume. The count
+        is recomputed from scratch whenever the bitmap itself is replaced
+        (initialize/load_bitmap), which are the only ways it can change behind
+        this class's back.
+
+        Why it matters: write_file consults get_free_pages() before expanding a
+        user's reservation, so this used to walk all 38400 pages of an SMD pack
+        on every file written. That went unnoticed while an all-zero file needed
+        no pages at all and skipped the quota branch entirely; once every page
+        became real (see filesystem._write_data_page_to_index) a test that
+        creates a few thousand small files turned into tens of millions of
+        bit tests and the Python suite stopped finishing.
+        """
         if self._bitmap is None:
             return 0
+        if self._used_count is None:
+            self._used_count = self._recount_used()
+        return self._used_count
+
+    def _recount_used(self) -> int:
+        """Walk the bitmap and count used pages. Only for (re)building the cache."""
         count = 0
         for i in range(self.total_pages):
             if self.is_block_used(i):
@@ -161,9 +202,34 @@ class BitFile:
 
         Returns the block ID or -1 if no free block exists.
         """
-        for i in range(self._top_scan_index(), FIRST_ALLOCATABLE_BLOCK - 1, -1):
+        # Resume where the last successful search stopped instead of rescanning
+        # the whole volume from the top. Everything above `_scan_cursor` was
+        # already used when we passed it, and `mark_block_free` clears the
+        # cursor, so this returns exactly the same block the full scan would --
+        # it just does not walk the used prefix again.
+        #
+        # This matters now that an all-zero page is a real page rather than an
+        # inferred hole (see filesystem._write_data_page_to_index). Writing a
+        # 1000-page file used to allocate a handful of blocks; it now allocates
+        # 1000, and a fresh top-down scan per block made that O(pages x volume)
+        # -- on a 38400-page pack the Python test suite went from 11 s to over
+        # 10 minutes before this cursor was added.
+        start = self._top_scan_index() if self._scan_cursor is None else self._scan_cursor
+        if start > self._top_scan_index():
+            start = self._top_scan_index()
+        for i in range(start, FIRST_ALLOCATABLE_BLOCK - 1, -1):
             if not self.is_block_used(i):
+                self._scan_cursor = i
                 return i
+        # Nothing free at or below the cursor. If the cursor had narrowed the
+        # window, retry once over the whole range before declaring the pack
+        # full, so a stale cursor can never invent an out-of-space error.
+        if self._scan_cursor is not None:
+            self._scan_cursor = None
+            for i in range(self._top_scan_index(), FIRST_ALLOCATABLE_BLOCK - 1, -1):
+                if not self.is_block_used(i):
+                    self._scan_cursor = i
+                    return i
         return -1
 
     def find_free_block_range(self, blocks_needed: int) -> int:
