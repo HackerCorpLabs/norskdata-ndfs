@@ -29,6 +29,41 @@ entry page left from an older backup. The parse failed with "Block 268453449
 out of range" and reported nothing; it now lists `MACM-1718K:BPUN` and
 `SINTRAN-I:DATA`.
 
+### Fixed - three write-path bugs found installing the COSMOS TCP/IP kit
+
+* **Sparse holes must be declared, never inferred from an all-zero page.**
+  The old writers turned any full page of zeros into a hole; that is
+  invisible on read-back through this library, but SINTRAN's READ-BI and
+  READ-PROGFILE refuse a hole with `NO SUCH PAGE` / `ERROR IN ACCESSING
+  INPUT FILE`. Measured 2026-08-18 on a SINTRAN III VSX-K pack:
+  `(TCP-IP)TCP-SER-B1..B3-B05:BPUN` arrived with 48/62/53 invented holes and
+  failed to load; bank 0, which has no zero pages, loaded fine. Every write
+  path now allocates every logical page for real; a new
+  `ndfs_write_file_holes` (C) / `holes=` (Python) / `holePages` (TS)
+  parameter lets a caller restore holes explicitly recorded in an XAT
+  sidecar's `ndfs.holes` key, the only legitimate source of a hole.
+* **A new file now inherits the owning user's default file access**
+  (`@SET-DEFAULT-FILE-ACCESS`) instead of a flat owner-and-friends-only
+  default. The flat default left files unreadable by SYSTEM, which is
+  neither owner nor friend of an ordinary user, so a `:BPUN` written into a
+  user's area could not be read by the RT-LOADER meant to load it.
+* **Object lookup (Python/TS) now matches by TYPE, not just NAME.**
+  `NAME:TYPE` is a SINTRAN file's real identity — two files commonly share a
+  name and differ only in type, e.g. `(TCP-IP)SKP-C00:DEFS`/`:IMPT`/`:INTL`.
+  Matching on name alone made a write to `AAA:MODE` silently overwrite an
+  existing `AAA:LIST`'s data while leaving its type as `LIST`. Measured
+  2026-08-19 installing the same kit: `TCP-IP-LO-D02:MODE` and
+  `TCP-START-D02:MODE` were both lost this way. `ndfs-c`'s object lookup
+  already matched on type, so `ndfs-c` needed no change for this one.
+
+Declaring every page real exposed an O(n²) allocation-scan cost in
+`ndfs-py`'s bit file (each allocation rescanned the bitmap from the top, and
+the used-page count was recomputed by a full walk on every quota check).
+`ndfs-py` now caches a scan cursor and a running used-page count.
+`ndfs-c` and `ndfs-ts` have the same rescan cost, not yet optimized — their
+30,000-file stress test takes ~9 minutes and ~3 minutes respectively but
+still passes.
+
 ## 0.0.5 — 2026-08-02
 
 **Upgrade strongly recommended. Earlier versions can corrupt genuine SINTRAN packs on write.**
