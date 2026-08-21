@@ -17,8 +17,10 @@ describe('SparseFiles', () => {
     const freeBefore = fs.getFreePages();
 
     // Write a multi-page all-zero file
-    const data = new Uint8Array(NDFS_PAGE_SIZE * 5); // all zeros
-    fs.writeFile('SYSTEM/ZEROS:DATA', data);
+    // Every page DECLARED a hole. Zeros alone do not make holes: a file with
+    // invented holes is one SINTRAN cannot READ-BI.
+    const data = new Uint8Array(NDFS_PAGE_SIZE * 5);
+    fs.writeFile('SYSTEM/ZEROS:DATA', data, 'none', [0, 1, 2, 3, 4]);
 
     const freeAfter = fs.getFreePages();
     // With sparse, only 1 index block should be allocated (data pages are sparse holes)
@@ -37,7 +39,7 @@ describe('SparseFiles', () => {
     // Page 3 (offset 6144-8191): non-zero
     for (let i = NDFS_PAGE_SIZE * 3; i < NDFS_PAGE_SIZE * 4; i++) data[i] = 0xBB;
 
-    fs.writeFile('SYSTEM/MIXED:DATA', data);
+    fs.writeFile('SYSTEM/MIXED:DATA', data, 'none', [0, 2]);
 
     const freeAfter = fs.getFreePages();
     // 1 index block + 2 data blocks (pages 0 and 2 are sparse)
@@ -74,17 +76,37 @@ describe('SparseFiles', () => {
     const fs1 = createFS();
     const fs2 = createFS();
 
-    // Sparse: all zeros
+    // Sparse: pages DECLARED as holes (the content is irrelevant to that).
     const sparseData = new Uint8Array(NDFS_PAGE_SIZE * 5);
-    fs1.writeFile('SYSTEM/SPARSE:DATA', sparseData);
+    fs1.writeFile('SYSTEM/SPARSE:DATA', sparseData, 'none', [0, 1, 2, 3, 4]);
 
-    // Non-sparse: all non-zero
+    // Non-sparse: no holes declared.
     const denseData = new Uint8Array(NDFS_PAGE_SIZE * 5);
     denseData.fill(0xFF);
     fs2.writeFile('SYSTEM/DENSE:DATA', denseData);
 
     // Sparse should have more free pages
     expect(fs1.getFreePages()).toBeGreaterThan(fs2.getFreePages());
+  });
+
+  it('all-zero pages are NOT holes unless declared', () => {
+    // THE REGRESSION THAT MATTERS. Deliberately asymmetric: it fails against
+    // the old inference-based writer, which is the point -- a test that passes
+    // under both conventions proves nothing.
+    //
+    // Measured consequence of that writer on a SINTRAN III VSX-K pack
+    // (2026-08-18): (TCP-IP)TCP-SER-B1..B3-B05:BPUN were copied in with
+    // 48/62/53 invented holes and the machine refused all three with
+    // NO SUCH PAGE, while bank 0 (which had no all-zero page) loaded.
+    const fs = createFS();
+    const freeBefore = fs.getFreePages();
+
+    const data = new Uint8Array(NDFS_PAGE_SIZE * 5); // all zeros, no holes declared
+    fs.writeFile('SYSTEM/NOHOLES:BPUN', data);
+
+    // 1 index block + 5 real data pages -- nothing was turned into a hole.
+    expect(fs.getFreePages()).toBe(freeBefore - 6);
+    expect(fs.getFileBlocks('SYSTEM/NOHOLES:BPUN').filter((b) => b === 0).length).toBe(0);
   });
 });
 
@@ -114,7 +136,7 @@ describe('SparseFileQuotaAccounting', () => {
     const before = pagesUsedFor(fs, 'SYSTEM');
 
     const data = new Uint8Array(NDFS_PAGE_SIZE * 5); // all zero — fully sparse
-    fs.writeFile('SYSTEM/ALLZERO:DAT', data);
+    fs.writeFile('SYSTEM/ALLZERO:DAT', data, 'none', Array.from({ length: 5 }, (_, i) => i));
 
     const after = pagesUsedFor(fs, 'SYSTEM');
     expect(after).toBe(before);
@@ -127,7 +149,7 @@ describe('SparseFileQuotaAccounting', () => {
     // 10 pages: pages 0-2 real (non-zero), pages 3-9 stay zero (7 sparse holes)
     const data = new Uint8Array(NDFS_PAGE_SIZE * 10);
     for (let i = 0; i < NDFS_PAGE_SIZE * 3; i++) data[i] = (i % 251) + 1; // never zero
-    fs.writeFile('SYSTEM/MIXEDQUOTA:DAT', data);
+    fs.writeFile('SYSTEM/MIXEDQUOTA:DAT', data, 'none', [3, 4, 5, 6, 7, 8, 9]);
 
     const after = pagesUsedFor(fs, 'SYSTEM');
     expect(after - before).toBe(3);
@@ -191,7 +213,8 @@ describe('SparseFileQuotaAccounting', () => {
     const data = new Uint8Array(NDFS_PAGE_SIZE * 600);
     // Only 2 real pages; the remaining 598 pages stay zero (sparse holes).
     for (let i = 0; i < NDFS_PAGE_SIZE * 2; i++) data[i] = (i % 251) + 1;
-    fs.writeFile('SYSTEM/BIGSPARSE:DAT', data);
+    fs.writeFile('SYSTEM/BIGSPARSE:DAT', data, 'none',
+      Array.from({ length: 600 }, (_, i) => i).filter((p) => p !== 0 && p !== 2));
 
     const after = pagesUsedFor(fs, 'SYSTEM');
     expect(after - before).toBe(2);

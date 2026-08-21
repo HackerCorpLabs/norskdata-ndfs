@@ -209,7 +209,8 @@ class TestSparseFileWithXat:
             content[i] = 0xBB
         # Page 3: zeros
 
-        fs1.write_file("SYSTEM/SPARSE:DATA", bytes(content))
+        # Pages 1 and 3 are DECLARED holes -- being zero would not make them so.
+        fs1.write_file("SYSTEM/SPARSE:DATA", bytes(content), holes=[1, 3])
 
         data, properties = fs1.read_file_with_properties("SYSTEM/SPARSE:DATA")
         # pages_in_file counts the pages ACTUALLY ALLOCATED, not the logical extent:
@@ -249,7 +250,9 @@ class TestLargeSparseFileXat:
         for i in range(9 * NDFS_PAGE_SIZE, 10 * NDFS_PAGE_SIZE):
             content[i] = 0xFF
 
-        fs1.write_file("SYSTEM/BIGSPARSE:DATA", bytes(content))
+        # Pages 1..8 are DECLARED holes; only 0 and 9 carry data.
+        fs1.write_file("SYSTEM/BIGSPARSE:DATA", bytes(content),
+                       holes=range(1, 9))
 
         data, properties = fs1.read_file_with_properties("SYSTEM/BIGSPARSE:DATA")
         # Only the first and last pages hold data; the 8 in between are sparse holes

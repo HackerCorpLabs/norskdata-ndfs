@@ -915,9 +915,26 @@ static int test_subindexed_sparse_holes(void)
     fill_nonzero_pattern(data + (size_t)511 * NDFS_PAGE_SIZE, NDFS_PAGE_SIZE, 6);
     fill_nonzero_pattern(data + (size_t)700 * NDFS_PAGE_SIZE, NDFS_PAGE_SIZE, 7);
 
-    ndfs_get_free_pages(fs, &free_before);
-    TEST_ASSERT_OK(ndfs_write_file(fs, "SYSTEM/SPARSBIG:DATA", data, size));
-    ndfs_get_free_pages(fs, &free_after);
+    /* Declare every page except those three as a hole. Holes are stated, never
+     * inferred from the zeros (see write_data_page_to_index). */
+    {
+        uint32_t *hole_pages = (uint32_t *)malloc(sizeof(uint32_t) * data_pages);
+        ndfs_hole_list_t holes;
+        uint32_t p, n = 0;
+
+        TEST_ASSERT_NOT_NULL(hole_pages);
+        for (p = 0; p < data_pages; p++) {
+            if (p != 10 && p != 511 && p != 700) hole_pages[n++] = p;
+        }
+        holes.pages = hole_pages;
+        holes.count = n;
+
+        ndfs_get_free_pages(fs, &free_before);
+        TEST_ASSERT_OK(ndfs_write_file_holes(fs, "SYSTEM/SPARSBIG:DATA", data, size,
+                                             NDFS_PARITY_NONE, &holes));
+        ndfs_get_free_pages(fs, &free_after);
+        free(hole_pages);
+    }
 
     /* Structural pages (1 sub-index + num_index_blocks group index blocks)
      * plus only the non-sparse data pages -- NOT all 1000 data pages. */
@@ -1384,20 +1401,30 @@ static int test_unreserved_pages_persist_does_not_touch_extended_info(void)
  * (src/filesystem.c) to charge only real (non-sparse), non-structural
  * pages. */
 
-/* A fully-sparse (all-zero) file must charge ZERO pages_used -- no data
- * page is real, and no structural page is ever charged either. */
+/* A file whose every page is DECLARED a hole must charge ZERO pages_used --
+ * no data page is real, and no structural page is ever charged either.
+ *
+ * The holes have to be declared. Before 2026-08-18 this test passed all-zero
+ * data to ndfs_write_file() and relied on the writer inferring the holes; that
+ * inference is gone, because it produced files SINTRAN could not read. */
 static int test_quota_fully_sparse_file_charges_zero(void)
 {
     ndfs_filesystem_t *fs = create_writable(NDFS_TMPL_FLOPPY_360KB, "QSPARSE0");
     size_t size = NDFS_PAGE_SIZE * 4;
     uint8_t *data = (uint8_t *)calloc(size, 1); /* all zero */
+    static const uint32_t hole_pages[] = { 0, 1, 2, 3 };
+    ndfs_hole_list_t holes;
     uint32_t used_before, used_after;
 
     TEST_ASSERT_NOT_NULL(fs);
     TEST_ASSERT_NOT_NULL(data);
 
+    holes.pages = hole_pages;
+    holes.count = 4;
+
     used_before = get_user_pages_used(fs, "SYSTEM");
-    TEST_ASSERT_OK(ndfs_write_file(fs, "SYSTEM/ALLSPRS:DATA", data, size));
+    TEST_ASSERT_OK(ndfs_write_file_holes(fs, "SYSTEM/ALLSPRS:DATA", data, size,
+                                         NDFS_PARITY_NONE, &holes));
     used_after = get_user_pages_used(fs, "SYSTEM");
 
     TEST_ASSERT_EQUAL(used_before, used_after);
@@ -1407,7 +1434,7 @@ static int test_quota_fully_sparse_file_charges_zero(void)
     return 0;
 }
 
-/* A mixed file (some real pages, some zero pages) must charge only the real
+/* A mixed file (some real pages, some DECLARED holes) must charge only the real
  * page count -- not the logical page count and not a structural add-on. */
 static int test_quota_mixed_sparse_charges_only_real(void)
 {
@@ -1416,6 +1443,8 @@ static int test_quota_mixed_sparse_charges_only_real(void)
     size_t size = (size_t)logical_pages * NDFS_PAGE_SIZE;
     uint8_t *data = (uint8_t *)calloc(size, 1);
     uint32_t real_pages = 2; /* only pages 1 and 3 carry real data */
+    static const uint32_t hole_pages[] = { 0, 2, 4 };
+    ndfs_hole_list_t holes;
     uint32_t used_before, used_after;
 
     TEST_ASSERT_NOT_NULL(fs);
@@ -1424,12 +1453,54 @@ static int test_quota_mixed_sparse_charges_only_real(void)
     fill_nonzero_pattern(data + (size_t)1 * NDFS_PAGE_SIZE, NDFS_PAGE_SIZE, 11);
     fill_nonzero_pattern(data + (size_t)3 * NDFS_PAGE_SIZE, NDFS_PAGE_SIZE, 22);
 
+    holes.pages = hole_pages;
+    holes.count = 3;
+
     used_before = get_user_pages_used(fs, "SYSTEM");
-    TEST_ASSERT_OK(ndfs_write_file(fs, "SYSTEM/MIXED:DATA", data, size));
+    TEST_ASSERT_OK(ndfs_write_file_holes(fs, "SYSTEM/MIXED:DATA", data, size,
+                                         NDFS_PARITY_NONE, &holes));
     used_after = get_user_pages_used(fs, "SYSTEM");
 
     TEST_ASSERT_EQUAL(used_before + real_pages, used_after);
     TEST_ASSERT(used_after - used_before < logical_pages); /* proves no over-charge */
+
+    free(data);
+    ndfs_close(fs);
+    return 0;
+}
+
+/* THE REGRESSION THAT MATTERS: all-zero pages must NOT become holes on their
+ * own. Every logical page gets a real block, and the user is charged for all
+ * of them.
+ *
+ * Deliberately asymmetric: it fails against the old inference-based writer,
+ * which is the whole point -- a test that passes under both conventions proves
+ * nothing. Measured consequence of the old behaviour, on a SINTRAN III VSX-K
+ * pack 2026-08-18: (TCP-IP)TCP-SER-B1..B3-B05:BPUN arrived with 48/62/53
+ * invented holes and the machine refused all three with NO SUCH PAGE, while
+ * bank 0 (no all-zero pages) loaded. */
+static int test_zero_pages_are_not_holes_unless_declared(void)
+{
+    ndfs_filesystem_t *fs = create_writable(NDFS_TMPL_FLOPPY_360KB, "NOSPARSE");
+    uint32_t logical_pages = 4;
+    size_t size = (size_t)logical_pages * NDFS_PAGE_SIZE;
+    uint8_t *data = (uint8_t *)calloc(size, 1); /* all zero */
+    ndfs_xat_properties_t xat;
+    uint32_t used_before, used_after;
+
+    TEST_ASSERT_NOT_NULL(fs);
+    TEST_ASSERT_NOT_NULL(data);
+
+    used_before = get_user_pages_used(fs, "SYSTEM");
+    TEST_ASSERT_OK(ndfs_write_file(fs, "SYSTEM/NOHOLES:BPUN", data, size));
+    used_after = get_user_pages_used(fs, "SYSTEM");
+
+    /* every page real: charged for all four, not zero */
+    TEST_ASSERT_EQUAL(used_before + logical_pages, used_after);
+
+    /* and the object entry agrees -- pages_in_file counts allocated pages */
+    TEST_ASSERT_OK(ndfs_get_file_properties(fs, "SYSTEM/NOHOLES:BPUN", &xat));
+    TEST_ASSERT_EQUAL((long)logical_pages, (long)xat.pages_in_file);
 
     free(data);
     ndfs_close(fs);
@@ -1559,7 +1630,22 @@ static int test_quota_subindexed_sparse_charges_only_real(void)
     fill_nonzero_pattern(data + (size_t)900 * NDFS_PAGE_SIZE, NDFS_PAGE_SIZE, 66);
 
     used_before = get_user_pages_used(fs, "SYSTEM");
-    TEST_ASSERT_OK(ndfs_write_file(fs, "SYSTEM/SUBSPRS:DATA", data, size));
+    {
+        uint32_t *hole_pages = (uint32_t *)malloc(sizeof(uint32_t) * data_pages);
+        ndfs_hole_list_t holes;
+        uint32_t p, n = 0;
+
+        TEST_ASSERT_NOT_NULL(hole_pages);
+        for (p = 0; p < data_pages; p++) {
+            if (p != 5 && p != 900) hole_pages[n++] = p;
+        }
+        holes.pages = hole_pages;
+        holes.count = n;
+
+        TEST_ASSERT_OK(ndfs_write_file_holes(fs, "SYSTEM/SUBSPRS:DATA", data, size,
+                                             NDFS_PARITY_NONE, &holes));
+        free(hole_pages);
+    }
     used_after = get_user_pages_used(fs, "SYSTEM");
 
     /* Exactly the 2 real pages -- none of the sub-index/group-index
@@ -1665,6 +1751,7 @@ void run_write_comprehensive_tests(void)
     RUN_TEST(test_object_dir_delete_recreate_in_second_group);
     RUN_TEST(test_quota_fully_sparse_file_charges_zero);
     RUN_TEST(test_quota_mixed_sparse_charges_only_real);
+    RUN_TEST(test_zero_pages_are_not_holes_unless_declared);
     RUN_TEST(test_quota_fully_real_file_no_index_overhead);
     RUN_TEST(test_quota_delete_refunds_exactly);
     RUN_TEST(test_quota_overwrite_grow_then_shrink);

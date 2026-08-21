@@ -194,7 +194,8 @@ describe('XAT Copy-Across Scenarios', () => {
     for (let i = 2 * NDFS_PAGE_SIZE; i < 3 * NDFS_PAGE_SIZE; i++) content[i] = 0xBB;
     // Page 3: all zeros (default)
 
-    fs1.writeFile('SYSTEM/SPARSE:DATA', content);
+    // Pages 1 and 3 are DECLARED holes -- being zero would not make them so.
+    fs1.writeFile('SYSTEM/SPARSE:DATA', content, 'none', [1, 3]);
 
     const { data, properties } = fs1.readFileWithProperties('SYSTEM/SPARSE:DATA');
     // pagesInFile counts the pages ACTUALLY ALLOCATED, not the logical extent: pages 0
@@ -243,7 +244,8 @@ describe('XAT Copy-Across Scenarios', () => {
     for (let i = 9 * NDFS_PAGE_SIZE; i < 10 * NDFS_PAGE_SIZE; i++) content[i] = 0xFF;
     // Pages 1-8: zeros
 
-    fs1.writeFile('SYSTEM/BIGSPARSE:DATA', content);
+    // Pages 1..8 are DECLARED holes; only 0 and 9 carry data.
+    fs1.writeFile('SYSTEM/BIGSPARSE:DATA', content, 'none', [1, 2, 3, 4, 5, 6, 7, 8]);
 
     const { data, properties } = fs1.readFileWithProperties('SYSTEM/BIGSPARSE:DATA');
     // Only the first and last pages hold data; the 8 in between are sparse holes

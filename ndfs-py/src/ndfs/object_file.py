@@ -52,16 +52,50 @@ class ObjectFile:
         """Get an object entry by index."""
         return self._entries.get(index, None)
 
-    def find_object(self, object_name: str, user_name: str) -> Optional[ObjectEntry]:
-        """Find an object by name and user."""
+    @staticmethod
+    def _normalize_type(file_type: Optional[str]) -> str:
+        """Uppercase a file type and drop the padding SINTRAN leaves on it.
+
+        Types read off a pack can carry a trailing apostrophe and spaces
+        (the same reason other call sites do rstrip("' ")), so compare on a
+        normalized form rather than raw bytes.
+        """
+        return (file_type or "").upper().strip().rstrip("'").strip()
+
+    def find_object(
+        self,
+        object_name: str,
+        user_name: str,
+        file_type: Optional[str] = None,
+    ) -> Optional[ObjectEntry]:
+        """Find an object by name and user, and by type when one is given.
+
+        A SINTRAN file is identified by NAME:TYPE, and two files may share a
+        name while differing only in type -- a real pack carries both
+        (TCP-IP)TCP-IP-LO-D02:MODE and :LIST, and (TCP-IP)SKP-C00 exists as
+        :DEFS, :IMPT and :INTL at once.
+
+        Matching on the name alone made write_file treat those as one file:
+        writing AAA:MODE after AAA:LIST overwrote the LIST entry's data while
+        leaving its type as LIST, so the MODE file vanished and the LIST file
+        silently held the wrong bytes. Measured 2026-08-19 while installing
+        the COSMOS TCP/IP kit -- TCP-IP-LO-D02:MODE and TCP-START-D02:MODE
+        were both lost that way.
+
+        file_type=None keeps the old name-only behaviour, for callers that
+        genuinely do not know the type.
+        """
         name_upper = object_name.upper()
         user_upper = user_name.upper()
+        type_upper = self._normalize_type(file_type) if file_type else None
         for entry in self._entries.values():
-            if (
-                entry.object_name.upper() == name_upper
-                and entry.user_name.upper() == user_upper
-            ):
-                return entry
+            if entry.object_name.upper() != name_upper:
+                continue
+            if entry.user_name.upper() != user_upper:
+                continue
+            if type_upper is not None and self._normalize_type(entry.type) != type_upper:
+                continue
+            return entry
         return None
 
     def add_object(self, entry: ObjectEntry) -> None:

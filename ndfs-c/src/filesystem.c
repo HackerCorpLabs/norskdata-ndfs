@@ -114,22 +114,31 @@ static void free_file_blocks(struct ndfs_filesystem *fs,
                              const ndfs_object_entry_t *obj);
 static uint32_t count_real_data_pages_in_buffer(const uint8_t *file_data,
                                                 size_t file_size,
-                                                uint32_t data_pages);
+                                                uint32_t data_pages,
+                                                const ndfs_hole_list_t *holes);
 static uint32_t count_real_data_pages_in_object(const struct ndfs_filesystem *fs,
                                                 const ndfs_object_entry_t *obj);
 static ndfs_error_t create_new_file(struct ndfs_filesystem *fs,
                                     const char *obj_name, const char *file_type,
                                     int user_idx,
-                                    const uint8_t *file_data, size_t file_size);
+                                    const uint8_t *file_data, size_t file_size,
+                                    const ndfs_hole_list_t *holes);
 static ndfs_error_t update_existing_file(struct ndfs_filesystem *fs,
                                          int obj_idx, int user_idx,
-                                         const uint8_t *file_data, size_t file_size);
+                                         const uint8_t *file_data, size_t file_size,
+                                         const ndfs_hole_list_t *holes);
+static ndfs_error_t write_file_impl(ndfs_filesystem_t *fs,
+                                    const char *path,
+                                    const uint8_t *file_data,
+                                    size_t file_size,
+                                    const ndfs_hole_list_t *holes);
 static ndfs_error_t allocate_and_write_data(struct ndfs_filesystem *fs,
                                             const uint8_t *file_data, size_t file_size,
                                             uint32_t data_pages,
                                             uint32_t *out_top_block_id,
                                             ndfs_pointer_type_t *out_pointer_type,
-                                            uint32_t *out_struct_pages);
+                                            uint32_t *out_struct_pages,
+                                            const ndfs_hole_list_t *holes);
 static void add_object(struct ndfs_filesystem *fs, const ndfs_object_entry_t *obj);
 static size_t objects_for_user_by_index(const struct ndfs_filesystem *fs, uint8_t idx);
 static void persist_master_block(struct ndfs_filesystem *fs);
@@ -1265,36 +1274,61 @@ static uint32_t ensure_user_dir_page(struct ndfs_filesystem *fs, uint32_t user_i
     return blk;
 }
 
-/* Write one data page (sparse-aware) and store its BlockPointer at slot
- * `slot_in_index` of `index_page_buf` (an already-mapped 2048-byte index
- * page). A page that is entirely zero and fully within the file is left as
- * a sparse hole (BlockPointer 0) rather than allocating a real disk block —
- * this is the exact sparse-hole rule the plain Indexed path already used,
- * factored out so the SubIndexed path (which needs it per-group) stays in
- * sync with it instead of duplicating and possibly drifting. */
+/* True when `page` is named in the caller-supplied hole list. A NULL or empty
+ * list means the file has no holes -- the normal case. The list is ascending,
+ * but this scans linearly because hole lists are short (a handful of entries)
+ * and a binary search would be harder to read for no measurable gain. */
+static bool page_is_declared_hole(const ndfs_hole_list_t *holes, uint32_t page)
+{
+    size_t i;
+
+    if (!holes || !holes->pages) return false;
+    for (i = 0; i < holes->count; i++) {
+        if (holes->pages[i] == page) return true;
+        if (holes->pages[i] > page) break; /* ascending: no point looking further */
+    }
+    return false;
+}
+
+/* Write one data page and store its BlockPointer at slot `slot_in_index` of
+ * `index_page_buf` (an already-mapped 2048-byte index page).
+ *
+ * A page becomes a sparse hole ONLY when the caller names it in `holes`. The
+ * content of the page never decides this.
+ *
+ * It used to: any page that was entirely zero and fully within the file was
+ * silently turned into a hole. That was wrong, and wrong in a way this library
+ * could not see -- reading such a file back through ndfs_read_file() returns
+ * the same bytes either way. SINTRAN is not so forgiving. READ-BI and
+ * READ-PROGFILE stop at a hole with
+ *
+ *     NO SUCH PAGE
+ *     ERROR IN ACCESSING INPUT FILE
+ *
+ * so a :BPUN or :PROG copied onto a pack this way is a file the machine refuses
+ * to load. Measured on a real SINTRAN III VSX-K pack, 2026-08-18: the four
+ * (TCP-IP)TCP-SER-B0..B3 PIOC bank images came in with 0/48/62/53 invented
+ * holes; bank 0 loaded and banks 1-3 all failed with NO SUCH PAGE. The same
+ * files on genuine ND media have no holes at all -- a 128 KB bank dump is fully
+ * allocated even where the bank is empty.
+ *
+ * Holes are still real and still supported; they just have to be declared,
+ * which is what the XAT sidecar's "ndfs.holes" records them for. */
 static ndfs_error_t write_data_page_to_index(struct ndfs_filesystem *fs,
                                              const uint8_t *file_data, size_t file_size,
                                              uint32_t data_page_index,
                                              uint8_t *index_page_buf,
-                                             uint32_t slot_in_index)
+                                             uint32_t slot_in_index,
+                                             const ndfs_hole_list_t *holes)
 {
     size_t page_offset = (size_t)data_page_index * NDFS_PAGE_SIZE;
     size_t page_end = page_offset + NDFS_PAGE_SIZE;
     size_t slice_len;
-    bool all_zeros = true;
-    size_t b;
 
     if (page_end > file_size) page_end = file_size;
     slice_len = page_end > page_offset ? page_end - page_offset : 0;
 
-    for (b = 0; b < slice_len; b++) {
-        if (file_data[page_offset + b] != 0) {
-            all_zeros = false;
-            break;
-        }
-    }
-
-    if (all_zeros && slice_len == NDFS_PAGE_SIZE) {
+    if (page_is_declared_hole(holes, data_page_index)) {
         /* Sparse hole: BlockPointer 0, no disk space consumed. */
         ndfs_write_u32be(index_page_buf, slot_in_index * 4, 0);
     } else {
@@ -1338,31 +1372,20 @@ static ndfs_error_t write_data_page_to_index(struct ndfs_filesystem *fs,
  * quota). */
 static uint32_t count_real_data_pages_in_buffer(const uint8_t *file_data,
                                                 size_t file_size,
-                                                uint32_t data_pages)
+                                                uint32_t data_pages,
+                                                const ndfs_hole_list_t *holes)
 {
     uint32_t real_pages = 0;
     uint32_t p;
 
+    (void)file_data;
+    (void)file_size;
+
     for (p = 0; p < data_pages; p++) {
-        size_t page_offset = (size_t)p * NDFS_PAGE_SIZE;
-        size_t page_end = page_offset + NDFS_PAGE_SIZE;
-        size_t slice_len;
-        bool all_zeros = true;
-        size_t b;
-
-        if (page_end > file_size) page_end = file_size;
-        slice_len = page_end > page_offset ? page_end - page_offset : 0;
-
-        for (b = 0; b < slice_len; b++) {
-            if (file_data[page_offset + b] != 0) {
-                all_zeros = false;
-                break;
-            }
-        }
-
-        /* Mirrors write_data_page_to_index() exactly: only a FULL (unsliced)
-         * all-zero page becomes a sparse hole. */
-        if (!(all_zeros && slice_len == NDFS_PAGE_SIZE)) {
+        /* Mirrors write_data_page_to_index() exactly: a page is a hole only
+         * when the caller declared it one. The page's contents do not enter
+         * into it, which is why file_data/file_size are unused here now. */
+        if (!page_is_declared_hole(holes, p)) {
             real_pages++;
         }
     }
@@ -1388,7 +1411,8 @@ static ndfs_error_t allocate_and_write_data(struct ndfs_filesystem *fs,
                                             uint32_t data_pages,
                                             uint32_t *out_top_block_id,
                                             ndfs_pointer_type_t *out_pointer_type,
-                                            uint32_t *out_struct_pages)
+                                            uint32_t *out_struct_pages,
+                                            const ndfs_hole_list_t *holes)
 {
     ndfs_error_t err;
     uint32_t i;
@@ -1415,7 +1439,7 @@ static ndfs_error_t allocate_and_write_data(struct ndfs_filesystem *fs,
         cache_pin(fs, index_block_id);
         for (i = 0; i < data_pages; i++) {
             err = write_data_page_to_index(fs, file_data, file_size, i,
-                                           index_page_buf, i);
+                                           index_page_buf, i, holes);
             if (err != NDFS_OK) { cache_unpin(fs, index_block_id); return err; }
         }
         cache_unpin(fs, index_block_id);
@@ -1478,7 +1502,7 @@ static ndfs_error_t allocate_and_write_data(struct ndfs_filesystem *fs,
 
             for (p = start_page; p < end_page; p++) {
                 err = write_data_page_to_index(fs, file_data, file_size, p,
-                                               idx_page_buf, p - start_page);
+                                               idx_page_buf, p - start_page, holes);
                 if (err != NDFS_OK) {
                     cache_unpin(fs, idx_block_id);
                     cache_unpin(fs, sub_index_block_id);
@@ -1499,7 +1523,8 @@ static ndfs_error_t allocate_and_write_data(struct ndfs_filesystem *fs,
 static ndfs_error_t create_new_file(struct ndfs_filesystem *fs,
                                     const char *obj_name, const char *file_type,
                                     int user_slot,
-                                    const uint8_t *file_data, size_t file_size)
+                                    const uint8_t *file_data, size_t file_size,
+                                    const ndfs_hole_list_t *holes)
 {
     uint32_t data_pages = (uint32_t)((file_size + NDFS_PAGE_SIZE - 1) / NDFS_PAGE_SIZE);
     uint32_t top_block_id;
@@ -1530,7 +1555,7 @@ static ndfs_error_t create_new_file(struct ndfs_filesystem *fs,
      * <=512 pages, or SubIndexed (sub-index -> group index blocks -> data
      * pages) for larger files. */
     err = allocate_and_write_data(fs, file_data, file_size, data_pages,
-                                  &top_block_id, &pointer_type, &struct_pages);
+                                  &top_block_id, &pointer_type, &struct_pages, holes);
     if (err != NDFS_OK) return err;
 
     /* Create object entry */
@@ -1568,14 +1593,29 @@ static ndfs_error_t create_new_file(struct ndfs_filesystem *fs,
      *
      * The logical extent is still ceil(bytes_in_file / NDFS_PAGE_SIZE), which is what
      * ndfs_get_file_blocks uses to walk the index. */
-    entry.pages_in_file = count_real_data_pages_in_buffer(file_data, file_size, data_pages);
+    entry.pages_in_file = count_real_data_pages_in_buffer(file_data, file_size, data_pages, holes);
     entry.bytes_in_file = file_size > 0 ? (uint32_t)file_size : 1;
     entry.file_pointer.block_id = top_block_id;
     entry.file_pointer.type = pointer_type;
-    /* Sensible defaults for a freshly-created file: owner (and friends) get
-     * full rights. No separate SubIndexed file-type-flag bit exists (mirrors
-     * the TS port), so FT_INDEXED covers both Indexed and SubIndexed layouts. */
-    entry.access_bits = NDFS_ACCESS_DEFAULT;
+    /* A new file inherits the OWNING USER's default file access, which is what
+     * SINTRAN does (@SET-DEFAULT-FILE-ACCESS sets the value copied onto every
+     * file the user then creates). It used to be a flat NDFS_ACCESS_DEFAULT
+     * (0x03FF: owner and friends everything, PUBLIC nothing), which ignored the
+     * user entry and left the file unreadable by anyone else -- including
+     * SYSTEM, which is neither owner nor friend of an ordinary user. That bites
+     * immediately in practice: the RT-LOADER runs as SYSTEM, so a :BPUN copied
+     * into a user area could not be read by the very thing meant to load it.
+     * A brand-new user gets 0x04FF (see ndfs_ue_init), which grants PUBLIC READ.
+     *
+     * Falls back to NDFS_ACCESS_DEFAULT only when the user entry carries no
+     * default at all, so a pack whose user entries predate this still behaves
+     * as before rather than creating files nobody may touch.
+     *
+     * No separate SubIndexed file-type-flag bit exists (mirrors the TS port),
+     * so FT_INDEXED covers both Indexed and SubIndexed layouts. */
+    entry.access_bits = fs->users[user_slot].default_file_access
+                            ? (uint16_t)(fs->users[user_slot].default_file_access & 0x7FFFu)
+                            : NDFS_ACCESS_DEFAULT;
     entry.file_type_flags = NDFS_FT_INDEXED;
     /* object_index already encodes [user|fileEntry] (it was chosen inside the
      * user's region). The object-index word and a single-version file's
@@ -1593,7 +1633,7 @@ static ndfs_error_t create_new_file(struct ndfs_filesystem *fs,
      * needed as an out-param of allocate_and_write_data() above, but is no
      * longer part of the quota charge. */
     fs->users[user_slot].pages_used +=
-        count_real_data_pages_in_buffer(file_data, file_size, data_pages);
+        count_real_data_pages_in_buffer(file_data, file_size, data_pages, holes);
     (void)struct_pages;
 
     /* Surgical writes: the new object's directory page, the owner's user page,
@@ -1661,7 +1701,8 @@ static ndfs_error_t update_existing_contiguous_file(struct ndfs_filesystem *fs,
 
 static ndfs_error_t update_existing_file(struct ndfs_filesystem *fs,
                                          int obj_idx, int user_slot,
-                                         const uint8_t *file_data, size_t file_size)
+                                         const uint8_t *file_data, size_t file_size,
+                                         const ndfs_hole_list_t *holes)
 {
     ndfs_object_entry_t *existing = &fs->objects[obj_idx];
 
@@ -1711,12 +1752,12 @@ static ndfs_error_t update_existing_file(struct ndfs_filesystem *fs,
     /* Allocate + write the new data-block structure: plain Indexed for
      * <=512 pages, or SubIndexed for larger files. */
     err = allocate_and_write_data(fs, file_data, file_size, data_pages,
-                                  &top_block_id, &pointer_type, &struct_pages);
+                                  &top_block_id, &pointer_type, &struct_pages, holes);
     if (err != NDFS_OK) return err;
 
     /* Update existing entry */
     /* Allocated count, not the logical extent - see the note at the create site. */
-    existing->pages_in_file = count_real_data_pages_in_buffer(file_data, file_size, data_pages);
+    existing->pages_in_file = count_real_data_pages_in_buffer(file_data, file_size, data_pages, holes);
     existing->bytes_in_file = file_size > 0 ? (uint32_t)file_size : 1;
     existing->file_pointer.block_id = top_block_id;
     existing->file_pointer.type = pointer_type;
@@ -1730,7 +1771,7 @@ static ndfs_error_t update_existing_file(struct ndfs_filesystem *fs,
      * but is no longer part of the quota charge -- see
      * count_real_data_pages_in_buffer(). */
     fs->users[user_slot].pages_used +=
-        count_real_data_pages_in_buffer(file_data, file_size, data_pages);
+        count_real_data_pages_in_buffer(file_data, file_size, data_pages, holes);
     (void)struct_pages;
 
     /* Surgical writes: the file's object page, the owner's user page, and the
@@ -2285,23 +2326,45 @@ ndfs_error_t ndfs_write_file_parity(ndfs_filesystem_t *fs,
                                     size_t file_size,
                                     ndfs_parity_mode_t parity)
 {
+    return ndfs_write_file_holes(fs, path, file_data, file_size, parity, NULL);
+}
+
+ndfs_error_t ndfs_write_file_holes(ndfs_filesystem_t *fs,
+                                   const char *path,
+                                   const uint8_t *file_data,
+                                   size_t file_size,
+                                   ndfs_parity_mode_t parity,
+                                   const ndfs_hole_list_t *holes)
+{
     if (parity == NDFS_PARITY_SET && file_data && file_size > 0) {
         uint8_t *copy = (uint8_t *)malloc(file_size);
         ndfs_error_t err;
         if (!copy) return NDFS_ERR_ALLOC;
         memcpy(copy, file_data, file_size);
         ndfs_set_parity(copy, file_size);
-        err = ndfs_write_file(fs, path, copy, file_size);
+        err = write_file_impl(fs, path, copy, file_size, holes);
         free(copy);
         return err;
     }
-    return ndfs_write_file(fs, path, file_data, file_size);
+    return write_file_impl(fs, path, file_data, file_size, holes);
 }
 
 ndfs_error_t ndfs_write_file(ndfs_filesystem_t *fs,
                              const char *path,
                              const uint8_t *file_data,
                              size_t file_size)
+{
+    return write_file_impl(fs, path, file_data, file_size, NULL);
+}
+
+/* The one real writer. `holes` names the logical pages to leave unallocated and
+ * is NULL for the ordinary fully-allocated case; nothing here ever infers a
+ * hole from the data (see write_data_page_to_index for why). */
+static ndfs_error_t write_file_impl(ndfs_filesystem_t *fs,
+                                    const char *path,
+                                    const uint8_t *file_data,
+                                    size_t file_size,
+                                    const ndfs_hole_list_t *holes)
 {
     char user_name[NDFS_NAME_MAX + 1];
     char obj_name[NDFS_NAME_MAX + 1];
@@ -2350,7 +2413,7 @@ ndfs_error_t ndfs_write_file(ndfs_filesystem_t *fs,
 
     {
         uint32_t new_real_pages =
-            count_real_data_pages_in_buffer(file_data, file_size, data_pages);
+            count_real_data_pages_in_buffer(file_data, file_size, data_pages, holes);
         uint32_t existing_real_pages = 0;
 
         if (existing_idx >= 0) {
@@ -2384,9 +2447,9 @@ ndfs_error_t ndfs_write_file(ndfs_filesystem_t *fs,
     }
 
     if (existing_idx >= 0) {
-        err = update_existing_file(fs, existing_idx, user_slot, file_data, file_size);
+        err = update_existing_file(fs, existing_idx, user_slot, file_data, file_size, holes);
     } else {
-        err = create_new_file(fs, obj_name, file_type, user_slot, file_data, file_size);
+        err = create_new_file(fs, obj_name, file_type, user_slot, file_data, file_size, holes);
     }
 
     /* create_new_file / update_existing_file performed their own surgical

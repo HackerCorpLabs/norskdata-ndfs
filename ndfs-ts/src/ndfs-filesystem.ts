@@ -49,7 +49,7 @@ import { stripParity, setParity } from './parity.js';
 
 /** Parity mode for read/write operations. */
 export type ParityMode = 'none' | 'strip' | 'set';
-import { XatProperties, objectEntryToXat, xatToObjectEntry } from './xat.js';
+import { XatProperties, objectEntryToXat, xatToObjectEntry, XAT_KEY_HOLES } from './xat.js';
 
 /** One entry returned by NdfsFileSystem.listFriends. */
 export interface FriendInfo {
@@ -236,7 +236,27 @@ export class NdfsFileSystem {
    * @param parity - Parity handling: 'none' (default, write raw bytes),
    *   'set' (apply ND-100 even parity before writing, for text files).
    */
-  writeFile(path: string, fileData: Uint8Array, parity: ParityMode = 'none'): void {
+  /**
+   * Write (create or overwrite) a file.
+   *
+   * Every logical page is allocated a real disk block unless it is named in
+   * `holes`. An all-zero page is NOT a hole: a hole is a property of the file,
+   * so it has to be stated. Inferring one from the data produces a file SINTRAN
+   * cannot read -- READ-BI and READ-PROGFILE fail on a hole with
+   * "NO SUCH PAGE / ERROR IN ACCESSING INPUT FILE" -- see writeDataPageToIndex.
+   *
+   * @param holes Logical page indices to leave unallocated. The only
+   *   legitimate source is the holes recorded from an original: the XAT
+   *   sidecar's "ndfs.holes".
+   */
+  writeFile(
+    path: string,
+    fileData: Uint8Array,
+    parity: ParityMode = 'none',
+    holePages?: Iterable<number>,
+  ): void {
+    const holes: ReadonlySet<number> | undefined =
+      holePages === undefined ? undefined : new Set(holePages);
     this.ensureWritable();
 
     if (parity === 'set') {
@@ -254,10 +274,13 @@ export class NdfsFileSystem {
     // sparse (all-zero) pages allocate no block (see writeDataPageToIndex's
     // zero-check, reused by countRealDataPages), and the index/sub-index
     // structural blocks are filesystem overhead, not user data.
-    const requiredRealPages = this.countRealDataPages(fileData);
+    const requiredRealPages = this.countRealDataPages(fileData, holes);
 
-    // Check for existing file
-    const existing = this.objectFile.findObject(objectName, user.userName);
+    // Check for existing file. The TYPE is part of a SINTRAN file's identity,
+    // so it has to be passed: without it AAA:MODE and AAA:LIST resolve to the
+    // same entry and the second write silently overwrites the first's data
+    // while keeping the first's type.
+    const existing = this.objectFile.findObject(objectName, user.userName, fileType);
 
     // Determine additional pages needed, comparing against the existing
     // file's real (non-sparse) page count — not its logical page count.
@@ -287,9 +310,9 @@ export class NdfsFileSystem {
     }
 
     if (existing) {
-      this.updateExistingFile(existing, user, fileData);
+      this.updateExistingFile(existing, user, fileData, holes);
     } else {
-      this.createNewFile(objectName, fileType, user, fileData);
+      this.createNewFile(objectName, fileType, user, fileData, holes);
     }
     // updateExistingFile / createNewFile perform their own surgical metadata
     // writes (object page, owner user page, bitmap).
@@ -736,8 +759,12 @@ export class NdfsFileSystem {
     return this.objectFile.getObjects();
   }
 
-  getObjectEntry(name: string, userName: string): ObjectEntry | null {
-    return this.objectFile.findObject(name, userName);
+  /**
+   * Look up one object entry. Pass fileType to distinguish files that share a
+   * name, e.g. TCP-IP-LO-D02:MODE from TCP-IP-LO-D02:LIST.
+   */
+  getObjectEntry(name: string, userName: string, fileType?: string): ObjectEntry | null {
+    return this.objectFile.findObject(name, userName, fileType);
   }
 
   // ── Boot loader ────────────────────────────────────────────────────
@@ -869,7 +896,13 @@ export class NdfsFileSystem {
    * @param properties - XAT properties to apply after writing.
    */
   writeFileWithProperties(path: string, data: Uint8Array, properties: XatProperties): void {
-    this.writeFile(path, data);
+    // The one path that may legitimately create holes: the sidecar's
+    // `ndfs.holes` records where the ORIGINAL file's holes were, so restoring
+    // them reproduces the original rather than inventing holes from whatever
+    // happens to be zero (see writeFile).
+    const recorded = (properties as Record<string, unknown>)[XAT_KEY_HOLES];
+    const holes = Array.isArray(recorded) ? (recorded as number[]) : undefined;
+    this.writeFile(path, data, 'none', holes);
 
     // Now find the written entry and apply XAT properties
     const obj = this.findObject(path);
@@ -1196,6 +1229,7 @@ export class NdfsFileSystem {
   private allocateAndWriteData(
     fileData: Uint8Array,
     dataPages: number,
+    holes?: ReadonlySet<number>,
   ): { topBlockId: number; pointerType: PointerType; indexBlocksUsed: number } {
     const useSubIndexed = dataPages > MAX_OBJECT_FILE_POINTERS;
 
@@ -1208,7 +1242,7 @@ export class NdfsFileSystem {
       const indexPage = new Uint8Array(NDFS_PAGE_SIZE);
 
       for (let i = 0; i < dataPages; i++) {
-        this.writeDataPageToIndex(fileData, i, indexPage, i);
+        this.writeDataPageToIndex(fileData, i, indexPage, i, holes);
       }
 
       this.writePage(indexBlockId, indexPage);
@@ -1238,7 +1272,7 @@ export class NdfsFileSystem {
       const endPage = Math.min(startPage + MAX_OBJECT_FILE_POINTERS, dataPages);
 
       for (let i = startPage; i < endPage; i++) {
-        this.writeDataPageToIndex(fileData, i, indexPage, i - startPage);
+        this.writeDataPageToIndex(fileData, i, indexPage, i - startPage, holes);
       }
 
       this.writePage(idxBlockId, indexPage);
@@ -1249,28 +1283,44 @@ export class NdfsFileSystem {
   }
 
   /**
-   * Write a single data page (sparse-aware) and store its pointer in an index page.
+   * Write a single data page and store its pointer in an index page.
+   *
+   * A page becomes a sparse hole ONLY when `holes` names it. What the page
+   * contains never decides it.
+   *
+   * It used to: any page that was entirely zero and filled a whole page was
+   * silently made a hole. That was wrong in a way this library could not see,
+   * because reading such a file back returns the same bytes either way.
+   * SINTRAN is not so forgiving -- READ-BI and READ-PROGFILE stop at a hole
+   * with
+   *
+   *     NO SUCH PAGE
+   *     ERROR IN ACCESSING INPUT FILE
+   *
+   * so a :BPUN or :PROG copied onto a pack that way is a file the machine
+   * refuses to load. Measured on a SINTRAN III VSX-K pack 2026-08-18: the
+   * (TCP-IP)TCP-SER-B0..B3-B05:BPUN PIOC bank images arrived with 0/48/62/53
+   * invented holes, and banks 1-3 all failed with NO SUCH PAGE while bank 0
+   * (which had no all-zero page) loaded. The same files on genuine ND media
+   * have no holes at all -- a 128 KB bank dump is fully allocated even where
+   * the bank is empty.
+   *
+   * Holes are still supported; they just have to be declared, which is what
+   * the XAT sidecar's "ndfs.holes" records them for.
    */
   private writeDataPageToIndex(
     fileData: Uint8Array,
     dataPageIndex: number,
     indexPage: Uint8Array,
     slotInIndex: number,
+    holes?: ReadonlySet<number>,
   ): void {
     const pageOffset = dataPageIndex * NDFS_PAGE_SIZE;
     const pageEnd = Math.min(pageOffset + NDFS_PAGE_SIZE, fileData.length);
     const pageSlice = fileData.subarray(pageOffset, pageEnd);
 
-    // Check if page is all zeros (sparse)
-    let allZeros = true;
-    for (let b = 0; b < pageSlice.length; b++) {
-      if (pageSlice[b] !== 0) {
-        allZeros = false;
-        break;
-      }
-    }
-
-    if (allZeros && pageSlice.length === NDFS_PAGE_SIZE) {
+    if (holes && holes.has(dataPageIndex)) {
+      // Sparse hole: BlockPointer 0, no disk block consumed.
       writeUint32BE(indexPage, slotInIndex * 4, 0);
     } else {
       const dataBlockId = this.bitFile.findFirstFreeBlock();
@@ -1390,6 +1440,7 @@ export class NdfsFileSystem {
     fileType: string,
     user: UserEntry,
     fileData: Uint8Array,
+    holes?: ReadonlySet<number>,
   ): void {
     let dataPages = Math.ceil(fileData.length / NDFS_PAGE_SIZE);
     if (dataPages === 0) dataPages = 1;
@@ -1399,7 +1450,7 @@ export class NdfsFileSystem {
     const slot = this.allocateUserObjectSlot(user);
     this.ensureObjectDirPage(slot);
 
-    const { topBlockId, pointerType } = this.allocateAndWriteData(fileData, dataPages);
+    const { topBlockId, pointerType } = this.allocateAndWriteData(fileData, dataPages, holes);
 
     // Create object entry
     const entry = new ObjectEntry();
@@ -1422,13 +1473,26 @@ export class NdfsFileSystem {
     //
     // The logical extent remains ceil(bytesInFile / NDFS_PAGE_SIZE), which is what
     // getFileBlocks uses to walk the index.
-    entry.pagesInFile = this.countRealDataPages(fileData);
+    entry.pagesInFile = this.countRealDataPages(fileData, holes);
     entry.bytesInFile = fileData.length > 0 ? fileData.length : 1;
     entry.filePointer = new BlockPointer(topBlockId, pointerType);
-    // New-file defaults: owner+friend full rights; allocation flag; and a
-    // self-referential version chain + object index ([user|slot]) so SINTRAN
-    // does not see a broken version chain (";2") and refuse to open the file.
-    entry.accessBits = ACCESS_DEFAULT;
+    // A new file inherits the OWNING USER's default file access, which is what
+    // SINTRAN does (@SET-DEFAULT-FILE-ACCESS sets the value copied onto every
+    // file the user then creates). It used to be a flat ACCESS_DEFAULT (0x03FF:
+    // owner and friends everything, PUBLIC nothing), which ignored the user
+    // entry and left the file unreadable by anyone else -- SYSTEM included,
+    // since SYSTEM is neither owner nor friend of an ordinary user. That bites
+    // at once in practice: the RT-LOADER runs as SYSTEM, so a :BPUN copied into
+    // a user area could not be read by the very thing meant to load it. A
+    // brand-new user gets 0x04FF, which grants PUBLIC READ. Falls back to
+    // ACCESS_DEFAULT only when the user entry carries no default at all.
+    //
+    // The allocation flag, self-referential version chain and object index
+    // ([user|slot]) below keep SINTRAN from seeing a broken version chain
+    // (";2") and refusing to open the file.
+    entry.accessBits = user.defaultFileAccess
+      ? user.defaultFileAccess & 0x7fff
+      : ACCESS_DEFAULT;
     entry.fileTypeFlags =
       pointerType === PointerType.Contiguous ? FT_CONTIGUOUS : FT_INDEXED;
     // objectIndex already encodes [user|fileEntry] (chosen in the user region).
@@ -1441,7 +1505,7 @@ export class NdfsFileSystem {
     // holes allocate no block (see writeDataPageToIndex's zero-check, reused
     // by countRealDataPages) and the index/sub-index structural blocks are
     // filesystem overhead, not charged against the user.
-    user.pagesUsed += this.countRealDataPages(fileData);
+    user.pagesUsed += this.countRealDataPages(fileData, holes);
 
     // Surgical writes: new object's page, owner's user page, bitmap.
     this.writeObjectPage(entry.objectIndex);
@@ -1477,7 +1541,9 @@ export class NdfsFileSystem {
     const user = this.resolveUser(userName);
     if (!user) throw new Error(`User not found: ${userName || '(default)'}`);
 
-    if (this.objectFile.findObject(objectName, user.userName)) {
+    // Same as writeFile: NAME:TYPE identifies the file, so a contiguous
+    // FOO:DATA must not collide with an existing FOO:PROG.
+    if (this.objectFile.findObject(objectName, user.userName, fileType)) {
       throw new Error(`File already exists: ${path}`);
     }
 
@@ -1605,6 +1671,7 @@ export class NdfsFileSystem {
     existing: ObjectEntry,
     user: UserEntry,
     fileData: Uint8Array,
+    holes?: ReadonlySet<number>,
   ): void {
     // A contiguous file keeps the run it was created with. It is never converted to an
     // indexed file behind the caller's back, and it never grows: SINTRAN cannot grow a
@@ -1630,18 +1697,18 @@ export class NdfsFileSystem {
     let dataPages = Math.ceil(fileData.length / NDFS_PAGE_SIZE);
     if (dataPages === 0) dataPages = 1;
 
-    const { topBlockId, pointerType } = this.allocateAndWriteData(fileData, dataPages);
+    const { topBlockId, pointerType } = this.allocateAndWriteData(fileData, dataPages, holes);
 
     // Update existing entry
     // Allocated count, not the logical extent - see the note at the create site.
-    existing.pagesInFile = this.countRealDataPages(fileData);
+    existing.pagesInFile = this.countRealDataPages(fileData, holes);
     existing.bytesInFile = fileData.length > 0 ? fileData.length : 1;
     existing.filePointer = new BlockPointer(topBlockId, pointerType);
 
     // Update user pages used. Quota tracks only REAL disk consumption: charge
     // only the new file's real (non-sparse) data pages, never the
     // index/sub-index structural block overhead.
-    user.pagesUsed += this.countRealDataPages(fileData);
+    user.pagesUsed += this.countRealDataPages(fileData, holes);
 
     // Surgical writes: the file's object page, owner's user page, bitmap.
     this.writeObjectPage(existing.objectIndex);
@@ -1730,23 +1797,15 @@ export class NdfsFileSystem {
    * and the index/sub-index structural blocks are filesystem overhead, not
    * user data.
    */
-  private countRealDataPages(data: Uint8Array): number {
+  private countRealDataPages(data: Uint8Array, holes?: ReadonlySet<number>): number {
     let filePages = Math.ceil(data.length / NDFS_PAGE_SIZE);
     if (filePages === 0) filePages = 1;
 
     let realPages = 0;
     for (let i = 0; i < filePages; i++) {
-      const pageOffset = i * NDFS_PAGE_SIZE;
-      const pageEnd = Math.min(pageOffset + NDFS_PAGE_SIZE, data.length);
-      const pageSlice = data.subarray(pageOffset, pageEnd);
-
-      // Same all-zero check as writeDataPageToIndex(): a short final page
-      // (pageSlice.length < NDFS_PAGE_SIZE) is never sparse-eligible.
-      let allZeros = pageSlice.length === NDFS_PAGE_SIZE;
-      for (let b = 0; b < pageSlice.length && allZeros; b++) {
-        if (pageSlice[b] !== 0) allZeros = false;
-      }
-      if (!allZeros) realPages++;
+      // Mirrors writeDataPageToIndex() exactly: a page is a hole only when it
+      // was DECLARED one. Its contents do not enter into it.
+      if (!(holes && holes.has(i))) realPages++;
     }
     return realPages;
   }

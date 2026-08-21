@@ -39,6 +39,21 @@ function sparseContent(pageCount: number, filledPages: number[]): Uint8Array {
   return data;
 }
 
+/**
+ * The hole list for content built by sparseContent().
+ *
+ * Holes are DECLARED, never inferred from zeros -- writing a hole where the
+ * original merely had zeros produces a file SINTRAN cannot READ-BI, so the
+ * writer no longer guesses. These tests state the same holes the old inference
+ * would have produced, which is what keeps them testing holes.
+ */
+function holesFor(pageCount: number, filled: number[]): number[] {
+  const set = new Set(filled);
+  const out: number[] = [];
+  for (let p = 0; p < pageCount; p++) if (!set.has(p)) out.push(p);
+  return out;
+}
+
 function makeFs(): NdfsFileSystem {
   return NdfsFileSystem.createImage({
     template: ImageTemplate.Floppy360KB,
@@ -60,7 +75,7 @@ describe('XAT sparse-hole map', () => {
   it('reports where the holes are', () => {
     const fs = makeFs();
     // 6 pages, real data only on the first and last, so pages 1..4 hole out.
-    fs.writeFile('SYSTEM/SPARSE:DATA', sparseContent(6, [0, 5]));
+    fs.writeFile('SYSTEM/SPARSE:DATA', sparseContent(6, [0, 5]), 'none', holesFor(6, [0, 5]));
 
     const props = fs.getFileProperties('SYSTEM/SPARSE:DATA')!;
 
@@ -69,7 +84,7 @@ describe('XAT sparse-hole map', () => {
 
   it('matches the zero entries in the file index', () => {
     const fs = makeFs();
-    fs.writeFile('SYSTEM/GAPPY:DATA', sparseContent(8, [0, 3, 7]));
+    fs.writeFile('SYSTEM/GAPPY:DATA', sparseContent(8, [0, 3, 7]), 'none', holesFor(8, [0, 3, 7]));
 
     const props = fs.getFileProperties('SYSTEM/GAPPY:DATA')!;
     const blocks = fs.getFileBlocks('SYSTEM/GAPPY:DATA');
@@ -82,7 +97,7 @@ describe('XAT sparse-hole map', () => {
 
   it('lists holes ascending, without duplicates, inside the extent', () => {
     const fs = makeFs();
-    fs.writeFile('SYSTEM/ORDER:DATA', sparseContent(8, [0, 3, 7]));
+    fs.writeFile('SYSTEM/ORDER:DATA', sparseContent(8, [0, 3, 7]), 'none', holesFor(8, [0, 3, 7]));
 
     const props = fs.getFileProperties('SYSTEM/ORDER:DATA')!;
     const holes = props[XAT_KEY_HOLES] as number[];
@@ -98,7 +113,7 @@ describe('XAT sparse-hole map', () => {
 
   it('carries the holes through readFileWithProperties too', () => {
     const fs = makeFs();
-    fs.writeFile('SYSTEM/BOTH:DATA', sparseContent(6, [0, 5]));
+    fs.writeFile('SYSTEM/BOTH:DATA', sparseContent(6, [0, 5]), 'none', holesFor(6, [0, 5]));
 
     const { data, properties } = fs.readFileWithProperties('SYSTEM/BOTH:DATA');
 
@@ -109,7 +124,7 @@ describe('XAT sparse-hole map', () => {
 
   it('survives the JSON round trip as a flat array of numbers', () => {
     const fs = makeFs();
-    fs.writeFile('SYSTEM/RTRIP:DATA', sparseContent(6, [0, 5]));
+    fs.writeFile('SYSTEM/RTRIP:DATA', sparseContent(6, [0, 5]), 'none', holesFor(6, [0, 5]));
 
     const props = fs.getFileProperties('SYSTEM/RTRIP:DATA')!;
     const json = serializeXat(props);

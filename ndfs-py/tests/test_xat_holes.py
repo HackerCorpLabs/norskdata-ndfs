@@ -42,6 +42,17 @@ def _sparse_content(page_count: int, filled_pages) -> bytes:
     return bytes(data)
 
 
+def _holes(page_count: int, filled_pages) -> list:
+    """The hole list for content built by :func:`_sparse_content`.
+
+    Holes are DECLARED, never inferred from zeros -- writing a hole where the
+    original merely had zeros produces a file SINTRAN cannot READ-BI, so the
+    writer no longer guesses. These tests state the same holes the old
+    inference would have produced, which is what makes them still test holes.
+    """
+    return [p for p in range(page_count) if p not in set(filled_pages)]
+
+
 class TestXatHoles:
     """The hole map is recorded, and says where the holes actually are."""
 
@@ -57,7 +68,7 @@ class TestXatHoles:
     def test_sparse_file_reports_the_hole_positions(self, test_image):
         fs = NdfsFileSystem(test_image)
         # 6 pages, real data only on the first and last, so pages 1..4 hole out.
-        fs.write_file("SYSTEM/SPARSE:DATA", _sparse_content(6, [0, 5]))
+        fs.write_file("SYSTEM/SPARSE:DATA", _sparse_content(6, [0, 5]), holes=_holes(6, [0, 5]))
 
         props = fs.get_file_properties("SYSTEM/SPARSE:DATA")
 
@@ -65,7 +76,7 @@ class TestXatHoles:
 
     def test_hole_list_is_ascending_and_within_the_extent(self, test_image):
         fs = NdfsFileSystem(test_image)
-        fs.write_file("SYSTEM/GAPPY:DATA", _sparse_content(8, [0, 3, 7]))
+        fs.write_file("SYSTEM/GAPPY:DATA", _sparse_content(8, [0, 3, 7]), holes=_holes(8, [0, 3, 7]))
 
         props = fs.get_file_properties("SYSTEM/GAPPY:DATA")
         holes = props[XAT_HOLES]
@@ -84,7 +95,7 @@ class TestXatHoles:
         why the page count cannot be used for this check.
         """
         fs = NdfsFileSystem(test_image)
-        fs.write_file("SYSTEM/CHECK:DATA", _sparse_content(6, [0, 5]))
+        fs.write_file("SYSTEM/CHECK:DATA", _sparse_content(6, [0, 5]), holes=_holes(6, [0, 5]))
 
         props = fs.get_file_properties("SYSTEM/CHECK:DATA")
         blocks = fs.get_file_blocks("SYSTEM/CHECK:DATA")
@@ -111,7 +122,7 @@ class TestXatHoles:
         the same number again.
         """
         fs = NdfsFileSystem(test_image)
-        fs.write_file("SYSTEM/CONV:DATA", _sparse_content(6, [0, 5]))
+        fs.write_file("SYSTEM/CONV:DATA", _sparse_content(6, [0, 5]), holes=_holes(6, [0, 5]))
 
         props = fs.get_file_properties("SYSTEM/CONV:DATA")
         blocks = fs.get_file_blocks("SYSTEM/CONV:DATA")
@@ -141,7 +152,7 @@ class TestXatHoles:
         fs = NdfsFileSystem(test_image)
 
         before = fs.get_user(0).pages_used
-        fs.write_file("SYSTEM/QUOTA:DATA", _sparse_content(6, [0, 5]))
+        fs.write_file("SYSTEM/QUOTA:DATA", _sparse_content(6, [0, 5]), holes=_holes(6, [0, 5]))
         after = fs.get_user(0).pages_used
 
         charged = after - before
@@ -155,7 +166,7 @@ class TestXatHoles:
 
     def test_read_with_properties_carries_the_holes_too(self, test_image):
         fs = NdfsFileSystem(test_image)
-        fs.write_file("SYSTEM/BOTH:DATA", _sparse_content(6, [0, 5]))
+        fs.write_file("SYSTEM/BOTH:DATA", _sparse_content(6, [0, 5]), holes=_holes(6, [0, 5]))
 
         data, props = fs.read_file_with_properties("SYSTEM/BOTH:DATA")
 
@@ -169,7 +180,7 @@ class TestXatHolesSerialization:
 
     def test_holes_survive_serialize_and_deserialize(self, test_image):
         fs = NdfsFileSystem(test_image)
-        fs.write_file("SYSTEM/RTRIP:DATA", _sparse_content(6, [0, 5]))
+        fs.write_file("SYSTEM/RTRIP:DATA", _sparse_content(6, [0, 5]), holes=_holes(6, [0, 5]))
 
         props = fs.get_file_properties("SYSTEM/RTRIP:DATA")
         restored = deserialize_xat(serialize_xat(props))
@@ -181,7 +192,7 @@ class TestXatHolesSerialization:
         TypeScript ports emit. The C library stores runs internally but expands
         them here, so all four sidecars are byte-comparable."""
         fs = NdfsFileSystem(test_image)
-        fs.write_file("SYSTEM/JSONF:DATA", _sparse_content(6, [0, 5]))
+        fs.write_file("SYSTEM/JSONF:DATA", _sparse_content(6, [0, 5]), holes=_holes(6, [0, 5]))
 
         raw = json.loads(serialize_xat(fs.get_file_properties("SYSTEM/JSONF:DATA")))
 
@@ -215,7 +226,7 @@ class TestXatHolesSerialization:
         """The holes are recorded, not restored. Applying a sidecar that carries
         them must simply ignore the key rather than error."""
         fs = NdfsFileSystem(test_image)
-        fs.write_file("SYSTEM/APPLY:DATA", _sparse_content(6, [0, 5]))
+        fs.write_file("SYSTEM/APPLY:DATA", _sparse_content(6, [0, 5]), holes=_holes(6, [0, 5]))
         props = fs.get_file_properties("SYSTEM/APPLY:DATA")
 
         entry = ObjectEntry()

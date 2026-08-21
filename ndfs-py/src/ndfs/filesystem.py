@@ -47,7 +47,7 @@ from ndfs.object_entry import (
     compute_file_number,
 )
 from ndfs.types import PointerType, FileEntry, ImageCreationOptions, BootFormat, BootControllerType, BootCode
-from ndfs.xat import object_entry_to_xat, xat_to_object_entry
+from ndfs.xat import object_entry_to_xat, xat_to_object_entry, XAT_HOLES
 from ndfs import sintran
 
 _BufType = Union[bytes, bytearray, memoryview]
@@ -229,15 +229,27 @@ class NdfsFileSystem:
         path: str,
         file_data: Union[bytes, bytearray, memoryview],
         parity: str = "none",
+        holes: Optional[Sequence[int]] = None,
     ) -> None:
         """Write (create or overwrite) a file.
+
+        Every logical page is allocated a real disk block unless it is named in
+        `holes`. An all-zero page is NOT a hole: a hole is a property of the
+        file, so it has to be stated. Inferring one from the data produces a
+        file SINTRAN cannot read -- READ-BI and READ-PROGFILE fail on a hole
+        with "NO SUCH PAGE / ERROR IN ACCESSING INPUT FILE" -- see
+        `_write_data_page_to_index`.
 
         Args:
             path: "USERNAME/FILENAME:TYPE" or "FILENAME:TYPE"
             file_data: The raw bytes to write.
             parity: Parity handling -- "none" (default, write raw bytes),
                 "set" (apply ND-100 even parity before writing, for text files).
+            holes: Logical page indices to leave unallocated, or None for a
+                fully allocated file. The only legitimate source is the holes
+                recorded from an original -- the XAT sidecar's "ndfs.holes".
         """
+        holes = frozenset(holes) if holes else None
         from ndfs.parity import set_parity as _set
 
         self._ensure_writable()
@@ -260,10 +272,13 @@ class NdfsFileSystem:
         # sparse holes") and the index/sub-index structural pages are
         # filesystem overhead, not user data -- see
         # _count_real_data_pages_in_buffer / _count_real_data_pages_for_object.
-        total_required = self._count_real_data_pages_in_buffer(file_data)
+        total_required = self._count_real_data_pages_in_buffer(file_data, holes)
 
-        # Check for existing file
-        existing = self._object_file.find_object(object_name, user.user_name)
+        # Check for existing file. The TYPE is part of a SINTRAN file's
+        # identity, so it has to be passed: without it AAA:MODE and AAA:LIST
+        # resolve to the same entry and the second write silently overwrites
+        # the first's data while keeping the first's type.
+        existing = self._object_file.find_object(object_name, user.user_name, file_type)
 
         # Determine additional pages needed
         additional_needed = total_required
@@ -292,9 +307,9 @@ class NdfsFileSystem:
                 user.pages_reserved += expansion
 
         if existing is not None:
-            self._update_existing_file(existing, user, file_data)
+            self._update_existing_file(existing, user, file_data, holes)
         else:
-            self._create_new_file(object_name, file_type, user, file_data)
+            self._create_new_file(object_name, file_type, user, file_data, holes)
         # _update_existing_file / _create_new_file perform their own surgical
         # metadata writes (object page, owner user page, bitmap).
 
@@ -565,8 +580,12 @@ class NdfsFileSystem:
     def get_object_entries(self) -> List[ObjectEntry]:
         return self._object_file.get_objects()
 
-    def get_object_entry(self, name: str, user_name: str) -> Optional[ObjectEntry]:
-        return self._object_file.find_object(name, user_name)
+    def get_object_entry(
+        self, name: str, user_name: str, file_type: Optional[str] = None
+    ) -> Optional[ObjectEntry]:
+        """Look up one object entry. Pass file_type to distinguish files that
+        share a name, e.g. TCP-IP-LO-D02:MODE from TCP-IP-LO-D02:LIST."""
+        return self._object_file.find_object(name, user_name, file_type)
 
     # -- Diagnostics -------------------------------------------------------
 
@@ -672,12 +691,22 @@ class NdfsFileSystem:
         The file is written first, then the XAT properties are applied
         to the resulting object entry.
 
+        This is the one path that may legitimately create sparse holes: the
+        sidecar's "ndfs.holes" records where the ORIGINAL file's holes were, so
+        restoring them reproduces the original rather than inventing holes from
+        whatever happens to be zero (see `write_file`). A sidecar without the
+        key leaves the file fully allocated -- the key is optional precisely
+        because a writer that never looked cannot claim the file is solid.
+
         Args:
             path: "USERNAME/FILENAME:TYPE" or "FILENAME:TYPE"
             data: The raw bytes to write.
             properties: XAT properties dict to apply after writing.
         """
-        self.write_file(path, data)
+        holes = properties.get(XAT_HOLES) if properties else None
+        if holes is not None and not isinstance(holes, (list, tuple)):
+            holes = None
+        self.write_file(path, data, holes=holes)
 
         # Now find the written entry and apply status-related XAT fields
         obj = self._find_object(path)
@@ -950,7 +979,8 @@ class NdfsFileSystem:
         num_index_blocks = math.ceil(data_pages / MAX_OBJECT_FILE_POINTERS)
         return num_index_blocks + 1  # + top-level sub-index block
 
-    def _count_real_data_pages_in_buffer(self, data: _BufType) -> int:
+    def _count_real_data_pages_in_buffer(self, data: _BufType,
+                                         holes: Optional[frozenset] = None) -> int:
         """Count how many 2048-byte pages of *data* are NOT sparse holes --
         i.e. how many pages `_write_data_page_to_index` will actually
         allocate a real disk block for.
@@ -978,18 +1008,9 @@ class NdfsFileSystem:
             end = min(offset + NDFS_PAGE_SIZE, len(data))
             page_slice = data[offset:end]
 
-            if len(page_slice) != NDFS_PAGE_SIZE:
-                # Short/empty trailing slice: never treated as sparse, always
-                # a real page (mirrors _write_data_page_to_index exactly).
-                real_pages += 1
-                continue
-
-            all_zeros = True
-            for b in range(len(page_slice)):
-                if page_slice[b] != 0:
-                    all_zeros = False
-                    break
-            if not all_zeros:
+            # Mirrors _write_data_page_to_index exactly: a page is a hole only
+            # when it was DECLARED one. Its contents never decide it.
+            if not (holes and p in holes):
                 real_pages += 1
 
         return real_pages
@@ -1038,23 +1059,41 @@ class NdfsFileSystem:
         data_page_index: int,
         index_page: bytearray,
         slot_in_index: int,
+        holes: Optional[frozenset] = None,
     ) -> None:
-        """Write one data page (sparse-aware) and record its pointer in
-        `index_page` at `slot_in_index`. Shared by both the plain Indexed
-        allocation loop and each group's index block under a SubIndexed
-        layout, so sparse-hole handling is identical in both layouts."""
+        """Write one data page and record its pointer in `index_page` at
+        `slot_in_index`. Shared by both the plain Indexed allocation loop and
+        each group's index block under a SubIndexed layout, so hole handling is
+        identical in both layouts.
+
+        A page becomes a sparse hole ONLY when `holes` names it. The page's
+        contents never decide it.
+
+        It used to: any page that was entirely zero and filled a whole page was
+        silently made a hole. That was wrong in a way this library could not
+        see, because reading such a file back returns the same bytes either way.
+        SINTRAN is not so forgiving -- READ-BI and READ-PROGFILE stop at a hole
+        with
+
+            NO SUCH PAGE
+            ERROR IN ACCESSING INPUT FILE
+
+        so a :BPUN or :PROG copied onto a pack that way is a file the machine
+        refuses to load. Measured on a SINTRAN III VSX-K pack 2026-08-18: the
+        (TCP-IP)TCP-SER-B0..B3-B05:BPUN PIOC bank images arrived with 0/48/62/53
+        invented holes, and banks 1-3 all failed with NO SUCH PAGE while bank 0
+        (which had no all-zero page) loaded. The same files on genuine ND media
+        have no holes at all -- a 128 KB bank dump is fully allocated even where
+        the bank is empty.
+
+        Holes are still supported; they just have to be declared, which is what
+        the XAT sidecar's "ndfs.holes" records them for.
+        """
         page_offset = data_page_index * NDFS_PAGE_SIZE
         page_end = min(page_offset + NDFS_PAGE_SIZE, len(file_data))
         page_slice = file_data[page_offset:page_end]
 
-        # Check if page is all zeros (sparse)
-        all_zeros = True
-        for b in range(len(page_slice)):
-            if page_slice[b] != 0:
-                all_zeros = False
-                break
-
-        if all_zeros and len(page_slice) == NDFS_PAGE_SIZE:
+        if holes and data_page_index in holes:
             # Sparse hole: write block_id=0 to index (no disk block allocated)
             write_uint32_be(index_page, slot_in_index * 4, 0)
         else:
@@ -1074,7 +1113,8 @@ class NdfsFileSystem:
             data_ptr.to_bytes(index_page, slot_in_index * 4)
 
     def _allocate_and_write_data(
-        self, file_data: Union[bytes, bytearray, memoryview], data_pages: int
+        self, file_data: Union[bytes, bytearray, memoryview], data_pages: int,
+        holes: Optional[frozenset] = None
     ) -> Tuple[int, "PointerType", int]:
         """Allocate blocks and write file data to disk.
 
@@ -1107,7 +1147,7 @@ class NdfsFileSystem:
 
             index_page = bytearray(NDFS_PAGE_SIZE)
             for i in range(data_pages):
-                self._write_data_page_to_index(file_data, i, index_page, i)
+                self._write_data_page_to_index(file_data, i, index_page, i, holes)
 
             self._write_page(index_block_id, index_page)
             return index_block_id, PointerType.Indexed, 1
@@ -1147,7 +1187,7 @@ class NdfsFileSystem:
             end_page = min(start_page + MAX_OBJECT_FILE_POINTERS, data_pages)
 
             for i in range(start_page, end_page):
-                self._write_data_page_to_index(file_data, i, index_page, i - start_page)
+                self._write_data_page_to_index(file_data, i, index_page, i - start_page, holes)
 
             self._write_page(idx_block_id, index_page)
 
@@ -1551,6 +1591,7 @@ class NdfsFileSystem:
         file_type: str,
         user: UserEntry,
         file_data: Union[bytes, bytearray, memoryview],
+        holes: Optional[frozenset] = None,
     ) -> None:
         """Create a new file on the filesystem."""
         data_pages = math.ceil(len(file_data) / NDFS_PAGE_SIZE)
@@ -1577,7 +1618,7 @@ class NdfsFileSystem:
         # Allocate index/sub-index block(s) and write data (sparse-aware).
         # Picks Indexed (<=512 pages) or SubIndexed (>512 pages) automatically.
         top_block_id, top_pointer_type, structural_pages = self._allocate_and_write_data(
-            file_data, data_pages
+            file_data, data_pages, holes
         )
 
         # Create object entry
@@ -1601,14 +1642,26 @@ class NdfsFileSystem:
         #
         # The logical extent is not lost - it is ceil(bytes_in_file / NDFS_PAGE_SIZE), and
         # get_file_blocks uses exactly that to walk the index.
-        entry.pages_in_file = self._count_real_data_pages_in_buffer(file_data)
+        entry.pages_in_file = self._count_real_data_pages_in_buffer(file_data, holes)
         entry.bytes_in_file = len(file_data) if len(file_data) > 0 else 1
         entry.file_pointer = BlockPointer(top_block_id, top_pointer_type)
-        # New-file defaults: owner+friend full rights; indexed allocation flag
-        # (SINTRAN uses the same FT_INDEXED flag for both Indexed and
-        # SubIndexed layouts -- the actual layout is carried by the
-        # BlockPointer's own type field, not by a separate flag bit).
-        entry.access_bits = ACCESS_DEFAULT
+        # A new file inherits the OWNING USER's default file access, which is
+        # what SINTRAN does (@SET-DEFAULT-FILE-ACCESS sets the value copied onto
+        # every file the user then creates). It used to be a flat ACCESS_DEFAULT
+        # (0x03FF: owner and friends everything, PUBLIC nothing), which ignored
+        # the user entry and left the file unreadable by anyone else -- SYSTEM
+        # included, since SYSTEM is neither owner nor friend of an ordinary
+        # user. That bites at once in practice: the RT-LOADER runs as SYSTEM, so
+        # a :BPUN copied into a user area could not be read by the very thing
+        # meant to load it. A brand-new user gets 0x04FF, which grants PUBLIC
+        # READ. Falls back to ACCESS_DEFAULT only when the user entry carries no
+        # default at all.
+        #
+        # file_type_flags: SINTRAN uses the same FT_INDEXED flag for both
+        # Indexed and SubIndexed layouts -- the actual layout is carried by the
+        # BlockPointer's own type field, not by a separate flag bit.
+        entry.access_bits = (user.default_file_access & 0x7FFF) \
+            if user.default_file_access else ACCESS_DEFAULT
         entry.file_type_flags = FT_INDEXED
         # object_index already encodes [user|fileEntry]; the object-index word
         # and the self-referential version chain all equal it.
@@ -1620,7 +1673,7 @@ class NdfsFileSystem:
         # Update user pages used: only the REAL (non-sparse) data pages --
         # never the index/sub-index structural pages, which are filesystem
         # overhead, not user data. See _count_real_data_pages_in_buffer.
-        user.pages_used += self._count_real_data_pages_in_buffer(file_data)
+        user.pages_used += self._count_real_data_pages_in_buffer(file_data, holes)
 
         # Surgical writes: new object's page, owner's user page, bitmap.
         self._write_object_page(entry.object_index)
@@ -1664,7 +1717,9 @@ class NdfsFileSystem:
         if user is None:
             raise ValueError(f"User not found: {user_name or '(default)'}")
 
-        if self._object_file.find_object(object_name, user.user_name) is not None:
+        # Same as write_file: NAME:TYPE identifies the file, so a contiguous
+        # FOO:DATA must not collide with an existing FOO:PROG.
+        if self._object_file.find_object(object_name, user.user_name, file_type) is not None:
             raise FileExistsError(f"File already exists: {path}")
 
         # Every page of a contiguous file is real disk, so the whole run is charged to the
@@ -1788,6 +1843,7 @@ class NdfsFileSystem:
         existing: ObjectEntry,
         user: UserEntry,
         file_data: Union[bytes, bytearray, memoryview],
+        holes: Optional[frozenset] = None,
     ) -> None:
         """Update an existing file with new data."""
         # A contiguous file keeps the run it was created with. It is never converted to an
@@ -1824,19 +1880,19 @@ class NdfsFileSystem:
             )
 
         top_block_id, top_pointer_type, structural_pages = self._allocate_and_write_data(
-            file_data, data_pages
+            file_data, data_pages, holes
         )
 
         # Update existing entry
         # Allocated count, not the logical extent - see the note at the create site.
-        existing.pages_in_file = self._count_real_data_pages_in_buffer(file_data)
+        existing.pages_in_file = self._count_real_data_pages_in_buffer(file_data, holes)
         existing.bytes_in_file = len(file_data) if len(file_data) > 0 else 1
         existing.file_pointer = BlockPointer(top_block_id, top_pointer_type)
 
         # Update user pages used: only the REAL (non-sparse) data pages of the
         # new content -- never the index/sub-index structural pages. See
         # _count_real_data_pages_in_buffer.
-        user.pages_used += self._count_real_data_pages_in_buffer(file_data)
+        user.pages_used += self._count_real_data_pages_in_buffer(file_data, holes)
 
         # Surgical writes: the file's object page, owner's user page, bitmap.
         self._write_object_page(existing.object_index)

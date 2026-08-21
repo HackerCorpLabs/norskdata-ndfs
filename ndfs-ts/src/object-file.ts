@@ -41,17 +41,44 @@ export class ObjectFile {
     return this.entries.get(index) ?? null;
   }
 
-  /** Find an object by name and user. */
-  findObject(objectName: string, userName: string): ObjectEntry | null {
+  /**
+   * Uppercase a file type and drop the padding SINTRAN leaves on it - a type
+   * read off a pack can carry a trailing apostrophe and spaces.
+   */
+  private static normalizeType(fileType: string | undefined): string {
+    return (fileType ?? '').toUpperCase().trim().replace(/'+$/, '').trim();
+  }
+
+  /**
+   * Find an object by name and user, and by type when one is given.
+   *
+   * A SINTRAN file is identified by NAME:TYPE, and two files may share a name
+   * while differing only in type - a real pack carries both
+   * (TCP-IP)TCP-IP-LO-D02:MODE and :LIST, and (TCP-IP)SKP-C00 exists as
+   * :DEFS, :IMPT and :INTL at once.
+   *
+   * Matching on the name alone made writeFile treat those as one file:
+   * writing AAA:MODE after AAA:LIST overwrote the LIST entry's data while
+   * leaving its type as LIST, so the MODE file vanished and the LIST file
+   * silently held the wrong bytes. Measured 2026-08-19 while installing the
+   * COSMOS TCP/IP kit - TCP-IP-LO-D02:MODE and TCP-START-D02:MODE were both
+   * lost that way.
+   *
+   * Omitting fileType keeps the old name-only behaviour, for callers that
+   * genuinely do not know the type.
+   */
+  findObject(objectName: string, userName: string, fileType?: string): ObjectEntry | null {
     const nameUpper = objectName.toUpperCase();
     const userUpper = userName.toUpperCase();
+    const typeUpper = fileType ? ObjectFile.normalizeType(fileType) : null;
     const iter = this.entries.values();
     let next = iter.next();
     while (!next.done) {
       const entry = next.value;
       if (
         entry.objectName.toUpperCase() === nameUpper &&
-        entry.userName.toUpperCase() === userUpper
+        entry.userName.toUpperCase() === userUpper &&
+        (typeUpper === null || ObjectFile.normalizeType(entry.type) === typeUpper)
       ) {
         return entry;
       }

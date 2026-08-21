@@ -26,15 +26,36 @@ class TestAllZeroSparse:
         ndfs = _make_fs()
         free_before = ndfs.get_free_pages()
 
-        # Write a multi-page all-zero file (should be sparse)
+        # A multi-page file whose every page is DECLARED a hole. The holes have
+        # to be stated: an all-zero page is not a hole on its own, because a
+        # file with invented holes is one SINTRAN cannot READ-BI.
         data = bytearray(NDFS_PAGE_SIZE * 5)
-        ndfs.write_file("SYSTEM/ZEROS:DATA", data)
+        ndfs.write_file("SYSTEM/ZEROS:DATA", data, holes=range(5))
 
         free_after = ndfs.get_free_pages()
-        # Should use only 1 block (index block) since all data pages are sparse
+        # Only the index block: a declared hole allocates no data block.
         pages_used = free_before - free_after
-        # Index block = 1, no data blocks for all-zero pages
-        assert pages_used == 1  # Only the index block
+        assert pages_used == 1
+
+    def test_all_zero_file_without_declared_holes_allocates_every_page(self):
+        """THE REGRESSION THAT MATTERS: zeros alone must not make holes.
+
+        Deliberately asymmetric -- it fails against the old inference-based
+        writer, which is the point; a test that passes under both conventions
+        proves nothing. Measured consequence of that writer on a SINTRAN III
+        VSX-K pack (2026-08-18): (TCP-IP)TCP-SER-B1..B3-B05:BPUN were copied in
+        with 48/62/53 invented holes and the machine refused all three with
+        NO SUCH PAGE, while bank 0 (which had no all-zero page) loaded.
+        """
+        ndfs = _make_fs()
+        free_before = ndfs.get_free_pages()
+
+        data = bytearray(NDFS_PAGE_SIZE * 5)
+        ndfs.write_file("SYSTEM/ZEROS2:DATA", data)
+
+        pages_used = free_before - ndfs.get_free_pages()
+        assert pages_used == 6  # 1 index block + 5 real data pages
+        assert ndfs.get_file_blocks("SYSTEM/ZEROS2:DATA").count(0) == 0
 
     def test_all_zero_reads_back_correctly(self):
         ndfs = _make_fs()
@@ -58,11 +79,11 @@ class TestMixedSparse:
         for i in range(NDFS_PAGE_SIZE):
             data[i] = 0xAA
 
-        ndfs.write_file("SYSTEM/MIXED:DATA", data)
+        ndfs.write_file("SYSTEM/MIXED:DATA", data, holes=[1, 2])
 
         free_after = ndfs.get_free_pages()
         pages_used = free_before - free_after
-        # Should use 2 blocks: 1 index + 1 data (two zero pages are sparse)
+        # 1 index + 1 data: pages 1 and 2 were declared holes.
         assert pages_used == 2
 
     def test_mixed_reads_back_correctly(self):

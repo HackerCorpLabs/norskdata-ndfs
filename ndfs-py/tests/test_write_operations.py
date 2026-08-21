@@ -184,8 +184,8 @@ class TestSparseQuotaAccounting:
         ndfs = _make_fs()
         used_before = ndfs.get_user(0).pages_used
 
-        data = bytearray(NDFS_PAGE_SIZE * 5)  # all zero -- fully sparse
-        ndfs.write_file("SYSTEM/ZERO:DAT", data)
+        data = bytearray(NDFS_PAGE_SIZE * 5)  # every page DECLARED a hole
+        ndfs.write_file("SYSTEM/ZERO:DAT", data, holes=range(5))
 
         used_after = ndfs.get_user(0).pages_used
         assert used_after == used_before, (
@@ -200,8 +200,8 @@ class TestSparseQuotaAccounting:
         data = bytearray(NDFS_PAGE_SIZE * 10)
         for i in range(NDFS_PAGE_SIZE * 3):  # pages 0-2: real
             data[i] = 0xAA
-        # pages 3-9 stay zero (7 sparse holes)
-        ndfs.write_file("SYSTEM/MIXED:DAT", data)
+        # pages 3-9 DECLARED as holes (their being zero would not suffice)
+        ndfs.write_file("SYSTEM/MIXED:DAT", data, holes=range(3, 10))
 
         used_after = ndfs.get_user(0).pages_used
         assert used_after - used_before == 3, (

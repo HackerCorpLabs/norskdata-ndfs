@@ -238,7 +238,15 @@ static int test_xat_copy_sparse_file(void)
     for (i = 2 * NDFS_PAGE_SIZE; i < 3 * NDFS_PAGE_SIZE; i++) content[i] = 0xBB;
     /* Page 3: zeros */
 
-    TEST_ASSERT_OK(ndfs_write_file(fs, "SYSTEM/SPARSE:DATA", content, file_size));
+    {
+        /* Holes are declared, never inferred from the zero pages. */
+        static const uint32_t hole_pages[] = { 1, 3 };
+        ndfs_hole_list_t holes;
+        holes.pages = hole_pages;
+        holes.count = 2;
+        TEST_ASSERT_OK(ndfs_write_file_holes(fs, "SYSTEM/SPARSE:DATA", content,
+                                             file_size, NDFS_PARITY_NONE, &holes));
+    }
     TEST_ASSERT_OK(ndfs_get_file_properties(fs, "SYSTEM/SPARSE:DATA", &xat));
 
     /* pages_in_file counts the pages ACTUALLY ALLOCATED, not the logical extent:
@@ -295,7 +303,15 @@ static int test_xat_copy_large_sparse(void)
     /* Last page: 0xFF */
     for (i = 9 * NDFS_PAGE_SIZE; i < 10 * NDFS_PAGE_SIZE; i++) content[i] = 0xFF;
 
-    TEST_ASSERT_OK(ndfs_write_file(fs, "SYSTEM/BIGSPARSE:DATA", content, file_size));
+    {
+        /* Pages 1..8 are declared holes; pages 0 and 9 carry data. */
+        static const uint32_t hole_pages[] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+        ndfs_hole_list_t holes;
+        holes.pages = hole_pages;
+        holes.count = 8;
+        TEST_ASSERT_OK(ndfs_write_file_holes(fs, "SYSTEM/BIGSPARSE:DATA", content,
+                                             file_size, NDFS_PARITY_NONE, &holes));
+    }
     TEST_ASSERT_OK(ndfs_get_file_properties(fs, "SYSTEM/BIGSPARSE:DATA", &xat));
 
     /* Only the first and last pages hold data; the 8 in between are sparse

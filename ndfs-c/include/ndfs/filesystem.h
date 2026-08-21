@@ -126,7 +126,32 @@ void ndfs_free_data(uint8_t *data);
 /* ── Write operations ────────────────────────────────────────────── */
 
 /**
- * Write (create or overwrite) a file.
+ * An explicit list of a file's sparse holes, as ascending LOGICAL page indices.
+ *
+ * A hole is a deliberate property of a file, so it has to be stated. It is NOT
+ * inferred from the data: a page of zeros is a page of zeros, and writing it as
+ * a hole changes what the file IS. The two are indistinguishable when read back
+ * through this library, but they are not the same on the pack, and SINTRAN can
+ * tell: READ-BI and READ-PROGFILE fail on a hole with
+ *
+ *     NO SUCH PAGE
+ *     ERROR IN ACCESSING INPUT FILE
+ *
+ * so a :BPUN/:PROG copied in with holes invented from its zero pages is a file
+ * the machine cannot load. Genuine ND media bear this out -- a 128 KB PIOC bank
+ * dump is fully allocated even where the bank is empty.
+ *
+ * The only legitimate source of this list is a file that recorded the holes of
+ * the original: the XAT sidecar's "ndfs.holes" key (see xat.h).
+ */
+typedef struct {
+    const uint32_t *pages; /**< ascending logical page indices; may be NULL when count == 0 */
+    size_t          count; /**< number of entries in `pages` */
+} ndfs_hole_list_t;
+
+/**
+ * Write (create or overwrite) a file. Every logical page is allocated a real
+ * disk block, including pages that are entirely zero.
  * @param path       "USERNAME/FILENAME:TYPE" or "FILENAME:TYPE"
  * @param file_data  The raw bytes to write.
  * @param file_size  Number of bytes.
@@ -135,6 +160,24 @@ ndfs_error_t ndfs_write_file(ndfs_filesystem_t *fs,
                              const char *path,
                              const uint8_t *file_data,
                              size_t file_size);
+
+/**
+ * Write (create or overwrite) a file, leaving the named logical pages as sparse
+ * holes. Every page NOT in `holes` gets a real disk block, whatever it contains.
+ *
+ * Use this only to restore holes recorded from an original (XAT "ndfs.holes").
+ * Pass NULL, or a list with count == 0, for a fully allocated file -- which is
+ * what ndfs_write_file() does.
+ *
+ * @param holes  Ascending logical page indices to leave unallocated, or NULL.
+ *               Indices at or beyond the file's page count are ignored.
+ */
+ndfs_error_t ndfs_write_file_holes(ndfs_filesystem_t *fs,
+                                   const char *path,
+                                   const uint8_t *file_data,
+                                   size_t file_size,
+                                   ndfs_parity_mode_t parity,
+                                   const ndfs_hole_list_t *holes);
 
 /**
  * Create an empty contiguous file occupying a fixed run of `pages` pages.

@@ -125,8 +125,13 @@ class TestSubIndexedSparseHoles:
             for i in range(start, start + NDFS_PAGE_SIZE):
                 data[i] = 0xCC
 
+        # Every other page is DECLARED a hole. Zeros alone do not make holes --
+        # a file with invented holes is one SINTRAN cannot READ-BI.
+        real = (0, 510, 511, 512, 513, 599)
+        holes = [p for p in range(num_pages) if p not in real]
+
         free_before = ndfs.get_free_pages()
-        ndfs.write_file("SYSTEM/SPARSEBIG:DATA", data)
+        ndfs.write_file("SYSTEM/SPARSEBIG:DATA", data, holes=holes)
         free_after = ndfs.get_free_pages()
 
         entry = _find_entry(ndfs, "SPARSEBIG")
@@ -230,7 +235,9 @@ class TestSubIndexedSparseQuotaAccounting:
         data[0] = 0xAA
 
         used_before = ndfs.get_user(0).pages_used
-        ndfs.write_file("SYSTEM/BIGSPARSE:DAT", data)
+        # Pages 0 and 2 hold data; the other 598 are DECLARED holes.
+        ndfs.write_file("SYSTEM/BIGSPARSE:DAT", data,
+                        holes=[p for p in range(num_pages) if p not in (0, 2)])
         used_after = ndfs.get_user(0).pages_used
 
         assert used_after - used_before == 2, (
