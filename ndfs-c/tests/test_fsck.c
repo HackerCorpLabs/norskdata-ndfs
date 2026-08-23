@@ -474,6 +474,167 @@ static int test_fsck_detects_genuine_cross_link(void)
     return 0;
 }
 
+/* A file's data block, freed in the bitmap by hand while the file's index
+ * still points at it. This is the third leg of Phase 3 (orphaned /
+ * referenced_free / multiply_referenced) that the earlier tests don't touch:
+ * a block a file legitimately owns, but the bitmap says is free. Genuinely
+ * dangerous on a real pack -- the next file written could be handed that
+ * same block out from under the file that already owns it. */
+static int test_fsck_detects_referenced_but_marked_free(void)
+{
+    ndfs_filesystem_t *fs = create_writable(NDFS_TMPL_FLOPPY_12MB, "FSCKRFREE");
+    uint8_t *data = (uint8_t *)malloc(NDFS_PAGE_SIZE);
+    ndfs_object_entry_t entry;
+    uint8_t *buf = NULL;
+    size_t buf_size = 0;
+    ndfs_filesystem_t *fs_dirty = NULL;
+    uint32_t data_block;
+    size_t byte_off;
+    uint8_t mask;
+    size_t abs_off;
+    char *report = NULL;
+    int fsck_errors = -1;
+
+    TEST_ASSERT_NOT_NULL(fs);
+    TEST_ASSERT_NOT_NULL(data);
+    fill_nonzero_pattern(data, NDFS_PAGE_SIZE, 8);
+
+    TEST_ASSERT_OK(ndfs_write_file(fs, "SYSTEM/RFREE:DATA", data, NDFS_PAGE_SIZE));
+    free(data);
+
+    TEST_ASSERT_OK(ndfs_get_object_entry(fs, "RFREE:DATA", "SYSTEM", &entry));
+    TEST_ASSERT_EQUAL(NDFS_PTR_INDEXED, entry.file_pointer.type);
+
+    TEST_ASSERT_OK(ndfs_to_buffer(fs, &buf, &buf_size));
+    data_block = ndfs_read_u32be(buf, (size_t)entry.file_pointer.block_id * NDFS_PAGE_SIZE + 0);
+    TEST_ASSERT(data_block != 0);
+
+    /* Flip the bitmap bit for RFREE's own data page to "free", without
+     * touching its index entry -- the index still legitimately points at it. */
+    {
+        const ndfs_master_block_t *mb = NULL;
+        TEST_ASSERT_OK(ndfs_get_master_block(fs, &mb));
+        raw_bitmap_bit_offset(data_block, &byte_off, &mask);
+        abs_off = (size_t)mb->bit_file_ptr.block_id * NDFS_PAGE_SIZE + byte_off;
+    }
+    TEST_ASSERT((buf[abs_off] & mask) != 0); /* premise: it really is marked used before the flip */
+    buf[abs_off] &= (uint8_t)~mask;
+
+    TEST_ASSERT_OK(ndfs_open_buffer_copy(buf, buf_size, true, &fs_dirty));
+    free(buf);
+
+    TEST_ASSERT_OK(ndfs_fsck(fs_dirty, &report, &fsck_errors));
+    TEST_ASSERT_NOT_NULL(report);
+    TEST_ASSERT(fsck_errors > 0);
+    TEST_ASSERT(strstr(report, "referenced by files but marked FREE") != NULL);
+
+    free(report);
+    ndfs_close(fs_dirty);
+    ndfs_close(fs);
+    return 0;
+}
+
+/* Phase 1 must still catch a master block whose object-file pointer was
+ * clobbered to a RESERVED (invalid) type -- the exact shape of damage a
+ * partially-overwritten master block leaves behind. */
+static int test_fsck_detects_invalid_master_block_pointer(void)
+{
+    ndfs_filesystem_t *fs = create_writable(NDFS_TMPL_FLOPPY_360KB, "FSCKMBAD");
+    uint8_t *buf = NULL;
+    size_t buf_size = 0;
+    ndfs_filesystem_t *fs_dirty = NULL;
+    size_t obj_ptr_off;
+    char *report = NULL;
+    int fsck_errors = -1;
+
+    TEST_ASSERT_NOT_NULL(fs);
+    TEST_ASSERT_OK(ndfs_to_buffer(fs, &buf, &buf_size));
+
+    /* Object-file pointer lives at NDFS_MASTER_BLOCK_OFFSET+0x10 (see
+     * master_block.c's ndfs_mb_from_bytes/to_bytes). Encode type=3
+     * (NDFS_PTR_RESERVED, top 2 bits) over whatever block_id was there --
+     * ndfs_bp_is_valid() rejects any RESERVED-type pointer outright. */
+    obj_ptr_off = NDFS_MASTER_BLOCK_OFFSET + 0x10;
+    ndfs_write_u32be(buf, obj_ptr_off, 0xC0000001u);
+
+    TEST_ASSERT_OK(ndfs_open_buffer_copy(buf, buf_size, true, &fs_dirty));
+    free(buf);
+
+    TEST_ASSERT_OK(ndfs_fsck(fs_dirty, &report, &fsck_errors));
+    TEST_ASSERT_NOT_NULL(report);
+    TEST_ASSERT(fsck_errors > 0);
+    TEST_ASSERT(strstr(report, "ERROR: Object file pointer invalid") != NULL);
+
+    free(report);
+    ndfs_close(fs_dirty);
+    ndfs_close(fs);
+    return 0;
+}
+
+/* Phase 4 compares pages_used (as SINTRAN would report it) against a fresh
+ * recount from the actual file structure. Corrupting pages_used by hand --
+ * the on-disk shape of a quota field a crash left stale -- must surface as
+ * a WARNING (not silently accepted, and not escalated to an ERROR: a quota
+ * mismatch is informational, never a structural danger the way a cross-link
+ * or a referenced-but-free block is). */
+static int test_fsck_detects_quota_mismatch(void)
+{
+    ndfs_filesystem_t *fs = create_writable(NDFS_TMPL_FLOPPY_360KB, "FSCKQUOT");
+    ndfs_user_entry_t *users = NULL;
+    size_t user_count = 0;
+    uint8_t system_index = 0xFF;
+    size_t u;
+    const ndfs_master_block_t *mb = NULL;
+    uint8_t *buf = NULL;
+    size_t buf_size = 0;
+    uint32_t user_data_block;
+    size_t entry_off, pages_used_off;
+    ndfs_filesystem_t *fs_dirty = NULL;
+    char *report = NULL;
+    int fsck_errors = -1;
+
+    TEST_ASSERT_NOT_NULL(fs);
+
+    TEST_ASSERT_OK(ndfs_get_users(fs, &users, &user_count));
+    for (u = 0; u < user_count; u++) {
+        if (strcmp(users[u].user_name, "SYSTEM") == 0) {
+            system_index = users[u].user_index;
+            break;
+        }
+    }
+    ndfs_free_users(users);
+    TEST_ASSERT(system_index != 0xFF);
+
+    TEST_ASSERT_OK(ndfs_get_master_block(fs, &mb));
+    TEST_ASSERT_OK(ndfs_to_buffer(fs, &buf, &buf_size));
+
+    /* User-file index block: slot (user_index/32) holds the data page that
+     * holds this user's 64-byte entry at slot (user_index%32). */
+    user_data_block = ndfs_read_u32be(
+        buf, (size_t)mb->user_file_ptr.block_id * NDFS_PAGE_SIZE
+             + (size_t)(system_index / 32) * 4);
+    TEST_ASSERT(user_data_block != 0);
+
+    entry_off = (size_t)user_data_block * NDFS_PAGE_SIZE
+              + (size_t)(system_index % 32) * 64;
+    pages_used_off = entry_off + 32; /* see user_entry.c: pages_used is offset+32 */
+    TEST_ASSERT_EQUAL(0, ndfs_read_u32be(buf, pages_used_off)); /* premise: SYSTEM owns no files yet */
+    ndfs_write_u32be(buf, pages_used_off, 9999u);
+
+    TEST_ASSERT_OK(ndfs_open_buffer_copy(buf, buf_size, true, &fs_dirty));
+    free(buf);
+
+    TEST_ASSERT_OK(ndfs_fsck(fs_dirty, &report, &fsck_errors));
+    TEST_ASSERT_NOT_NULL(report);
+    TEST_ASSERT_EQUAL(0, fsck_errors); /* a quota mismatch is a WARNING, not an ERROR */
+    TEST_ASSERT(strstr(report, "pages_used=9999") != NULL);
+
+    free(report);
+    ndfs_close(fs_dirty);
+    ndfs_close(fs);
+    return 0;
+}
+
 /* ---- End-to-end: a realistic mixed workload must come back fully clean ---- */
 
 /* The strongest regression net: many users, every pointer type (Contiguous,
@@ -550,5 +711,8 @@ void run_fsck_tests(void)
     RUN_TEST(test_fsck_garbage_pointer_into_reserved_range_ignored);
     RUN_TEST(test_fsck_detects_genuine_orphan);
     RUN_TEST(test_fsck_detects_genuine_cross_link);
+    RUN_TEST(test_fsck_detects_referenced_but_marked_free);
+    RUN_TEST(test_fsck_detects_invalid_master_block_pointer);
+    RUN_TEST(test_fsck_detects_quota_mismatch);
     RUN_TEST(test_fsck_mixed_workload_is_clean);
 }
