@@ -3437,6 +3437,86 @@ ndfs_error_t ndfs_verify_integrity(const ndfs_filesystem_t *fs, bool *out_ok)
     return NDFS_OK;
 }
 
+/* ── fsck reference-map helpers ───────────────────────────────────────
+ *
+ * These build the "how many files/structures reference each block" map used by
+ * Phase 3. They deliberately mirror the PROVEN read/free enumerators
+ * (read_indexed_data / read_subindexed_data / free_file_blocks and the
+ * load_structures walks) so fsck sees exactly the blocks the rest of the code
+ * treats as live -- earlier fsck used a second, incomplete walk that missed
+ * whole classes of blocks (subindexed files, the multi-page bitmap, the object-
+ * and user-file DATA pages) and reported them as phantom "orphans". */
+
+/* Safely bump the reference count for one block (bounds- and saturation-checked).
+ *
+ * Reserved blocks (0..NDFS_FIRST_ALLOC_BLOCK-1) are never legitimate file,
+ * index or data-page targets -- they hold the master block and its fixed
+ * system structures, and Phase 3 already exempts that range from the orphan
+ * check. A pointer INTO that range is always garbage (typically a stale byte
+ * pattern in an unused index slot on a rewritten pack), so we never let it
+ * bump a reference count: doing so used to manufacture phantom "cross-linked"
+ * reports on blocks 1..6. */
+static void fsck_ref(uint8_t *refcount, uint32_t total_pages, uint32_t block_id)
+{
+    if (block_id >= NDFS_FIRST_ALLOC_BLOCK && block_id < total_pages
+        && refcount[block_id] < 255)
+        refcount[block_id]++;
+}
+
+/* Mark every real (non-hole) DATA pointer stored in ONE index block. `max_ptrs`
+ * bounds the scan: NDFS_MAX_OBJECT_FILE_PTRS for object/data index blocks,
+ * NDFS_MAX_USER_FILE_PTRS for the user-file index block. Mirrors
+ * read_indexed_data() / count_real_data_pages_in_object(): block_id 0 is a
+ * sparse hole (no disk page), everything else is a real data page. The index
+ * block ITSELF is the caller's responsibility to count. */
+static void fsck_ref_index_data(const struct ndfs_filesystem *fs,
+                                uint8_t *refcount, uint32_t total_pages,
+                                uint32_t index_block_id, size_t max_ptrs)
+{
+    const uint8_t *idx_page;
+    size_t k;
+
+    if (index_block_id == 0 || index_block_id >= total_pages) return;
+    idx_page = read_page(fs, index_block_id);
+    if (!idx_page) return;
+    /* idx_page held across up to max_ptrs reads of it -- pin its slot. */
+    cache_pin(fs, index_block_id);
+    for (k = 0; k < max_ptrs; k++) {
+        ndfs_block_pointer_t p = ndfs_bp_from_bytes(idx_page, k * 4);
+        if (p.block_id > 0)
+            fsck_ref(refcount, total_pages, p.block_id);
+    }
+    cache_unpin(fs, index_block_id);
+}
+
+/* Fully walk a SUBINDEXED structure: the sub-index block points at group-index
+ * blocks (each a structural block), and each group-index block points at data
+ * pages. Mirrors read_subindexed_data() / free_file_blocks()'s subindexed arm.
+ * The sub-index block ITSELF is the caller's responsibility to count. */
+static void fsck_ref_subindexed(const struct ndfs_filesystem *fs,
+                                uint8_t *refcount, uint32_t total_pages,
+                                uint32_t sub_index_block_id)
+{
+    const uint8_t *sub_page;
+    size_t si;
+
+    if (sub_index_block_id == 0 || sub_index_block_id >= total_pages) return;
+    sub_page = read_page(fs, sub_index_block_id);
+    if (!sub_page) return;
+    /* sub_page held across the whole walk -- pin it. */
+    cache_pin(fs, sub_index_block_id);
+    for (si = 0; si < NDFS_MAX_OBJECT_FILE_PTRS; si++) {
+        ndfs_block_pointer_t idx_ptr = ndfs_bp_from_bytes(sub_page, si * 4);
+        if (!ndfs_bp_is_valid(&idx_ptr)) continue;
+        /* the group-index block is itself a real, allocated structural block */
+        fsck_ref(refcount, total_pages, idx_ptr.block_id);
+        /* ...and the data pages it points at */
+        fsck_ref_index_data(fs, refcount, total_pages, idx_ptr.block_id,
+                            NDFS_MAX_OBJECT_FILE_PTRS);
+    }
+    cache_unpin(fs, sub_index_block_id);
+}
+
 ndfs_error_t ndfs_fsck(const ndfs_filesystem_t *fs, char **out_report,
                        int *out_errors)
 {
@@ -3504,13 +3584,43 @@ ndfs_error_t ndfs_fsck(const ndfs_filesystem_t *fs, char **out_report,
         return NDFS_ERR_ALLOC;
     }
 
-    /* Mark system blocks (master block pointer targets) */
-    if (ndfs_bp_is_valid(&fs->master_block.object_file_ptr))
-        refcount[fs->master_block.object_file_ptr.block_id]++;
-    if (ndfs_bp_is_valid(&fs->master_block.user_file_ptr))
-        refcount[fs->master_block.user_file_ptr.block_id]++;
-    if (ndfs_bp_is_valid(&fs->master_block.bit_file_ptr))
-        refcount[fs->master_block.bit_file_ptr.block_id]++;
+    /* Mark system structural blocks AND the data pages behind them.
+     *
+     * Bug B fix: earlier code counted ONLY the master-block pointer targets
+     * (i.e. the object-file index block, the user-file index block, and the
+     * FIRST bitmap page). It never counted the object-file DATA pages, the
+     * user-file DATA pages, or the bitmap's additional pages, so Phase 3 saw
+     * every one of those legitimately-used blocks as an "orphan". */
+
+    /* Object file: its index/sub-index block + all its data (object) pages. */
+    if (ndfs_bp_is_valid(&fs->master_block.object_file_ptr)) {
+        uint32_t ob = fs->master_block.object_file_ptr.block_id;
+        fsck_ref(refcount, total_pages, ob);
+        if (fs->master_block.object_file_ptr.type == NDFS_PTR_SUBINDEXED)
+            fsck_ref_subindexed(fs, refcount, total_pages, ob);
+        else
+            fsck_ref_index_data(fs, refcount, total_pages, ob,
+                                NDFS_MAX_OBJECT_FILE_PTRS);
+    }
+
+    /* User file: its index block + up to 8 user data pages (see load_structures). */
+    if (ndfs_bp_is_valid(&fs->master_block.user_file_ptr)) {
+        uint32_t ub = fs->master_block.user_file_ptr.block_id;
+        fsck_ref(refcount, total_pages, ub);
+        fsck_ref_index_data(fs, refcount, total_pages, ub,
+                            NDFS_MAX_USER_FILE_PTRS);
+    }
+
+    /* Bit file: the bitmap spans several CONTIGUOUS pages, not just block_id.
+     * Recompute its page span exactly as load_structures does. */
+    if (ndfs_bp_is_valid(&fs->master_block.bit_file_ptr)) {
+        uint32_t bitmap_bytes = (((total_pages + 7) / 8) + 1) & ~1u;
+        uint32_t bitmap_pages = (bitmap_bytes + NDFS_PAGE_SIZE - 1) / NDFS_PAGE_SIZE;
+        uint32_t bb = fs->master_block.bit_file_ptr.block_id;
+        uint32_t p;
+        for (p = 0; p < bitmap_pages; p++)
+            fsck_ref(refcount, total_pages, bb + p);
+    }
 
     /* Walk all file pointers */
     for (i = 0; i < fs->object_count; i++) {
@@ -3525,33 +3635,63 @@ ndfs_error_t ndfs_fsck(const ndfs_filesystem_t *fs, char **out_report,
             continue;
         }
 
-        refcount[fp_block]++; /* index/sub-index block */
-
         if (obj->file_pointer.type == NDFS_PTR_INDEXED) {
-            /* Walk index block entries */
+            /* fp_block is a real, allocated structural index block -- count it
+             * once, then count each real data page it points at. Scan the whole
+             * index (NDFS_MAX_OBJECT_FILE_PTRS) and count only non-hole
+             * pointers, exactly like count_real_data_pages_in_object(); the old
+             * `j < pages_in_file` bound mis-counted sparse files. */
+            fsck_ref(refcount, total_pages, fp_block);
             const uint8_t *idx_page = read_page(fs, fp_block);
             if (idx_page) {
-                for (j = 0; j < NDFS_MAX_OBJECT_FILE_PTRS && j < obj->pages_in_file; j++) {
+                /* Scan the WHOLE index block (all 512 slots), counting every
+                 * real (non-hole) pointer, exactly like
+                 * count_real_data_pages_in_object() -- the index, not
+                 * bytes_in_file, is the truth of what pages a file physically
+                 * owns. A file's logical length (pages_in_file, derived from
+                 * bytes_in_file) is often SMALLER than the number of pages
+                 * recorded in its index; bounding the scan by pages_in_file (as
+                 * the original fsck did) leaves those extra, legitimately-owned
+                 * pages uncounted and reports them as phantom "orphans" -- that
+                 * was the bulk of the false orphan count on a healthy pack.
+                 * Garbage on a genuinely corrupt index is contained by three
+                 * guards: block_id==0 is a sparse hole (skipped), block_id in
+                 * the reserved range is rejected by fsck_ref(), and an
+                 * out-of-range block_id is reported as a real ERROR below. */
+                cache_pin(fs, fp_block);
+                for (j = 0; j < NDFS_MAX_OBJECT_FILE_PTRS; j++) {
                     ndfs_block_pointer_t dp = ndfs_bp_from_bytes(idx_page, j * 4);
                     if (dp.block_id > 0 && dp.block_id < total_pages) {
-                        refcount[dp.block_id]++;
+                        fsck_ref(refcount, total_pages, dp.block_id);
                     } else if (dp.block_id >= total_pages) {
                         APPEND("  ERROR: File '%s:%s' data block %u out of range\n",
                                obj->object_name, obj->type, dp.block_id);
                         errors++;
                     }
-                    /* block_id == 0 is sparse hole, that's OK */
+                    /* block_id == 0 is a sparse hole, that's OK */
                 }
+                cache_unpin(fs, fp_block);
             }
         } else if (obj->file_pointer.type == NDFS_PTR_CONTIGUOUS) {
+            /* Bug A fix: for a CONTIGUOUS file, fp_block IS the first data page
+             * (see read_object_data / free_file_blocks) -- there is NO separate
+             * structural index block. The loop below already counts fp_block at
+             * j==0, so we must NOT pre-count it, or the file cross-links with
+             * itself and Phase 3 reports a phantom "cross-linked" block per
+             * contiguous file. */
             for (j = 0; j < obj->pages_in_file; j++) {
                 uint32_t db = fp_block + (uint32_t)j;
                 if (db < total_pages) {
-                    refcount[db]++;
+                    fsck_ref(refcount, total_pages, db);
                 }
             }
+        } else if (obj->file_pointer.type == NDFS_PTR_SUBINDEXED) {
+            /* Bug B fix: subindexed files used to be skipped entirely, so all
+             * their index/group/data blocks looked orphaned. fp_block is the
+             * sub-index block (structural); walk the rest. */
+            fsck_ref(refcount, total_pages, fp_block);
+            fsck_ref_subindexed(fs, refcount, total_pages, fp_block);
         }
-        /* SubIndexed: would need deeper walk, skip for now */
     }
 
     /* --- Phase 3: Bitmap vs reference check --- */
